@@ -2,11 +2,14 @@
 """
 MoE-Compressors 统一运行入口
 
+【两种模式】
+- calib：单卡校准，在校准集上计算统计量，保存 adapter.safetensors
+- eval：多卡评测。若传入 adapter_dir 则先 patch（剪枝）再评测；不传则评测原模型
+
 用法:
-  python run.py <method> <action1> [action2] ... [options]
-  python run.py frequency_pruning eval --model ...
-  python run.py frequency_pruning patch eval --model ... --adapter_dir ...
-  python run.py frequency_pruning calib patch eval --model ... --adapter_dir ...
+  python run.py frequency_pruning calib --model ... --adapter_dir ...
+  python run.py frequency_pruning eval --model ...                    # 评测原模型
+  python run.py frequency_pruning eval --model ... --adapter_dir ...  # patch 后评测剪枝模型
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ METHOD_REGISTRY = {
 
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="MoE-Compressors: 支持 calib / patch / eval 任意组合"
+        description="MoE-Compressors: calib（校准）| eval（评测）"
     )
     parser.add_argument(
         "method",
@@ -37,16 +40,14 @@ def get_parser() -> argparse.ArgumentParser:
         help="压缩方法名称",
     )
     parser.add_argument(
-        "actions",
-        nargs="+",
-        choices=["calib", "patch", "eval"],
-        help="要执行的操作，按顺序执行",
+        "mode",
+        choices=["calib", "eval"],
+        help="calib=单卡校准保存adapter；eval=多卡评测（adapter_dir非空时先patch再评测）",
     )
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--adapter_dir", type=str, default=None,
-                        help="adapter 目录。eval 可不传，calib/patch 时必填")
-    parser.add_argument("--model_type", type=str, default=None,
-                        help="模型架构，默认由各方法决定")
+                        help="adapter目录。calib 时必填（保存路径）；eval 时可选，非空则 patch 后评测剪枝模型，空则评测原模型")
+    parser.add_argument("--model_type", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dtype", type=str, default="float16",
                         choices=["float16", "bfloat16", "float32"])
@@ -65,9 +66,8 @@ def get_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = get_parser().parse_args()
 
-    if "calib" in args.actions or "patch" in args.actions:
-        if args.adapter_dir is None:
-            raise ValueError("执行 calib 或 patch 时需提供 --adapter_dir")
+    if args.mode == "calib" and args.adapter_dir is None:
+        raise ValueError("calib 模式需提供 --adapter_dir（用于保存 adapter）")
 
     cls, default_model_type = METHOD_REGISTRY[args.method]
     model_type = args.model_type or default_model_type
@@ -84,31 +84,34 @@ def main() -> None:
         torch_dtype=torch_dtype,
     )
 
-    for action in args.actions:
-        if action == "calib":
-            compressor.calib(
-                calibration_dataset=args.calibration_dataset,
-                max_calib_samples=args.max_calib_samples,
-                batch_size=args.batch_size,
-            )
-            print(f"校准完成，adapter 已保存至: {compressor._get_adapter_path()}")
+    if args.mode == "calib":
+        compressor.calib(
+            calibration_dataset=args.calibration_dataset,
+            max_calib_samples=args.max_calib_samples,
+            batch_size=args.batch_size,
+        )
+        print(f"校准完成，adapter 已保存至: {compressor._get_adapter_path()}")
 
-        elif action == "patch":
+    elif args.mode == "eval":
+        # adapter_dir 非空：先 patch 再评测剪枝模型；否则直接评测原模型
+        if args.adapter_dir is not None:
             compressor.patch()
-            print("剪枝补丁已应用至 self.model")
-            if args.output_model_path:
-                compressor.model.save_pretrained(args.output_model_path)
-                compressor.tokenizer.save_pretrained(args.output_model_path)
-                print(f"剪枝模型已保存至: {args.output_model_path}")
+            print("已应用剪枝补丁，开始评测剪枝模型")
+        else:
+            print("评测原模型（未传 adapter_dir）")
 
-        elif action == "eval":
-            results = compressor.eval(
-                tasks=args.tasks,
-                num_fewshot=args.num_fewshot,
-                batch_size=args.eval_batch_size,
-                limit=args.limit,
-            )
-            print(results)
+        if args.output_model_path:
+            compressor.model.save_pretrained(args.output_model_path)
+            compressor.tokenizer.save_pretrained(args.output_model_path)
+            print(f"模型已保存至: {args.output_model_path}")
+
+        results = compressor.eval(
+            tasks=args.tasks,
+            num_fewshot=args.num_fewshot,
+            batch_size=args.eval_batch_size,
+            limit=args.limit,
+        )
+        print(results)
 
 
 if __name__ == "__main__":

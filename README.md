@@ -7,44 +7,49 @@ Implementations of training-free MoE pruning/merging algorithms for LLMs with Mi
 ```
 MoE-Compressors/
 ├── MoECompressor.py          # 抽象基类（calib / patch / eval）
-├── run.py                    # 统一入口，通过 method 参数选择压缩方法
+├── run.py                    # 统一入口，两种模式：calib | eval
 ├── methods/
 │   ├── frequency_pruning/    # 方法：基于激活频率的专家剪枝
 │   │   └── model_qwen3_moe.py
 │   └── ...
 ├── examples/
-│   └── run.sh                # 示例脚本：调 run.py，修改顶部参数后运行
+│   └── run.sh                # 示例脚本：calib 单卡，eval 多卡（accelerate）
 └── requirements.txt
 ```
 
-## 抽象接口
+## 两种模式
 
-| 接口 | 说明 |
-|------|------|
-| **calib** | 在校准集上计算专家重要性等统计量，保存到 `adapter.safetensors` |
-| **patch** | 读取 adapter，非侵入式修改模型结构/权重/forward，返回可推理的 `ModelForCausalLM` |
-| **eval** | 使用 lm_eval 的 HFLM 封装模型，调用 `simple_evaluate` 进行评测 |
+| 模式 | 说明 | 运行方式 |
+|------|------|----------|
+| **calib** | 单卡校准，在校准集上计算统计量，保存 `adapter.safetensors` | `python run.py ...` |
+| **eval** | 多卡评测。`adapter_dir` 非空则先 patch 再评测剪枝模型；空则评测原模型 | `accelerate launch python run.py ...` |
 
 ## 快速开始
 
-支持三种评估流程：
-1. **eval**：直接评估原 MoE 模型（可不传 adapter_dir）
-2. **patch eval**：加载已有 adapter，剪枝后评估
-3. **calib patch eval**：全流程（校准 → 剪枝 → 评估）
+### 1. 校准（单卡）
 
 ```bash
-python run.py frequency_pruning eval --model Qwen/Qwen3-MoE-15B-A2B
-python run.py frequency_pruning patch eval --model Qwen/Qwen3-MoE-15B-A2B --adapter_dir ./outputs/adapter
-python run.py frequency_pruning calib patch eval --model Qwen/Qwen3-MoE-15B-A2B --adapter_dir ./outputs/adapter
+python run.py frequency_pruning calib --model Qwen/Qwen3-MoE-15B-A2B --adapter_dir ./outputs/adapter
 ```
 
-或使用示例脚本（修改 `examples/run.sh` 顶部参数后运行）：
+### 2. 评测（多卡，建议 accelerate launch）
 
 ```bash
-bash examples/run.sh eval              # 仅评估原模型
-bash examples/run.sh patch eval        # 剪枝后评估
-bash examples/run.sh calib patch eval  # 全流程
-bash examples/run.sh all              # 等同于 calib patch eval
+# 评测剪枝模型（需先完成 calib）
+accelerate launch run.py frequency_pruning eval --model Qwen/Qwen3-MoE-15B-A2B --adapter_dir ./outputs/adapter
+
+# 评测原模型（不传 adapter_dir）
+accelerate launch run.py frequency_pruning eval --model Qwen/Qwen3-MoE-15B-A2B
+```
+
+### 3. 使用示例脚本
+
+修改 `examples/run.sh` 顶部参数后：
+
+```bash
+bash examples/run.sh calib           # 单卡校准
+bash examples/run.sh eval            # 多卡评测剪枝模型（ADAPTER_DIR 非空）
+EVAL_RAW=1 bash examples/run.sh eval # 强制多卡评测原模型
 ```
 
 ## 依赖
@@ -52,3 +57,5 @@ bash examples/run.sh all              # 等同于 calib patch eval
 ```bash
 pip install -r requirements.txt
 ```
+
+评测需安装 accelerate：`pip install accelerate`

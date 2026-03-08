@@ -7,10 +7,10 @@ MoE Compressor - MoE 剪枝/合并方法的抽象基类
 2. 非侵入式 patch：通过读取 adapter 动态修改模型，返回标准 ModelForCausalLM，可与 transformers 直接推理
 3. 统一评测：eval 接口在基类中实现，所有方法复用同一套 lm_eval 评测流程
 
-【接口约定】
-- calib：子类实现。在校准集上计算统计量（如专家重要性），保存到 adapter.safetensors
-- patch：子类实现。读取 adapter，修改模型结构/权重，返回可推理模型
-- eval：基类实现。将 patch 后的模型用 HFLM 封装，调用 lm_eval.simple_evaluate 评测
+【运行流程】
+- calib：单卡校准，在校准集上计算统计量，保存 adapter.safetensors
+- eval：多卡评测。若 adapter_dir 非空则先 patch 再评测剪枝模型；否则评测原模型
+- patch 不作为独立步骤暴露，由 eval 在需要时内部调用
 """
 
 from __future__ import annotations
@@ -118,12 +118,13 @@ class MoECompressor(ABC):
         **kwargs,
     ) -> PreTrainedModel:
         """
-        打补丁：读取 adapter，对self.model非侵入式地修改模型结构、权重和 forward 逻辑。
+        打补丁：读取 adapter，对 self.model 非侵入式地修改模型结构、权重和 forward 逻辑。
 
+        通常在 eval 前由 run.py 根据 adapter_dir 是否传入自动调用，不作为独立用户动作暴露。
         返回的模型为标准 ModelForCausalLM，可直接用于 transformers 推理或传给 eval。
 
         Args:
-            kwargs: 与compression方法相关的参数。
+            kwargs: 与压缩方法相关的参数。
 
         Returns:
             self.model: 打过补丁的 ModelForCausalLM
@@ -144,19 +145,17 @@ class MoECompressor(ABC):
         **lm_eval_kwargs,
     ) -> dict[str, Any]:
         """
-        评测：用 lm_eval 评估 patch 后的模型。
+        评测：用 lm_eval 评估模型。
 
-        内部将模型用 HFLM 封装，调用 simple_evaluate。所有压缩方法共用此流程，
-        保证评测方式一致。
+        内部将模型用 HFLM 封装，调用 simple_evaluate。所有压缩方法共用此流程。
+        调用前若已通过 patch() 修改 self.model，则评测剪枝模型；否则评测原模型。
 
         Args:
-            model: patch 后的模型。若 None，会先调用 self.patch()
-            adapter_path: adapter 路径。若 None，则表示直接评估原模型，否则评估剪枝模型。
+            model: 待评测模型。若 None，使用 self.model（可能已被 patch 修改）
             tasks: 评测任务名列表，如 ["wikitext", "hellaswag"]
             num_fewshot: few-shot 数量
             batch_size: 评测 batch size，可为 "auto"
             limit: 每任务样本上限，如 0.1 表示 10%
-            device: 覆盖 self.device
             **lm_eval_kwargs: 传给 simple_evaluate 的额外参数
 
         Returns:
@@ -168,12 +167,9 @@ class MoECompressor(ABC):
         except ImportError as e:
             raise ImportError("eval 需要 lm_eval: pip install lm_eval[hf]") from e
 
-        if model is None:
-            model = self.model
-            tokenizer = self.tokenizer
-        else:
-            tokenizer = model.tokenizer
-            
+        model = model if model is not None else self.model
+        tokenizer = model.tokenizer if model is not None else self.tokenizer
+
         try:
             from lm_eval.models.utils import configure_pad_token
             tokenizer = configure_pad_token(tokenizer, model_config=model.config)
@@ -230,11 +226,3 @@ class MoECompressor(ABC):
                 texts = [str(t) for t in ds[col][:max_calib_samples]]
             return texts
         raise ValueError("需提供 calibration_data 或 calibration_dataset")
-
-    @staticmethod
-    def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-        parser.add_argument("--model", type=str, required=True)
-        parser.add_argument("--adapter_dir", type=str, default=None)
-        parser.add_argument("--device", type=str, default="cuda")
-        parser.add_argument("--dtype", type=str, default="float16")
-        return parser

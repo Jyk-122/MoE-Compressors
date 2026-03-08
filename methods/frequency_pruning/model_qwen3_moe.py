@@ -221,6 +221,10 @@ class FrequencyPruningQwen3Moe(MoECompressor):
         save_file(state, str(self._get_adapter_path()))
 
     def patch(self, **kwargs) -> Any:
+        """
+        打补丁：读取 adapter，将每层 MoE 的 SparseMoeBlock 替换为 PrunedQwen3MoeSparseMoeBlock。
+        由 run.py 在 eval 时根据 adapter_dir 是否传入自动调用。
+        """
         if self.adapter_dir is None:
             raise ValueError("patch 需提供 adapter_dir")
         state = self.adapter
