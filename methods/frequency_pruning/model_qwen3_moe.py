@@ -13,11 +13,15 @@ Frequency Pruning 方法 - 基于激活频率的专家剪枝（Qwen3-MoE 实现�
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
+
+logger = logging.getLogger("MoECompressor")
 from safetensors.torch import load_file, save_file
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeSparseMoeBlock,
@@ -166,11 +170,15 @@ class FrequencyPruningQwen3Moe(MoECompressor):
         """
         if self.adapter_dir is None:
             raise ValueError("calib 需提供 adapter_dir")
+
+        logger.info("[calib] Step 1/4: Loading calibration data")
         texts = self.load_calibration_data(
             calibration_dataset=calibration_dataset,
             max_calib_samples=max_calib_samples,
             max_context_len=max_context_len,
         )
+
+        logger.info("[calib] Step 2/4: Forward pass to collect expert activation stats")
         self.model.eval()
         if hasattr(self.model.config, "output_router_logits"):
             self.model.config.output_router_logits = True
@@ -179,7 +187,8 @@ class FrequencyPruningQwen3Moe(MoECompressor):
         top_k = self.model.config.num_experts_per_tok
         expert_counts: dict[int, torch.Tensor] = {i: torch.zeros(num_experts) for i, _ in moe_layers}
 
-        for start in range(0, len(texts), batch_size):
+        n_batches = (len(texts) + batch_size - 1) // batch_size
+        for start in tqdm(range(0, len(texts), batch_size), total=n_batches, desc="Calibration forward", unit="batch"):
             batch_texts = texts[start : start + batch_size]
             inputs = self.tokenizer(
                 batch_texts,
@@ -207,6 +216,7 @@ class FrequencyPruningQwen3Moe(MoECompressor):
                     for k in range(selected.shape[1]):
                         expert_counts[decoder_layer_idx][selected[tok, k].item()] += 1
 
+        logger.info("[calib] Step 3/4: Determining kept experts by activation frequency")
         keep_per_layer = {}
         for decoder_layer_idx, counts in expert_counts.items():
             num_keep = max(1, int(num_experts * (1 - self.prune_ratio)))
@@ -219,6 +229,7 @@ class FrequencyPruningQwen3Moe(MoECompressor):
                 "keep_indices": keep_indices.cpu(),
                 "old_to_new": old_to_new.cpu(),
             }
+        logger.info("[calib] Step 4/4: Saving adapter")
         self.adapter_dir.mkdir(parents=True, exist_ok=True)
         state = {f"layer_{k}.keep_indices": v["keep_indices"] for k, v in keep_per_layer.items()}
         state.update({f"layer_{k}.old_to_new": v["old_to_new"] for k, v in keep_per_layer.items()})
@@ -231,13 +242,15 @@ class FrequencyPruningQwen3Moe(MoECompressor):
         """
         if self.adapter_dir is None:
             raise ValueError("patch 需提供 adapter_dir")
+        logger.info("[patch] Loading adapter")
         state = self.adapter
         if state is None:
             if not self.adapter_path.exists():
                 raise FileNotFoundError(f"未找到 adapter: {self.adapter_path}，请先运行 calib()")
             state = load_file(str(self.adapter_path))
         moe_layers = _get_moe_layers(self.model)
-        for decoder_layer_idx, block in moe_layers:
+        logger.info("[patch] Replacing %d MoE layers", len(moe_layers))
+        for decoder_layer_idx, block in tqdm(moe_layers, desc="Patching layers", unit="layer"):
             key_pre = f"layer_{decoder_layer_idx}"
             keep_indices = state[f"{key_pre}.keep_indices"]
             old_to_new = state[f"{key_pre}.old_to_new"]

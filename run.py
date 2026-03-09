@@ -15,8 +15,14 @@ MoE-Compressors 统一运行入口
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(message)s",
+)
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -70,6 +76,7 @@ def main() -> None:
     if args.mode == "calib" and args.adapter_dir is None:
         raise ValueError("calib 模式需提供 --adapter_dir（用于保存 adapter）")
 
+    logging.info("========== MoE-Compressors: %s mode ==========", args.mode.upper())
     cls, default_model_type = METHOD_REGISTRY[args.method]
     model_type = args.model_type or default_model_type
 
@@ -77,6 +84,7 @@ def main() -> None:
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     torch_dtype = dtype_map.get(args.dtype, torch.float16)
 
+    logging.info("Instantiating %s, model: %s", args.method, args.model)
     compressor = cls(
         model_name_or_path=args.model,
         adapter_dir=args.adapter_dir,
@@ -92,20 +100,21 @@ def main() -> None:
             max_context_len=args.max_context_len,
             batch_size=args.batch_size,
         )
-        print(f"校准完成，adapter 已保存至: {compressor._get_adapter_path()}")
+        logging.info("Calibration done, adapter saved to: %s", compressor._get_adapter_path())
 
     elif args.mode == "eval":
         # adapter_dir 非空：先 patch 再评测剪枝模型；否则直接评测原模型
         if args.adapter_dir is not None:
+            logging.info("[eval] Applying prune patch")
             compressor.patch()
-            print("已应用剪枝补丁，开始评测剪枝模型")
+            logging.info("[eval] Evaluating pruned model")
         else:
-            print("评测原模型（未传 adapter_dir）")
+            logging.info("[eval] Evaluating raw model (no adapter_dir)")
 
         if args.output_model_path:
             compressor.model.save_pretrained(args.output_model_path)
             compressor.tokenizer.save_pretrained(args.output_model_path)
-            print(f"模型已保存至: {args.output_model_path}")
+            logging.info("Model saved to: %s", args.output_model_path)
 
         results = compressor.eval(
             tasks=args.tasks,
@@ -113,6 +122,7 @@ def main() -> None:
             batch_size=args.eval_batch_size,
             limit=args.limit,
         )
+        logging.info("Evaluation done")
         print(results)
 
 

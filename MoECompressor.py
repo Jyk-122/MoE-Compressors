@@ -16,11 +16,15 @@ MoE Compressor - MoE 剪枝/合并方法的抽象基类
 from __future__ import annotations
 
 import argparse
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 import torch
+from tqdm import tqdm
+
+logger = logging.getLogger("MoECompressor")
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from safetensors.torch import load_file
 from datasets import load_dataset
@@ -62,12 +66,14 @@ class MoECompressor(ABC):
         self.trust_remote_code = trust_remote_code
         self.extra_kwargs = kwargs
 
+        logger.info("Loading model: %s", model_name_or_path)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name_or_path,
             torch_dtype=self.torch_dtype,
             device_map=device,
             trust_remote_code=trust_remote_code,
         )
+        logger.info("Loading tokenizer: %s", model_name_or_path)
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name_or_path,
             trust_remote_code=self.trust_remote_code,
@@ -78,6 +84,7 @@ class MoECompressor(ABC):
         if self.adapter_dir is not None:
             self.adapter_path = self._get_adapter_path()
             if self.adapter_path.exists():
+                logger.info("Loading adapter: %s", self.adapter_path)
                 self.adapter = load_file(str(self.adapter_path))
 
     def _get_adapter_path(self) -> Path:
@@ -168,7 +175,9 @@ class MoECompressor(ABC):
             raise ImportError("eval 需要 lm_eval: pip install lm_eval[hf]") from e
 
         model = model if model is not None else self.model
-        tokenizer = model.tokenizer if model is not None else self.tokenizer
+        tokenizer = self.tokenizer
+
+        logger.info("Starting evaluation, tasks: %s", tasks or ["wikitext"])
 
         try:
             from lm_eval.models.utils import configure_pad_token
@@ -221,27 +230,33 @@ class MoECompressor(ABC):
         Returns:
             校准文本块列表，每块约 max_context_len tokens
         """
+        logger.info("Loading calibration dataset: %s", calibration_dataset)
         parts = calibration_dataset.split(":", 1)
         name = parts[1] if len(parts) > 1 else None
         ds = load_dataset(parts[0], name, split="train")
 
         col = "text" if "text" in ds.column_names else ds.column_names[0]
         raw = ds[col]
-        lines = [t for t in raw if t]
+        lines = [t for t in raw if t and str(t).strip()]
+        logger.info("Valid lines after filtering: %d, building chunks of ~%d tokens", len(lines), max_context_len)
 
         chunks = []
         current_lines = []
+        pbar = tqdm(total=max_calib_samples, desc="Building calibration chunks", unit="chunk")
         for line in lines:
-            line = line if isinstance(line, str) else str(line)
+            line = (line if isinstance(line, str) else str(line)).strip()
             if not line:
                 continue
             current_lines.append(line)
-            combined = "".join(current_lines)
+            combined = "\n".join(current_lines)
             n_tokens = len(self.tokenizer.encode(combined, add_special_tokens=False))
             if n_tokens >= max_context_len:
                 chunks.append(combined)
+                pbar.update(1)
                 if len(chunks) >= max_calib_samples:
                     break
                 current_lines = []
 
+        pbar.close()
+        logger.info("Calibration data loaded, %d chunks", len(chunks))
         return chunks

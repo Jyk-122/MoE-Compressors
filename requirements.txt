@@ -4,3 +4,4 @@ safetensors>=0.4.0
 datasets>=2.0.0
 lm_eval[hf]>=0.4.0
 accelerate>=0.25.0
+tqdm>=4.60.0
