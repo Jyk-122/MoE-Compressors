@@ -203,7 +203,7 @@ class MoECompressor(ABC):
             limit=limit,
             **lm_eval_kwargs,
         )
-        return getattr(results, "results", results) if results is not None else {}
+        return results
 
     # -------------------------------------------------------------------------
     # 工具方法
@@ -248,7 +248,7 @@ class MoECompressor(ABC):
             if not line:
                 continue
             current_lines.append(line)
-            combined = "\n".join(current_lines)
+            combined = "".join(current_lines)
             n_tokens = len(self.tokenizer.encode(combined, add_special_tokens=False))
             if n_tokens >= max_context_len:
                 chunks.append(combined)

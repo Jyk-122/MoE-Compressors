@@ -13,15 +13,21 @@
 # ========== 参数配置 ==========
 METHOD="frequency_pruning"
 MODEL="Qwen/Qwen3-MoE-15B-A2B"
-# adapter 目录。calib 时保存到此；eval 时若非空则 patch 后评测，空则评测原模型
-ADAPTER_DIR="./outputs/frequency_pruning/adapter"
+# 输出根目录，与 model 相关的输出统一放在 DEFAULT_DIR/model_name/ 下
+# adapter: DEFAULT_DIR/model_name/method/adapter.safetensors
+# 原模型 eval 结果: DEFAULT_DIR/model_name/results_xxx.json
+# 剪枝模型 eval 结果: DEFAULT_DIR/model_name/method/results_xxx.json
+DEFAULT_DIR="./outputs"
+MODEL_NAME="${MODEL##*/}"
+OUTPUT_BASE="${DEFAULT_DIR}/${MODEL_NAME}"
+ADAPTER_DIR="${OUTPUT_BASE}/${METHOD}"
 PRUNE_RATIO=0.5
 CALIBRATION_DATASET="wikitext:wikitext-2-raw-v1"
-MAX_CALIB_SAMPLES=512
+MAX_CALIB_SAMPLES=128
 MAX_CONTEXT_LEN=2048
-OUTPUT_MODEL_PATH="./outputs/frequency_pruning/patched_model"
 TASKS="wikitext"
 EVAL_LIMIT=0.1
+EVAL_OUTPUT_PATH=""
 DEVICE="cuda"
 DTYPE="float16"
 # ==============================
@@ -50,14 +56,13 @@ if [ "$MODE" = "calib" ]; then
 
 elif [ "$MODE" = "eval" ]; then
   # 多卡评测（accelerate launch）
-  EVAL_ARGS="$BASE_ARGS --tasks $TASKS --limit $EVAL_LIMIT"
-  if [ -n "$OUTPUT_MODEL_PATH" ]; then
-    EVAL_ARGS="$EVAL_ARGS --output_model_path $OUTPUT_MODEL_PATH"
-  fi
+  EVAL_ARGS="$BASE_ARGS --tasks $TASKS --limit $EVAL_LIMIT --output_base $OUTPUT_BASE"
+  EXTRA_ARGS=()
+  [ -n "$EVAL_OUTPUT_PATH" ] && EXTRA_ARGS+=(--eval_output_path "$EVAL_OUTPUT_PATH")
   # EVAL_RAW=1 或 ADAPTER_DIR 为空 → 不传 adapter_dir，评测原模型
   if [ "${EVAL_RAW:-0}" = "1" ] || [ -z "$ADAPTER_DIR" ]; then
-    accelerate launch run.py $METHOD eval $EVAL_ARGS
+    accelerate launch run.py $METHOD eval $EVAL_ARGS "${EXTRA_ARGS[@]}"
   else
-    accelerate launch run.py $METHOD eval $EVAL_ARGS --adapter_dir "$ADAPTER_DIR"
+    accelerate launch run.py $METHOD eval $EVAL_ARGS --adapter_dir "$ADAPTER_DIR" "${EXTRA_ARGS[@]}"
   fi
 fi

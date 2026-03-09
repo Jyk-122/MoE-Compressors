@@ -15,8 +15,10 @@ MoE-Compressors 统一运行入口
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 logging.basicConfig(
@@ -34,6 +36,29 @@ from methods.frequency_pruning.model_qwen3_moe import FrequencyPruningQwen3Moe
 METHOD_REGISTRY = {
     "frequency_pruning": (FrequencyPruningQwen3Moe, "qwen3_moe"),
 }
+
+
+def _save_calib_config(args: argparse.Namespace, adapter_dir: Path) -> None:
+    """将 calib 涉及的全部参数保存到 adapter_dir/config.json。"""
+    config_path = adapter_dir / "config.json"
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    config = {
+        "method": args.method,
+        "mode": "calib",
+        "model": args.model,
+        "adapter_dir": str(adapter_dir),
+        "model_type": args.model_type,
+        "device": args.device,
+        "dtype": args.dtype,
+        "prune_ratio": args.prune_ratio,
+        "calibration_dataset": args.calibration_dataset,
+        "max_calib_samples": args.max_calib_samples,
+        "max_context_len": args.max_context_len,
+        "batch_size": args.batch_size,
+    }
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    logging.info("Calib config saved to: %s", config_path)
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -62,11 +87,14 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_calib_samples", type=int, default=512)
     parser.add_argument("--max_context_len", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--output_model_path", type=str, default=None)
     parser.add_argument("--tasks", type=str, nargs="+", default=["wikitext"])
     parser.add_argument("--num_fewshot", type=int, default=0)
     parser.add_argument("--eval_batch_size", type=str, default="auto")
     parser.add_argument("--limit", type=float, default=None)
+    parser.add_argument("--output_base", type=str, default=None,
+                        help="输出根目录，如 outputs/model_name。用于推导 eval 默认结果路径")
+    parser.add_argument("--eval_output_path", type=str, default=None,
+                        help="eval 结果保存路径。默认：剪枝 model 用 adapter_dir/results_{时间}.json，原 model 用 output_base/results_{时间}.json")
     return parser
 
 
@@ -102,6 +130,9 @@ def main() -> None:
         )
         logging.info("Calibration done, adapter saved to: %s", compressor._get_adapter_path())
 
+        # 保存 calib 涉及的全部参数到 method 目录下
+        _save_calib_config(args, Path(args.adapter_dir))
+
     elif args.mode == "eval":
         # adapter_dir 非空：先 patch 再评测剪枝模型；否则直接评测原模型
         if args.adapter_dir is not None:
@@ -111,19 +142,43 @@ def main() -> None:
         else:
             logging.info("[eval] Evaluating raw model (no adapter_dir)")
 
-        if args.output_model_path:
-            compressor.model.save_pretrained(args.output_model_path)
-            compressor.tokenizer.save_pretrained(args.output_model_path)
-            logging.info("Model saved to: %s", args.output_model_path)
-
         results = compressor.eval(
             tasks=args.tasks,
             num_fewshot=args.num_fewshot,
             batch_size=args.eval_batch_size,
             limit=args.limit,
         )
-        logging.info("Evaluation done")
-        print(results)
+
+        # 确定结果保存路径：显式指定 或 按规范默认
+        # 剪枝模型: output_base/method/results_{时间}.json；原模型: output_base/results_{时间}.json
+        eval_output = args.eval_output_path
+        if eval_output is None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if args.output_base:
+                output_base = Path(args.output_base)
+            else:
+                model_name = args.model.replace("\\", "/").split("/")[-1]
+                output_base = Path("./outputs") / model_name
+            if args.adapter_dir:
+                eval_output = str(Path(args.adapter_dir) / f"results_{ts}.json")
+            else:
+                eval_output = str(output_base / f"results_{ts}.json")
+
+        try:
+            from accelerate.state import PartialState
+            is_main = PartialState().is_main_process
+        except Exception:
+            is_main = True
+
+        if is_main:
+            Path(eval_output).parent.mkdir(parents=True, exist_ok=True)
+            obj = results.get("results", results) if isinstance(results, dict) else getattr(results, "results", results)
+            obj = obj if obj is not None else {}
+            with open(eval_output, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+            logging.info("Evaluation done, results saved to: %s", eval_output)
+            logging.info("Evaluation results: %s", obj)
+        
 
 
 if __name__ == "__main__":

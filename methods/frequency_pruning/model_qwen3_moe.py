@@ -229,6 +229,7 @@ class FrequencyPruningQwen3Moe(MoECompressor):
                 "keep_indices": keep_indices.cpu(),
                 "old_to_new": old_to_new.cpu(),
             }
+        
         logger.info("[calib] Step 4/4: Saving adapter")
         self.adapter_dir.mkdir(parents=True, exist_ok=True)
         state = {f"layer_{k}.keep_indices": v["keep_indices"] for k, v in keep_per_layer.items()}
@@ -242,6 +243,7 @@ class FrequencyPruningQwen3Moe(MoECompressor):
         """
         if self.adapter_dir is None:
             raise ValueError("patch 需提供 adapter_dir")
+        
         logger.info("[patch] Loading adapter")
         state = self.adapter
         if state is None:
@@ -249,6 +251,7 @@ class FrequencyPruningQwen3Moe(MoECompressor):
                 raise FileNotFoundError(f"未找到 adapter: {self.adapter_path}，请先运行 calib()")
             state = load_file(str(self.adapter_path))
         moe_layers = _get_moe_layers(self.model)
+        
         logger.info("[patch] Replacing %d MoE layers", len(moe_layers))
         for decoder_layer_idx, block in tqdm(moe_layers, desc="Patching layers", unit="layer"):
             key_pre = f"layer_{decoder_layer_idx}"
@@ -260,4 +263,5 @@ class FrequencyPruningQwen3Moe(MoECompressor):
                 old_to_new.to(block.gate.weight.device),
             )
             self.model.model.layers[decoder_layer_idx].mlp = pruned_block
+        
         return self.model
