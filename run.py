@@ -54,6 +54,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prune_ratio", type=float, default=0.5)
     parser.add_argument("--calibration_dataset", type=str, default="wikitext:wikitext-2-raw-v1")
     parser.add_argument("--max_calib_samples", type=int, default=512)
+    parser.add_argument("--max_context_len", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--output_model_path", type=str, default=None)
     parser.add_argument("--tasks", type=str, nargs="+", default=["wikitext"])
@@ -88,6 +89,7 @@ def main() -> None:
         compressor.calib(
             calibration_dataset=args.calibration_dataset,
             max_calib_samples=args.max_calib_samples,
+            max_context_len=args.max_context_len,
             batch_size=args.batch_size,
         )
         print(f"校准完成，adapter 已保存至: {compressor._get_adapter_path()}")

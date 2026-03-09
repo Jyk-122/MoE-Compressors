@@ -145,28 +145,32 @@ class FrequencyPruningQwen3Moe(MoECompressor):
 
     def calib(
         self,
-        calibration_data: list[str] | None = None,
-        calibration_dataset: str | None = None,
+        calibration_dataset: str,
         max_calib_samples: int = 512,
+        max_context_len: int = 2048,
         batch_size: int = 1,
         **kwargs,
     ) -> None:
         """
-        校准：在校准数据上计算统计量，并保存adapter，需要指定adapter_dir。
+        校准：在校准数据上计算统计量，并保存 adapter，需要指定 adapter_dir。
 
         Args:
-            calibration_data (list[str] | None): 可选，直接传入的校准文本数据。
-            calibration_dataset (str | None): 可选，HuggingFace数据集名，格式如"wikitext:wikitext-2-raw-v1"。
-            max_calib_samples (int): 最大校准样本数，默认512。
-            batch_size (int): 批量大小，默认1。
-            **kwargs: 其它方法相关的参数。
-        
+            calibration_dataset: HuggingFace 数据集路径，格式如 "wikitext:wikitext-2-raw-v1"
+            max_calib_samples: 最大校准样本数
+            max_context_len: 每个校准样本的目标 token 数
+            batch_size: 批量大小
+            **kwargs: 其它方法相关的参数
+
         Returns:
             None
-        """ 
+        """
         if self.adapter_dir is None:
             raise ValueError("calib 需提供 adapter_dir")
-        texts = self.load_calibration_data(calibration_data, calibration_dataset, max_calib_samples)
+        texts = self.load_calibration_data(
+            calibration_dataset=calibration_dataset,
+            max_calib_samples=max_calib_samples,
+            max_context_len=max_context_len,
+        )
         self.model.eval()
         if hasattr(self.model.config, "output_router_logits"):
             self.model.config.output_router_logits = True
@@ -182,7 +186,7 @@ class FrequencyPruningQwen3Moe(MoECompressor):
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=2048,
+                max_length=max_context_len,
             )
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
             with torch.no_grad():

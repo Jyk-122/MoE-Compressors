@@ -18,6 +18,7 @@ ADAPTER_DIR="./outputs/frequency_pruning/adapter"
 PRUNE_RATIO=0.5
 CALIBRATION_DATASET="wikitext:wikitext-2-raw-v1"
 MAX_CALIB_SAMPLES=512
+MAX_CONTEXT_LEN=2048
 OUTPUT_MODEL_PATH="./outputs/frequency_pruning/patched_model"
 TASKS="wikitext"
 EVAL_LIMIT=0.1
@@ -44,6 +45,7 @@ if [ "$MODE" = "calib" ]; then
     --adapter_dir "$ADAPTER_DIR" \
     --calibration_dataset "$CALIBRATION_DATASET" \
     --max_calib_samples $MAX_CALIB_SAMPLES \
+    --max_context_len $MAX_CONTEXT_LEN \
     --batch_size 1
 
 elif [ "$MODE" = "eval" ]; then

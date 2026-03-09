@@ -91,21 +91,21 @@ class MoECompressor(ABC):
     @abstractmethod
     def calib(
         self,
-        calibration_data: list[str] | None = None,
-        calibration_dataset: str | None = None,
+        calibration_dataset: str,
         max_calib_samples: int = 512,
+        max_context_len: int = 2048,
         batch_size: int = 1,
         **kwargs,
     ) -> None:
         """
-        校准：在校准数据上计算统计量，并保存adapter，需要指定adapter_dir。
+        校准：在校准数据上计算统计量，并保存 adapter，需要指定 adapter_dir。
 
         Args:
-            calibration_data (list[str] | None): 可选，直接传入的校准文本数据。
-            calibration_dataset (str | None): 可选，HuggingFace数据集名，格式如"wikitext:wikitext-2-raw-v1"。
-            max_calib_samples (int): 最大校准样本数，默认512。
-            batch_size (int): 批量大小，默认1。
-            **kwargs: 其它方法相关的参数。
+            calibration_dataset: HuggingFace 数据集路径，格式如 "wikitext:wikitext-2-raw-v1"
+            max_calib_samples: 最大校准样本数
+            max_context_len: 每个校准样本的目标 token 数
+            batch_size: 批量大小
+            **kwargs: 其它方法相关的参数
 
         Returns:
             None
@@ -202,27 +202,46 @@ class MoECompressor(ABC):
 
     def load_calibration_data(
         self,
-        calibration_data: list[str] | None = None,
-        calibration_dataset: str | None = None,
+        calibration_dataset: str,
         max_calib_samples: int = 512,
+        max_context_len: int = 2048,
     ) -> list[str]:
         """
-        加载校准文本。支持直接传入字符串列表，或从 HuggingFace 数据集读取。
+        从 HuggingFace 数据集加载校准文本。
 
-        calibration_dataset 格式：若数据集需指定 config，用 "dataset:config"，
-        如 "wikitext:wikitext-2-raw-v1"。
+        针对 wikitext 等按换行粗暴切分的数据集（大量空字符串）：逐行拼接。
+        当块内 token 数达到 max_context_len 时形成一个校准样本，直到得到 max_calib_samples 个样本。
+
+        Args:
+            calibration_dataset: 数据集路径，格式 "dataset" 或 "dataset:config"，
+                如 "wikitext:wikitext-2-raw-v1"
+            max_calib_samples: 最大校准样本数
+            max_context_len: 每个样本的目标 token 数上限
+
+        Returns:
+            校准文本块列表，每块约 max_context_len tokens
         """
-        if calibration_data:
-            return calibration_data[:max_calib_samples]
+        parts = calibration_dataset.split(":", 1)
+        name = parts[1] if len(parts) > 1 else None
+        ds = load_dataset(parts[0], name, split="train")
 
-        if calibration_dataset:
-            parts = calibration_dataset.split(":", 1)
-            name = parts[1] if len(parts) > 1 else None
-            ds = load_dataset(parts[0], name, split="train")
-            if "text" in ds.column_names:
-                texts = [t for t in ds["text"][:max_calib_samples] if t and t.strip()]
-            else:
-                col = ds.column_names[0]
-                texts = [str(t) for t in ds[col][:max_calib_samples]]
-            return texts
-        raise ValueError("需提供 calibration_data 或 calibration_dataset")
+        col = "text" if "text" in ds.column_names else ds.column_names[0]
+        raw = ds[col]
+        lines = [t for t in raw if t]
+
+        chunks = []
+        current_lines = []
+        for line in lines:
+            line = line if isinstance(line, str) else str(line)
+            if not line:
+                continue
+            current_lines.append(line)
+            combined = "".join(current_lines)
+            n_tokens = len(self.tokenizer.encode(combined, add_special_tokens=False))
+            if n_tokens >= max_context_len:
+                chunks.append(combined)
+                if len(chunks) >= max_calib_samples:
+                    break
+                current_lines = []
+
+        return chunks
