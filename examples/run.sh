@@ -46,6 +46,10 @@ fi
 BASE_ARGS="--model $MODEL --device $DEVICE --dtype $DTYPE --prune_ratio $PRUNE_RATIO"
 
 if [ "$MODE" = "calib" ]; then
+  if [ -z "$ADAPTER_DIR" ]; then
+    echo "ERROR: ADAPTER_DIR 不能为空"
+    exit 1
+  fi
   # 单卡校准
   python run.py $METHOD calib $BASE_ARGS \
     --adapter_dir "$ADAPTER_DIR" \
