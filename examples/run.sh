@@ -15,7 +15,7 @@ export HF_ALLOW_CODE_EVAL=1
 
 # ========== 参数配置 ==========
 METHOD="frequency_pruning"
-MODEL="Qwen/Qwen3-MoE-30B-A3B"
+MODEL="Qwen/Qwen3-MoE-30B-A3B-Instruct-2507"
 # 输出根目录，与 model 相关的输出统一放在 DEFAULT_DIR/model_name/ 下
 # adapter: DEFAULT_DIR/model_name/method/adapter.safetensors
 # 原模型 eval 结果: DEFAULT_DIR/model_name/results_xxx.json
@@ -28,8 +28,9 @@ PRUNE_RATIO=0.5
 CALIBRATION_DATASET="wikitext:wikitext-2-raw-v1"
 MAX_CALIB_SAMPLES=128
 MAX_CONTEXT_LEN=2048
-TASKS="piqa hellaswag winogrande arc mmlu mmlu_pro gsm8k hendrycks_ethics mbpp humaneval"
+TASKS="piqa hellaswag winogrande arc mmlu mmlu_pro gsm8k hendrycks_math mbpp humaneval"
 EVAL_LIMIT=100000
+GEN_KWARGS="max_gen_toks=1024"
 EVAL_OUTPUT_PATH=""
 DEVICE="cuda"
 DTYPE="float16"
@@ -66,6 +67,7 @@ elif [ "$MODE" = "eval" ]; then
   EVAL_ARGS="$BASE_ARGS --tasks $TASKS --limit $EVAL_LIMIT --output_base $OUTPUT_BASE"
   EXTRA_ARGS=()
   [ -n "$EVAL_OUTPUT_PATH" ] && EXTRA_ARGS+=(--eval_output_path "$EVAL_OUTPUT_PATH")
+  [ -n "$GEN_KWARGS" ] && EXTRA_ARGS+=(--gen_kwargs "$GEN_KWARGS")
   # EVAL_RAW=1 或 ADAPTER_DIR 为空 → 不传 adapter_dir，评测原模型
   if [ "${EVAL_RAW:-0}" = "1" ] || [ -z "$ADAPTER_DIR" ]; then
     accelerate launch run.py $METHOD eval $EVAL_ARGS "${EXTRA_ARGS[@]}"

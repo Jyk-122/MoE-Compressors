@@ -222,15 +222,13 @@ class FrequencyPruningQwen3Moe(MoECompressor):
                 )
 
             # 从 router_logits 推断每 token 选中的 topk 专家，累加计数
-            for layer_idx, (decoder_layer_idx, _) in enumerate(moe_layers):
+            for layer_idx, _ in enumerate(moe_layers):
                 logits = outputs.router_logits[layer_idx]
                 if logits.dim() == 3:
                     logits = logits.reshape(-1, logits.shape[-1])
                 probs = F.softmax(logits.float(), dim=-1)
                 _, selected = torch.topk(probs, top_k, dim=-1)
-                for tok in range(selected.shape[0]):
-                    for k in range(selected.shape[1]):
-                        expert_counts[decoder_layer_idx][selected[tok, k].item()] += 1
+                expert_counts[layer_idx] += torch.bincount(selected.view(-1), minlength=num_experts).type_as(expert_counts[layer_idx])
 
         logger.info("[calib] Step 3/4: Determining kept experts by activation frequency")
         keep_per_layer = {}

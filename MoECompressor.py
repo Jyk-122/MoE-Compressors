@@ -126,9 +126,10 @@ class MoECompressor(ABC):
     def eval(
         self,
         tasks: list[str] | None = None,
-        num_fewshot: int | dict[str, int] = 0,
+        num_fewshot: int | None = None,
         batch_size: int | str = 1,
         limit: float | None = None,
+        gen_kwargs: str | dict | None = None,
         **lm_eval_kwargs,
     ) -> dict[str, Any]:
         """
@@ -142,6 +143,7 @@ class MoECompressor(ABC):
             num_fewshot: few-shot 数量
             batch_size: 评测 batch size，可为 "auto"
             limit: 每任务样本上限，如 0.1 表示 10%
+            gen_kwargs: 生成参数，如 "max_gen_toks=1024" 或 dict，对 generate_until 任务生效
             **lm_eval_kwargs: 传给 simple_evaluate 的额外参数
 
         Returns:
@@ -179,6 +181,8 @@ class MoECompressor(ABC):
             num_fewshot=num_fewshot,
             batch_size=batch_size,
             limit=limit,
+            confirm_run_unsafe_code=True,
+            gen_kwargs=gen_kwargs,
             **lm_eval_kwargs,
         )
         return results

@@ -88,13 +88,15 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_context_len", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--tasks", type=str, nargs="+", default=["wikitext"])
-    parser.add_argument("--num_fewshot", type=int, default=0)
+    parser.add_argument("--num_fewshot", type=int, default=None)
     parser.add_argument("--eval_batch_size", type=str, default="auto")
     parser.add_argument("--limit", type=float, default=None)
     parser.add_argument("--output_base", type=str, default=None,
                         help="输出根目录，如 outputs/model_name。用于推导 eval 默认结果路径")
     parser.add_argument("--eval_output_path", type=str, default=None,
                         help="eval 结果保存路径。默认：剪枝 model 用 adapter_dir/results_{时间}.json，原 model 用 output_base/results_{时间}.json")
+    parser.add_argument("--gen_kwargs", type=str, default=None,
+                        help="lm_eval 生成参数，如 max_gen_toks=1024 或 max_gen_toks=1024,temperature=0.8。对 generate_until 类任务（mbpp、humaneval 等）生效")
     return parser
 
 
@@ -139,6 +141,7 @@ def main() -> None:
             num_fewshot=args.num_fewshot,
             batch_size=args.eval_batch_size,
             limit=args.limit,
+            gen_kwargs=args.gen_kwargs,
         )
 
         # 确定结果保存路径：显式指定 或 按规范默认
@@ -167,7 +170,7 @@ def main() -> None:
             obj = results.get("results", results) if isinstance(results, dict) else getattr(results, "results", results)
             obj = obj if obj is not None else {}
             with open(eval_output, "w", encoding="utf-8") as f:
-                json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+                json.dump(results, f, ensure_ascii=False, indent=2, default=str)
             
             logging.info("Evaluation done, results saved to: %s", eval_output)
             logging.info("Evaluation results: %s", obj)
