@@ -184,6 +184,10 @@ class MoECompressor(ABC):
             tokenizer = configure_pad_token(tokenizer, model_config=model.config)
         except Exception:
             pass
+        
+        # 忽略 datasets 和 httpx 的警告
+        logging.getLogger("datasets").setLevel(logging.ERROR)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
 
         lm = HFLM(
             pretrained=model,

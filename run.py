@@ -175,7 +175,8 @@ def main() -> None:
             obj = results.get("results", results) if isinstance(results, dict) else getattr(results, "results", results)
             obj = obj if obj is not None else {}
             with open(eval_output, "w", encoding="utf-8") as f:
-                json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+                json.dump(results, f, ensure_ascii=False, indent=2, default=str)
+            
             logging.info("Evaluation done, results saved to: %s", eval_output)
             logging.info("Evaluation results: %s", obj)
         

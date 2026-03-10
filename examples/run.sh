@@ -10,9 +10,12 @@
 #   bash examples/run.sh eval
 #   EVAL_RAW=1 bash examples/run.sh eval    # 强制评测原模型
 
+# ========== 环境变量 ==========
+export HF_ALLOW_CODE_EVAL=1
+
 # ========== 参数配置 ==========
 METHOD="frequency_pruning"
-MODEL="Qwen/Qwen3-MoE-15B-A2B"
+MODEL="Qwen/Qwen3-MoE-30B-A3B"
 # 输出根目录，与 model 相关的输出统一放在 DEFAULT_DIR/model_name/ 下
 # adapter: DEFAULT_DIR/model_name/method/adapter.safetensors
 # 原模型 eval 结果: DEFAULT_DIR/model_name/results_xxx.json
@@ -25,8 +28,8 @@ PRUNE_RATIO=0.5
 CALIBRATION_DATASET="wikitext:wikitext-2-raw-v1"
 MAX_CALIB_SAMPLES=128
 MAX_CONTEXT_LEN=2048
-TASKS="wikitext"
-EVAL_LIMIT=0.1
+TASKS="piqa hellaswag winogrande arc mmlu mmlu_pro gsm8k hendrycks_ethics mbpp humaneval"
+EVAL_LIMIT=100000
 EVAL_OUTPUT_PATH=""
 DEVICE="cuda"
 DTYPE="float16"
