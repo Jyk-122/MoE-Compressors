@@ -172,35 +172,50 @@ class FrequencyPruningQwen3Moe(MoECompressor):
         if self.adapter_dir is None:
             raise ValueError("calib 需提供 adapter_dir")
 
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        logger.info("[calib] Step 0/4: Loading model and tokenizer")
+        model = AutoModelForCausalLM.from_pretrained(
+            self.model_name_or_path,
+            torch_dtype=self.torch_dtype,
+            device_map=self.device,
+            trust_remote_code=self.trust_remote_code,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name_or_path,
+            trust_remote_code=self.trust_remote_code,
+        )
+
         logger.info("[calib] Step 1/4: Loading calibration data")
         texts = self.load_calibration_data(
+            tokenizer=tokenizer,
             calibration_dataset=calibration_dataset,
             max_calib_samples=max_calib_samples,
             max_context_len=max_context_len,
         )
 
         logger.info("[calib] Step 2/4: Forward pass to collect expert activation stats")
-        self.model.eval()
-        if hasattr(self.model.config, "output_router_logits"):
-            self.model.config.output_router_logits = True
-        moe_layers = _get_moe_layers(self.model)
-        num_experts = self.model.config.num_experts
-        top_k = self.model.config.num_experts_per_tok
+        model.eval()
+        if hasattr(model.config, "output_router_logits"):
+            model.config.output_router_logits = True
+        moe_layers = _get_moe_layers(model)
+        num_experts = model.config.num_experts
+        top_k = model.config.num_experts_per_tok
         expert_counts: dict[int, torch.Tensor] = {i: torch.zeros(num_experts) for i, _ in moe_layers}
 
         n_batches = (len(texts) + batch_size - 1) // batch_size
         for start in tqdm(range(0, len(texts), batch_size), total=n_batches, desc="Calibration forward", unit="batch"):
             batch_texts = texts[start : start + batch_size]
-            inputs = self.tokenizer(
+            inputs = tokenizer(
                 batch_texts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
                 max_length=max_context_len,
             )
-            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
             with torch.no_grad():
-                outputs = self.model(**inputs, output_router_logits=True)
+                outputs = model(**inputs, output_router_logits=True)
             if outputs.router_logits is None:
                 raise RuntimeError(
                     "模型未返回 router_logits，请确保 config.output_router_logits=True"
@@ -237,22 +252,20 @@ class FrequencyPruningQwen3Moe(MoECompressor):
         state.update({f"layer_{k}.old_to_new": v["old_to_new"] for k, v in keep_per_layer.items()})
         save_file(state, str(self._get_adapter_path()))
 
-    def patch(self, **kwargs) -> Any:
+    def patch(self, model, **kwargs) -> Any:
         """
-        打补丁：读取 adapter，将每层 MoE 的 SparseMoeBlock 替换为 PrunedQwen3MoeSparseMoeBlock。
-        由 run.py 在 eval 时根据 adapter_dir 是否传入自动调用。
+        打补丁：读取 adapter，将给定 model 的每层 MoE 替换为 PrunedQwen3MoeSparseMoeBlock。
+        由 eval() 在 HFLM 初始化后对 lm._model 调用。
         """
         if self.adapter_dir is None:
             raise ValueError("patch 需提供 adapter_dir")
-        
-        logger.info("[patch] Loading adapter")
-        state = self.adapter
-        if state is None:
-            if not self.adapter_path.exists():
-                raise FileNotFoundError(f"未找到 adapter: {self.adapter_path}，请先运行 calib()")
-            state = load_file(str(self.adapter_path))
 
-        layers = self.model.model.layers
+        logger.info("[patch] Loading adapter")
+        if not self.adapter_path.exists():
+            raise FileNotFoundError(f"未找到 adapter: {self.adapter_path}，请先运行 calib()")
+        state = load_file(str(self.adapter_path))
+
+        layers = model.model.layers
         moe_indices = [
             i for i, layer in enumerate(layers)
             if hasattr(layer, "mlp") and isinstance(layer.mlp, Qwen3MoeSparseMoeBlock)
@@ -275,4 +288,4 @@ class FrequencyPruningQwen3Moe(MoECompressor):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return self.model
+        return model

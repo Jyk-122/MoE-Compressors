@@ -134,14 +134,6 @@ def main() -> None:
         _save_calib_config(args, Path(args.adapter_dir))
 
     elif args.mode == "eval":
-        # adapter_dir 非空：先 patch 再评测剪枝模型；否则直接评测原模型
-        if args.adapter_dir is not None:
-            logging.info("[eval] Applying prune patch")
-            compressor.patch()
-            logging.info("[eval] Evaluating pruned model")
-        else:
-            logging.info("[eval] Evaluating raw model (no adapter_dir)")
-
         results = compressor.eval(
             tasks=args.tasks,
             num_fewshot=args.num_fewshot,
@@ -175,7 +167,7 @@ def main() -> None:
             obj = results.get("results", results) if isinstance(results, dict) else getattr(results, "results", results)
             obj = obj if obj is not None else {}
             with open(eval_output, "w", encoding="utf-8") as f:
-                json.dump(results, f, ensure_ascii=False, indent=2, default=str)
+                json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
             
             logging.info("Evaluation done, results saved to: %s", eval_output)
             logging.info("Evaluation results: %s", obj)

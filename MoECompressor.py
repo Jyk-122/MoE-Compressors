@@ -25,8 +25,6 @@ import torch
 from tqdm import tqdm
 
 logger = logging.getLogger("MoECompressor")
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from safetensors.torch import load_file
 from datasets import load_dataset
 
 if TYPE_CHECKING:
@@ -66,26 +64,8 @@ class MoECompressor(ABC):
         self.trust_remote_code = trust_remote_code
         self.extra_kwargs = kwargs
 
-        logger.info("Loading model: %s", model_name_or_path)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name_or_path,
-            torch_dtype=self.torch_dtype,
-            device_map=device,
-            trust_remote_code=trust_remote_code,
-        )
-        logger.info("Loading tokenizer: %s", model_name_or_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name_or_path,
-            trust_remote_code=self.trust_remote_code,
-        )
-
-        self.adapter_path = None
-        self.adapter = None
-        if self.adapter_dir is not None:
-            self.adapter_path = self._get_adapter_path()
-            if self.adapter_path.exists():
-                logger.info("Loading adapter: %s", self.adapter_path)
-                self.adapter = load_file(str(self.adapter_path))
+        # adapter 路径，patch 时按需加载
+        self.adapter_path = self._get_adapter_path() if self.adapter_dir is not None else None
 
     def _get_adapter_path(self) -> Path:
         """返回 adapter.safetensors 的完整路径。"""
@@ -122,19 +102,20 @@ class MoECompressor(ABC):
     @abstractmethod
     def patch(
         self,
+        model: PreTrainedModel,
         **kwargs,
     ) -> PreTrainedModel:
         """
-        打补丁：读取 adapter，对 self.model 非侵入式地修改模型结构、权重和 forward 逻辑。
+        打补丁：读取 adapter，对给定 model 原地修改 MoE 层结构、权重和 forward 逻辑。
 
-        通常在 eval 前由 run.py 根据 adapter_dir 是否传入自动调用，不作为独立用户动作暴露。
-        返回的模型为标准 ModelForCausalLM，可直接用于 transformers 推理或传给 eval。
+        由 eval() 在 HFLM 初始化后、simple_evaluate 前调用，对 lm._model 做 patch。
 
         Args:
-            kwargs: 与压缩方法相关的参数。
+            model: 待 patch 的 ModelForCausalLM（通常为 HFLM._model）
+            **kwargs: 与压缩方法相关的参数。
 
         Returns:
-            self.model: 打过补丁的 ModelForCausalLM
+            model: 打过补丁的 model（原地修改，返回同一对象）
         """
         pass
 
@@ -144,7 +125,6 @@ class MoECompressor(ABC):
 
     def eval(
         self,
-        model: PreTrainedModel | None = None,
         tasks: list[str] | None = None,
         num_fewshot: int | dict[str, int] = 0,
         batch_size: int | str = 1,
@@ -154,11 +134,10 @@ class MoECompressor(ABC):
         """
         评测：用 lm_eval 评估模型。
 
-        内部将模型用 HFLM 封装，调用 simple_evaluate。所有压缩方法共用此流程。
-        调用前若已通过 patch() 修改 self.model，则评测剪枝模型；否则评测原模型。
+        使用 HFLM(pretrained=model_path) 传入路径，以支持 accelerate 分布式数据并行。
+        若 adapter_dir 非空，则对 lm._model 原地 patch 后再评测剪枝模型。
 
         Args:
-            model: 待评测模型。若 None，使用 self.model（可能已被 patch 修改）
             tasks: 评测任务名列表，如 ["wikitext", "hellaswag"]
             num_fewshot: few-shot 数量
             batch_size: 评测 batch size，可为 "auto"
@@ -174,29 +153,24 @@ class MoECompressor(ABC):
         except ImportError as e:
             raise ImportError("eval 需要 lm_eval: pip install lm_eval[hf]") from e
 
-        model = model if model is not None else self.model
-        tokenizer = self.tokenizer
-
         logger.info("Starting evaluation, tasks: %s", tasks or ["wikitext"])
+        logger.info("Loading model via HFLM (pretrained=%s) for distributed eval", self.model_name_or_path)
 
-        try:
-            from lm_eval.models.utils import configure_pad_token
-            tokenizer = configure_pad_token(tokenizer, model_config=model.config)
-        except Exception:
-            pass
-        
         # 忽略 datasets 和 httpx 的警告
         logging.getLogger("datasets").setLevel(logging.ERROR)
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
         lm = HFLM(
-            pretrained=model,
-            tokenizer=tokenizer,
-            device=self.device,
+            pretrained=self.model_name_or_path,
             batch_size=batch_size,
+            device=self.device,
             dtype=self.torch_dtype,
             trust_remote_code=self.trust_remote_code,
         )
+
+        if self.adapter_dir is not None:
+            logger.info("[eval] Applying prune patch to lm._model")
+            self.patch(lm._model)
 
         tasks = tasks or ["wikitext"]
         results = simple_evaluate(
@@ -215,6 +189,7 @@ class MoECompressor(ABC):
 
     def load_calibration_data(
         self,
+        tokenizer,
         calibration_dataset: str,
         max_calib_samples: int = 512,
         max_context_len: int = 2048,
@@ -226,6 +201,7 @@ class MoECompressor(ABC):
         当块内 token 数达到 max_context_len 时形成一个校准样本，直到得到 max_calib_samples 个样本。
 
         Args:
+            tokenizer: 用于 encode 的 tokenizer，由 calib 加载后传入
             calibration_dataset: 数据集路径，格式 "dataset" 或 "dataset:config"，
                 如 "wikitext:wikitext-2-raw-v1"
             max_calib_samples: 最大校准样本数
@@ -253,7 +229,7 @@ class MoECompressor(ABC):
                 continue
             current_lines.append(line)
             combined = "".join(current_lines)
-            n_tokens = len(self.tokenizer.encode(combined, add_special_tokens=False))
+            n_tokens = len(tokenizer.encode(combined, add_special_tokens=False))
             if n_tokens >= max_context_len:
                 chunks.append(combined)
                 pbar.update(1)
