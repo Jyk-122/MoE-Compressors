@@ -15,20 +15,20 @@ export HF_ALLOW_CODE_EVAL=1
 
 # ========== 参数配置 ==========
 METHOD="frequency_pruning"
+PRUNE_RATIO=0.5
 MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"
 # 输出根目录，与 model 相关的输出统一放在 DEFAULT_DIR/model_name/ 下
-# adapter: DEFAULT_DIR/model_name/method/adapter.safetensors
+# adapter: DEFAULT_DIR/model_name/method/0.5/adapter.safetensors
 # 原模型 eval 结果: DEFAULT_DIR/model_name/results_xxx.json
-# 剪枝模型 eval 结果: DEFAULT_DIR/model_name/method/results_xxx.json
+# 剪枝模型 eval 结果: DEFAULT_DIR/model_name/method/0.5/results_xxx.json
 DEFAULT_DIR="./outputs"
 MODEL_NAME="${MODEL##*/}"
 OUTPUT_BASE="${DEFAULT_DIR}/${MODEL_NAME}"
-ADAPTER_DIR="${OUTPUT_BASE}/${METHOD}"
-PRUNE_RATIO=0.5
+ADAPTER_DIR="${OUTPUT_BASE}/${METHOD}/${PRUNE_RATIO}"
 CALIBRATION_DATASET="wikitext:wikitext-2-raw-v1"
 MAX_CALIB_SAMPLES=128
 MAX_CONTEXT_LEN=2048
-TASKS="piqa hellaswag winogrande arc_easy arc_challenge mmlu gsm8k hendrycks_math mbpp humaneval"
+TASKS="piqa hellaswag winogrande arc_easy arc_challenge mmlu gsm8k hendrycks_math500 mbpp humaneval"
 EVAL_LIMIT=100000
 GEN_KWARGS="max_gen_toks=1024"
 EVAL_OUTPUT_PATH=""
