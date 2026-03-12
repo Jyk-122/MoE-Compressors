@@ -25,7 +25,7 @@ MoE-Compressors/
 └── requirements.txt
 ```
 
-### Modes
+MoE-Compressors支持以下两种运行模式：
 
 | 模式 | 说明 | 运行方式 |
 |------|------|----------|
@@ -77,11 +77,19 @@ bash run.sh calib           # 单卡校准
 bash run.sh eval            # 多卡评测剪枝模型（ADAPTER_DIR 非空）
 
 # 覆盖参数
-METHOD=ean_pruning PRUNE_RATIO=0.3 bash run.sh calib
-METHOD=ean_pruning PRUNE_RATIO=0.3 bash run.sh eval
+METHOD=ean_pruning PRUNE_RATIO=0.5 bash run.sh calib
+METHOD=ean_pruning PRUNE_RATIO=0.5 bash run.sh eval
 MODEL=Qwen/Qwen3-8B bash run.sh eval
 EVAL_RAW=1 bash run.sh eval  # 强制评测原模型（不 patch）
 ```
+
+## Algorithms
+
+| 状态 | 方法 | 论文来源 |
+|:----:|------|----------|
+| ✓ | **frequency_pruning** | 常见 baseline，见 MoE 剪枝文献 |
+| ✓ | **ean_pruning** | [Finding Fantastic Experts in MoEs: A Unified Study for Expert Dropping Strategies and Observations](https://arxiv.org/abs/2504.05586) |
+| ☐ | **TODO_EXAMPLE** |   |
 
 ## Design Notes
 

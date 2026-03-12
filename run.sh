@@ -10,7 +10,7 @@
 #   bash run.sh eval
 #
 # 【外部覆盖】支持通过环境变量覆盖 METHOD、PRUNE_RATIO、MODEL，例如：
-#   METHOD=ean_pruning PRUNE_RATIO=0.3 bash run.sh eval
+#   METHOD=ean_pruning PRUNE_RATIO=0.5 bash run.sh eval
 #   MODEL=Qwen/Qwen3-8B bash run.sh calib
 
 # ========== 环境变量 ==========
@@ -51,7 +51,7 @@ MODE="${1:-}"
 if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
   echo "用法: bash run.sh calib | eval"
   echo "  可选环境变量: METHOD, PRUNE_RATIO, MODEL"
-  echo "  示例: METHOD=ean_pruning PRUNE_RATIO=0.3 bash run.sh eval"
+  echo "  示例: METHOD=ean_pruning PRUNE_RATIO=0.5 bash run.sh eval"
   echo ""
   echo "  calib: 单卡校准，保存 adapter 到 ADAPTER_DIR"
   echo "  eval:  多卡评测；ADAPTER_DIR 非空则 patch 后评测，否则评测原模型"
