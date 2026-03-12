@@ -1,13 +1,13 @@
 """
-EAN (Expert Activation Norm) 方法 - 基于专家激活范数的剪枝（Qwen3-MoE 实现）
+REAP (Why Pruning Prevails for One-Shot MoE compression) 方法 - 基于专家激活范数与 top-k weights 的剪枝（Qwen3-MoE 实现）
 
 【原理】
-在校准集上统计每个专家所输出的激活向量的 L2 范数（Norm）的和。
+在校准集上统计每个专家所输出的激活向量的 L2 范数（Norm）与 top-k weights 的乘积的均值。
 值越大表示专家越重要，越小越优先被裁剪。
 
 【适配 Qwen3-MoE】
 - MoE 层为 Qwen3MoeSparseMoeBlock，内含 gate (Router) 和 experts
-- 在校准 forward 时，对每个专家的输出（乘 routing weight 之前）计算 L2 范数，按专家累加求和
+- 在校准 forward 时，对每个专家的输出（乘 routing weight 之前）计算 L2 范数与 top-k weights 的乘积，按专家累加求均值
 - patch 时：与 frequency_pruning 相同，替换为 PrunedQwen3MoeSparseMoeBlock
 """
 
@@ -80,6 +80,8 @@ def _experts_forward_with_norm_collection(
         expert_output = F.linear(current_hidden_states, experts_module.down_proj[expert_idx])
         # 计算每个 token 输出的 L2 范数
         norms = torch.norm(expert_output.float(), p=2, dim=-1)
+        # 计算每个 token 输出的 L2 范数与 top-k weights 的乘积
+        norms = norms * top_k_weights[token_idx, top_k_pos, None]
         # 累加统计
         if layer_idx not in norm_stats:
             norm_stats[layer_idx] = {}
@@ -154,11 +156,11 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 
-class EANPruningQwen3Moe(MoECompressor):
+class REAPPruningQwen3Moe(MoECompressor):
     """
-    基于 Expert Activation Norm 的专家剪枝，适配 Qwen3-MoE。
+    基于 REAP 的专家剪枝，适配 Qwen3-MoE。
 
-    统计每个专家输出激活向量的 L2 范数均值，剪掉范数最小的专家。
+    统计每个专家输出激活向量的 L2 范数与 top-k weights 的乘积的均值，剪掉均值最小的专家。
     """
 
     def __init__(
@@ -217,7 +219,7 @@ class EANPruningQwen3Moe(MoECompressor):
             max_context_len=max_context_len,
         )
 
-        logger.info("[calib] Step 2/4: Forward pass to collect expert activation norms (EAN)")
+        logger.info("[calib] Step 2/4: Forward pass to collect expert activation norms (REAP)")
         model.eval()
         moe_layers = _get_moe_layers(model)
         num_experts = model.config.num_experts
@@ -257,17 +259,17 @@ class EANPruningQwen3Moe(MoECompressor):
             with torch.no_grad():
                 model(**inputs)
 
-        logger.info("[calib] Step 3/4: Determining kept experts by EAN (Experts Activation Norm)")
+        logger.info("[calib] Step 3/4: Determining kept experts by REAP")
         keep_per_layer = {}
         for decoder_layer_idx, _ in moe_layers:
             layer_stats = norm_stats.get(decoder_layer_idx, {})
             
-            sum_norms = torch.full((num_experts,), 0.0, dtype=torch.float64)
+            mean_norms = torch.full((num_experts,), 0.0, dtype=torch.float64)
             for expert_idx, (sum_norm, count) in layer_stats.items():
-                sum_norms[expert_idx] = sum_norm
+                mean_norms[expert_idx] = sum_norm / count
 
             num_keep = max(1, int(num_experts * (1 - self.prune_ratio)))
-            _, top_indices = torch.topk(sum_norms, num_keep)
+            _, top_indices = torch.topk(mean_norms, num_keep)
             keep_indices = top_indices.sort().values
             old_to_new = torch.full((num_experts,), -1, dtype=torch.long)
             for new_idx, old_idx in enumerate(keep_indices.tolist()):

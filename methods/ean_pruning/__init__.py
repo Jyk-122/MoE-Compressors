@@ -1,6 +1,6 @@
 """
 EAN (Expert Activation Norm) pruning.
-Prunes experts with lowest mean L2 norm of activation outputs on calibration data.
+Prunes experts with lowest sum L2 norm of activation outputs on calibration data.
 """
 
 from .model_qwen3_moe import EANPruningQwen3Moe

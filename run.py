@@ -34,6 +34,7 @@ from transformers import AutoConfig
 
 from methods.frequency_pruning.model_qwen3_moe import FrequencyPruningQwen3Moe
 from methods.ean_pruning.model_qwen3_moe import EANPruningQwen3Moe
+from methods.reap_pruning.model_qwen3_moe import REAPPruningQwen3Moe
 
 # 方法注册表：method_name -> { model_type -> compressor_cls }
 # model_type 与 HuggingFace config.model_type 保持一致，便于自动推断
@@ -43,6 +44,9 @@ METHOD_REGISTRY = {
     },
     "ean_pruning": {
         "qwen3_moe": EANPruningQwen3Moe,
+    },
+    "reap_pruning": {
+        "qwen3_moe": REAPPruningQwen3Moe,
     },
 }
 
