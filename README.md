@@ -18,6 +18,8 @@ MoE-Compressors/
 ├── methods/
 │   ├── frequency_pruning/    # 方法：基于激活频率的专家剪枝
 │   │   └── model_qwen3_moe.py
+│   ├── ean_pruning/         # 方法：基于 Expert Activation Norm 的专家剪枝
+│   │   └── model_qwen3_moe.py
 │   └── ...
 ├── examples/
 │   └── run.sh                # 示例脚本：calib 单卡，eval 多卡（accelerate）
@@ -86,5 +88,13 @@ EVAL_RAW=1 bash examples/run.sh eval # 强制多卡评测原模型
 - MoE的专家剪枝只涉及FFN的修改，非侵入式的`patch`更简洁高效，不提供 `modeling_xxx.py`，且剪枝后模型的 `forward` 逻辑通常与 base 模型不一致，无法用 `from_pretrained()` 直接加载
 - 使用剪枝模型的正确方式是：**加载 base 模型 → 加载 adapter → 执行 patch()**，三者缺一不可
 
-**推荐使用流程**：calib 后仅分发 adapter 目录，推理/评测时加载 base 和 adapter_dir` 再 patch 即可。
+**推荐使用流程**：calib 后仅分发 adapter 目录，推理/评测时加载 base 和 adapter_dir 再 patch 即可。
+
+### model_type 与扩展新模型
+
+`--model_type` 未指定时，会从 base 模型的 `config.model_type`（HuggingFace 标准字段）自动推断。
+
+**开发者约定**：新增方法实现时，`model_type` 必须与 HuggingFace 的 `config.model_type` **严格保持一致**，不做二次映射。例如 Qwen3-MoE 的 config 中 `model_type="qwen3_moe"`，则注册表中对应 key 也应为 `"qwen3_moe"`。这样 `run.py` 才能通过 `AutoConfig.from_pretrained(model).model_type` 自动推断并正确查找到实现类。
+
+目录组织示例：为 `ean_pruning` 新增 GPT-OSS 适配时，创建 `methods/ean_pruning/model_gpt_oss.py`，在 `run.py` 的 `METHOD_REGISTRY` 中注册 `"ean_pruning": { ..., "gpt_oss": EANPruningGptOss }`（假设 HF 中该模型的 `config.model_type` 为 `"gpt_oss"`）。
 

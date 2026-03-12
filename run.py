@@ -30,15 +30,33 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from methods.frequency_pruning.model_qwen3_moe import FrequencyPruningQwen3Moe
+from transformers import AutoConfig
 
-# 方法注册表：method_name -> (compressor_cls, default_model_type)
+from methods.frequency_pruning.model_qwen3_moe import FrequencyPruningQwen3Moe
+from methods.ean_pruning.model_qwen3_moe import EANPruningQwen3Moe
+
+# 方法注册表：method_name -> { model_type -> compressor_cls }
+# model_type 与 HuggingFace config.model_type 保持一致，便于自动推断
 METHOD_REGISTRY = {
-    "frequency_pruning": (FrequencyPruningQwen3Moe, "qwen3_moe"),
+    "frequency_pruning": {
+        "qwen3_moe": FrequencyPruningQwen3Moe,
+    },
+    "ean_pruning": {
+        "qwen3_moe": EANPruningQwen3Moe,
+    },
 }
 
 
-def _save_calib_config(args: argparse.Namespace, adapter_dir: Path) -> None:
+def infer_model_type(model_name_or_path: str, trust_remote_code: bool = True) -> str:
+    """从 base 模型配置推断 model_type（即 config.model_type），用于方法注册表查找。"""
+    config = AutoConfig.from_pretrained(
+        model_name_or_path,
+        trust_remote_code=trust_remote_code,
+    )
+    return config.model_type
+
+
+def _save_calib_config(args: argparse.Namespace, adapter_dir: Path, model_type: str) -> None:
     """将 calib 涉及的全部参数保存到 adapter_dir/config.json。"""
     config_path = adapter_dir / "config.json"
     adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -47,7 +65,7 @@ def _save_calib_config(args: argparse.Namespace, adapter_dir: Path) -> None:
         "mode": "calib",
         "model": args.model,
         "adapter_dir": str(adapter_dir),
-        "model_type": args.model_type,
+        "model_type": model_type,
         "device": args.device,
         "dtype": args.dtype,
         "prune_ratio": args.prune_ratio,
@@ -78,7 +96,8 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--adapter_dir", type=str, default=None,
                         help="adapter目录。calib 时必填（保存路径）；eval 时可选，非空则 patch 后评测剪枝模型，空则评测原模型")
-    parser.add_argument("--model_type", type=str, default=None)
+    parser.add_argument("--model_type", type=str, default=None,
+                        help="模型类型，用于选择方法实现。未指定时从 --model 的 config.model_type 自动推断")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dtype", type=str, default="float16",
                         choices=["float16", "bfloat16", "float32"])
@@ -107,8 +126,21 @@ def main() -> None:
         raise ValueError("calib 模式需提供 --adapter_dir（用于保存 adapter）")
 
     logging.info("========== MoE-Compressors: %s mode ==========", args.mode.upper())
-    cls, default_model_type = METHOD_REGISTRY[args.method]
-    model_type = args.model_type or default_model_type
+
+    # model_type: 显式指定 或 从 base 模型 config 自动推断
+    if args.model_type is not None:
+        model_type = args.model_type
+    else:
+        model_type = infer_model_type(args.model)
+        logging.info("Inferred model_type='%s' from model config", model_type)
+
+    model_registry = METHOD_REGISTRY[args.method]
+    if model_type not in model_registry:
+        raise ValueError(
+            f"方法 '{args.method}' 尚未实现 model_type='{model_type}' 的适配，"
+            f"支持的类型: {list(model_registry.keys())}"
+        )
+    cls = model_registry[model_type]
 
     import torch
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
@@ -133,7 +165,7 @@ def main() -> None:
         logging.info("Calibration done, adapter saved to: %s", compressor._get_adapter_path())
 
         # 保存 calib 涉及的全部参数到 method 目录下
-        _save_calib_config(args, Path(args.adapter_dir))
+        _save_calib_config(args, Path(args.adapter_dir), model_type)
 
     elif args.mode == "eval":
         results = compressor.eval(
