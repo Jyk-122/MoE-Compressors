@@ -15,14 +15,13 @@ pip install -r requirements.txt
 MoE-Compressors/
 ├── MoECompressor.py          # 抽象基类（calib / patch / eval）
 ├── run.py                    # 统一入口，两种模式：calib | eval
+├── run.sh                    # 运行脚本：calib 单卡，eval 多卡（accelerate），支持 METHOD/PRUNE_RATIO/MODEL 覆盖
 ├── methods/
 │   ├── frequency_pruning/    # 方法：基于激活频率的专家剪枝
 │   │   └── model_qwen3_moe.py
 │   ├── ean_pruning/         # 方法：基于 Expert Activation Norm 的专家剪枝
 │   │   └── model_qwen3_moe.py
 │   └── ...
-├── examples/
-│   └── run.sh                # 示例脚本：calib 单卡，eval 多卡（accelerate）
 └── requirements.txt
 ```
 
@@ -56,7 +55,7 @@ accelerate launch run.py frequency_pruning eval --model Qwen/Qwen3-30B-A3B-Instr
 
 ### 3. Outputs Organization
 
-通过 `DEFAULT_DIR` 和 `MODEL_NAME` 统一管理输出路径（见 `examples/run.sh`）：
+通过 `DEFAULT_DIR` 和 `MODEL_NAME` 统一管理输出路径（见 `run.sh`）：
 
 ```
 outputs/{model_name}/
@@ -68,14 +67,20 @@ outputs/{model_name}/
         └── results_20250305_123456.json    # 剪枝模型评测结果
 ```
 
-### 4. Examples
+### 4. Run Script
 
-修改 `examples/run.sh` 顶部参数后：
+使用根目录 `run.sh`，支持通过环境变量覆盖 `METHOD`、`PRUNE_RATIO`、`MODEL`：
 
 ```bash
-bash examples/run.sh calib           # 单卡校准
-bash examples/run.sh eval            # 多卡评测剪枝模型（ADAPTER_DIR 非空）
-EVAL_RAW=1 bash examples/run.sh eval # 强制多卡评测原模型
+# 默认参数（METHOD=frequency_pruning, PRUNE_RATIO=0.5）
+bash run.sh calib           # 单卡校准
+bash run.sh eval            # 多卡评测剪枝模型（ADAPTER_DIR 非空）
+
+# 覆盖参数
+METHOD=ean_pruning PRUNE_RATIO=0.3 bash run.sh calib
+METHOD=ean_pruning PRUNE_RATIO=0.3 bash run.sh eval
+MODEL=Qwen/Qwen3-8B bash run.sh eval
+EVAL_RAW=1 bash run.sh eval  # 强制评测原模型（不 patch）
 ```
 
 ## Design Notes
@@ -96,5 +101,5 @@ EVAL_RAW=1 bash examples/run.sh eval # 强制多卡评测原模型
 
 **开发者约定**：新增方法实现时，`model_type` 必须与 HuggingFace 的 `config.model_type` **严格保持一致**，不做二次映射。例如 Qwen3-MoE 的 config 中 `model_type="qwen3_moe"`，则注册表中对应 key 也应为 `"qwen3_moe"`。这样 `run.py` 才能通过 `AutoConfig.from_pretrained(model).model_type` 自动推断并正确查找到实现类。
 
-目录组织示例：为 `ean_pruning` 新增 GPT-OSS 适配时，创建 `methods/ean_pruning/model_gpt_oss.py`，在 `run.py` 的 `METHOD_REGISTRY` 中注册 `"ean_pruning": { ..., "gpt_oss": EANPruningGptOss }`（假设 HF 中该模型的 `config.model_type` 为 `"gpt_oss"`）。
+目录组织示例：为 `ean_pruning` 新增 GPT-OSS 适配时，创建 `methods/ean_pruning/model_gpt_oss.py`，在 `run.py` 的 `METHOD_REGISTRY` 中注册 `"ean_pruning": { ..., "gpt_oss": EANPruningGptOss }`（HF 中该模型的 `config.model_type` 为 `"gpt_oss"`）。
 

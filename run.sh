@@ -2,46 +2,57 @@
 # MoE-Compressors 运行脚本：两种模式
 #
 # 【模式 1】calib：单卡校准，保存 adapter.safetensors
-#   bash examples/run.sh calib
+#   bash run.sh calib
 #
 # 【模式 2】eval：多卡评测（accelerate launch）
 #   - ADAPTER_DIR 非空：加载 adapter 做 patch，评测剪枝模型
-#   - ADAPTER_DIR 为空：评测原模型（如 EVAL_RAW=1 或 ADAPTER_DIR=""）
-#   bash examples/run.sh eval
-#   EVAL_RAW=1 bash examples/run.sh eval    # 强制评测原模型
+#   - ADAPTER_DIR 为空：评测原模型（如 EVAL_RAW=1）
+#   bash run.sh eval
+#
+# 【外部覆盖】支持通过环境变量覆盖 METHOD、PRUNE_RATIO、MODEL，例如：
+#   METHOD=ean_pruning PRUNE_RATIO=0.3 bash run.sh eval
+#   MODEL=Qwen/Qwen3-8B bash run.sh calib
 
 # ========== 环境变量 ==========
 export HF_ALLOW_CODE_EVAL=1
 
-# ========== 参数配置 ==========
-METHOD="frequency_pruning"
-PRUNE_RATIO=0.5
-MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"
-# 输出根目录，与 model 相关的输出统一放在 DEFAULT_DIR/model_name/ 下
-# adapter: DEFAULT_DIR/model_name/method/0.5/adapter.safetensors
-# 原模型 eval 结果: DEFAULT_DIR/model_name/results_xxx.json
-# 剪枝模型 eval 结果: DEFAULT_DIR/model_name/method/0.5/results_xxx.json
+# ========== 参数配置（支持外部覆盖） ==========
+METHOD="${METHOD:-frequency_pruning}"
+PRUNE_RATIO="${PRUNE_RATIO:-0.5}"
+MODEL="${MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
+
+# ========== 路径配置 =========================
 DEFAULT_DIR="./outputs"
 MODEL_NAME="${MODEL##*/}"
 OUTPUT_BASE="${DEFAULT_DIR}/${MODEL_NAME}"
 ADAPTER_DIR="${OUTPUT_BASE}/${METHOD}/${PRUNE_RATIO}"
 CALIBRATION_DATASET="wikitext:wikitext-2-raw-v1"
+
+# ========== 校准参数配置 =====================
 MAX_CALIB_SAMPLES=128
 MAX_CONTEXT_LEN=2048
-TASKS="piqa hellaswag winogrande arc_easy arc_challenge mmlu gsm8k hendrycks_math500 mbpp humaneval"
+
+# ========== 评测参数配置 =====================
+TASKS=(
+  piqa hellaswag winogrande arc_easy arc_challenge mmlu 
+  gsm8k hendrycks_math500 mbpp humaneval
+)
 EVAL_LIMIT=100000
 GEN_KWARGS="max_gen_toks=1024"
 EVAL_OUTPUT_PATH=""
-DEVICE="cuda"
-DTYPE="float16"
-# ==============================
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEVICE="cuda"
+DTYPE="bfloat16"
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 MODE="${1:-}"
 if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
-  echo "用法: bash examples/run.sh calib | eval"
+  echo "用法: bash run.sh calib | eval"
+  echo "  可选环境变量: METHOD, PRUNE_RATIO, MODEL"
+  echo "  示例: METHOD=ean_pruning PRUNE_RATIO=0.3 bash run.sh eval"
+  echo ""
   echo "  calib: 单卡校准，保存 adapter 到 ADAPTER_DIR"
   echo "  eval:  多卡评测；ADAPTER_DIR 非空则 patch 后评测，否则评测原模型"
   exit 1
@@ -64,7 +75,7 @@ if [ "$MODE" = "calib" ]; then
 
 elif [ "$MODE" = "eval" ]; then
   # 多卡评测（accelerate launch）
-  EVAL_ARGS="$BASE_ARGS --tasks $TASKS --limit $EVAL_LIMIT --output_base $OUTPUT_BASE"
+  EVAL_ARGS="$BASE_ARGS --tasks ${TASKS[*]} --limit $EVAL_LIMIT --output_base $OUTPUT_BASE"
   EXTRA_ARGS=()
   [ -n "$EVAL_OUTPUT_PATH" ] && EXTRA_ARGS+=(--eval_output_path "$EVAL_OUTPUT_PATH")
   [ -n "$GEN_KWARGS" ] && EXTRA_ARGS+=(--gen_kwargs "$GEN_KWARGS")
