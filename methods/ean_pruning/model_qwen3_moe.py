@@ -13,6 +13,7 @@ EAN (Expert Activation Norm) 方法 - 基于专家激活范数的剪枝（Qwen3-
 
 from __future__ import annotations
 
+import copy
 import gc
 import logging
 import types
@@ -109,16 +110,17 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
         old_to_new: torch.LongTensor,
     ):
         super().__init__()
-        self.gate = original_block.gate
-        self.top_k = original_block.gate.top_k
-        self.num_experts = original_block.gate.num_experts
+        # deepcopy gate 避免引用 original_block，防止 GC 无法回收原始 experts 导致显存泄漏
+        self.gate = copy.deepcopy(original_block.gate)
+        self.top_k = self.gate.top_k
+        self.num_experts = self.gate.num_experts
         self.keep_indices = keep_indices
         self.old_to_new = old_to_new
         self.num_kept = len(keep_indices)
         experts = original_block.experts
         self.gate_up_proj = torch.nn.Parameter(experts.gate_up_proj[keep_indices].clone())
         self.down_proj = torch.nn.Parameter(experts.down_proj[keep_indices].clone())
-        self.act_fn = experts.act_fn
+        self.act_fn = copy.deepcopy(experts.act_fn)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape

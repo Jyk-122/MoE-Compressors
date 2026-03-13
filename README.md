@@ -89,6 +89,7 @@ EVAL_RAW=1 bash run.sh eval  # 强制评测原模型（不 patch）
 |:----:|------|----------|
 | ✓ | **frequency_pruning** | 常见 baseline，见 MoE 剪枝文献 |
 | ✓ | **ean_pruning** | [Finding Fantastic Experts in MoEs: A Unified Study for Expert Dropping Strategies and Observations](https://arxiv.org/abs/2504.05586) |
+| ✓ | **reap_pruning** | [REAP the Experts: Why Pruning Prevails for One-Shot MoE compression](http://arxiv.org/abs/2510.13999) |
 | ☐ | **TODO_EXAMPLE** |   |
 
 ## Design Notes
