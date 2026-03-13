@@ -120,6 +120,9 @@ def get_parser() -> argparse.ArgumentParser:
                         help="eval 结果保存路径。默认：剪枝 model 用 adapter_dir/results_{时间}.json，原 model 用 output_base/results_{时间}.json")
     parser.add_argument("--gen_kwargs", type=str, default=None,
                         help="lm_eval 生成参数，如 max_gen_toks=1024 或 max_gen_toks=1024,temperature=0.8。对 generate_until 类任务（mbpp、humaneval 等）生效")
+    parser.add_argument("--eval_output_content", type=str, default="metrics",
+                        choices=["metrics", "full"],
+                        help="eval 结果保存内容：metrics=仅数值结果，full=完整输出（含 samples、config 等）。默认 metrics")
     return parser
 
 
@@ -205,10 +208,25 @@ def main() -> None:
             Path(eval_output).parent.mkdir(parents=True, exist_ok=True)
             obj = results.get("results", results) if isinstance(results, dict) else getattr(results, "results", results)
             obj = obj if obj is not None else {}
+
+            if args.eval_output_content == "metrics":
+                to_dump = obj
+            else:
+                # full: 转换为可序列化 dict（lm_eval 可能返回对象）
+                if isinstance(results, dict):
+                    to_dump = results
+                else:
+                    to_dump = {}
+                    for attr in ("results", "config", "samples", "git_hash", "date"):
+                        v = getattr(results, attr, None)
+                        if v is not None:
+                            to_dump[attr] = v
+                    if not to_dump:
+                        to_dump = {"results": obj}
+
             with open(eval_output, "w", encoding="utf-8") as f:
-                json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
-            
-            logging.info("Evaluation done, results saved to: %s", eval_output)
+                json.dump(to_dump, f, ensure_ascii=False, indent=2, default=str)
+            logging.info("Evaluation done, results saved to: %s (%s)", eval_output, args.eval_output_content)
             logging.info("Evaluation results: %s", obj)
         
 

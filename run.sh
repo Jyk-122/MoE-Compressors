@@ -1,17 +1,27 @@
 #!/bin/bash
-# MoE-Compressors 运行脚本：两种模式
+# MoE-Compressors：
+# 用法: 
+#   bash run.sh calib     单卡校准
+#   bash run.sh eval      多卡评测
 #
-# 【模式 1】calib：单卡校准，保存 adapter.safetensors
-#   bash run.sh calib
+# 模式:
+#   calib  单卡校准 → 保存 adapter 到 outputs/{MODEL}/{METHOD}/{PRUNE_RATIO}/
+#   eval   accelerate 多卡评测；ADAPTER_DIR 非空则 patch 后评测，空则评测原模型
 #
-# 【模式 2】eval：多卡评测（accelerate launch）
-#   - ADAPTER_DIR 非空：加载 adapter 做 patch，评测剪枝模型
-#   - ADAPTER_DIR 为空：评测原模型（如 EVAL_RAW=1）
-#   bash run.sh eval
-#
-# 【外部覆盖】支持通过环境变量覆盖 METHOD、PRUNE_RATIO、MODEL，例如：
-#   METHOD=ean_pruning PRUNE_RATIO=0.5 bash run.sh eval
-#   MODEL=Qwen/Qwen3-8B bash run.sh calib
+# 参数:
+#   可命令行指定：
+#     METHOD                剪枝方法 (frequency_pruning|ean_pruning|reap_pruning)
+#     PRUNE_RATIO           剪枝比例 (默认 0.5)
+#     MODEL                 模型路径
+#   CALIBRATION_DATASET   校准数据集
+#   MAX_CALIB_SAMPLES     校准样本数
+#   MAX_CONTEXT_LEN       校准最大上下文长度
+#   TASKS                 评测任务列表（见脚本内）
+#   EVAL_LIMIT            评测 limit
+#   GEN_KWARGS            lm_eval 生成参数 (如 max_gen_toks=1024)
+#   EVAL_OUTPUT_PATH      评测结果文件路径（空则自动）
+#   EVAL_OUTPUT_CONTENT   results 保存内容：metrics=仅数值，full=完整
+#   EVAL_RAW              1=评测原模型（忽略 ADAPTER_DIR）
 
 # ========== 环境变量 ==========
 export HF_ALLOW_CODE_EVAL=1
@@ -35,11 +45,12 @@ MAX_CONTEXT_LEN=2048
 # ========== 评测参数配置 =====================
 TASKS=(
   piqa hellaswag winogrande arc_easy arc_challenge mmlu 
-  gsm8k hendrycks_math500 mbpp humaneval
+  gsm8k minerva_math500 mbpp humaneval
 )
 EVAL_LIMIT=100000
 GEN_KWARGS="max_gen_toks=1024"
 EVAL_OUTPUT_PATH=""
+EVAL_OUTPUT_CONTENT="metrics"
 
 DEVICE="cuda"
 DTYPE="bfloat16"
@@ -79,6 +90,7 @@ elif [ "$MODE" = "eval" ]; then
   EXTRA_ARGS=()
   [ -n "$EVAL_OUTPUT_PATH" ] && EXTRA_ARGS+=(--eval_output_path "$EVAL_OUTPUT_PATH")
   [ -n "$GEN_KWARGS" ] && EXTRA_ARGS+=(--gen_kwargs "$GEN_KWARGS")
+  EXTRA_ARGS+=(--eval_output_content "$EVAL_OUTPUT_CONTENT")
   # EVAL_RAW=1 或 ADAPTER_DIR 为空 → 不传 adapter_dir，评测原模型
   if [ "${EVAL_RAW:-0}" = "1" ] || [ -z "$ADAPTER_DIR" ]; then
     accelerate launch run.py $METHOD eval $EVAL_ARGS "${EXTRA_ARGS[@]}"
