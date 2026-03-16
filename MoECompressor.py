@@ -200,7 +200,7 @@ class MoECompressor(ABC):
     ) -> list[str]:
         """
         从 HuggingFace 数据集加载校准文本。
-
+        支持 WikiText (纯文本) 和 Alpaca (指令微调) 格式的校准数据加载。
         针对 wikitext 等按换行粗暴切分的数据集（大量空字符串）：逐行拼接。
         当块内 token 数达到 max_context_len 时形成一个校准样本，直到得到 max_calib_samples 个样本。
 
@@ -216,30 +216,58 @@ class MoECompressor(ABC):
         """
         logger.info("Loading calibration dataset: %s", calibration_dataset)
         parts = calibration_dataset.split(":", 1)
-        name = parts[1] if len(parts) > 1 else None
-        ds = load_dataset(parts[0], name, split="train")
+        dataset_name = parts[0]
+        config_name = parts[1] if len(parts) > 1 else None
+        
+        ds = load_dataset(dataset_name, config_name, split="train")
 
-        col = "text" if "text" in ds.column_names else ds.column_names[0]
-        raw = ds[col]
-        lines = [t for t in raw if t and str(t).strip()]
-        logger.info("Valid lines after filtering: %d, building chunks of ~%d tokens", len(lines), max_context_len)
+        # --- 1. 数据格式标准化 ---
+        formatted_texts = []
+        
+        # 判断是否为 Alpaca 格式 (包含 instruction 字段)
+        if "instruction" in ds.column_names:
+            logger.info("Detected Alpaca-style dataset. Formatting to chat messages...")
+            for item in ds:
+                # 合并 instruction 和 input
+                user_content = item["instruction"]
+                if "input" in item and item["input"]:
+                    user_content += "\n" + item["input"]
+                
+                messages = [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": item.get("output", "")}
+                ]
+                
+                # 使用 tokenizer 的 chat_template 转换为最终文本
+                # tokenize=False 返回字符串，add_generation_prompt=False 因为我们已经有输出了
+                text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+                formatted_texts.append(text)
+        else:
+            # 兼容原有逻辑：读取 "text" 或第一个字段
+            col = "text" if "text" in ds.column_names else ds.column_names[0]
+            formatted_texts = [str(t) for t in ds[col] if t and str(t).strip()]
+
+        # --- 2. 文本分块逻辑 (复用并优化) ---
+        logger.info("Valid samples after formatting: %d, building chunks of ~%d tokens", 
+                    len(formatted_texts), max_context_len)
 
         chunks = []
-        current_lines = []
+        current_chunk_text = ""
         pbar = tqdm(total=max_calib_samples, desc="Building calibration chunks", unit="chunk")
-        for line in lines:
-            line = (line if isinstance(line, str) else str(line)).strip()
-            if not line:
-                continue
-            current_lines.append(line)
-            combined = "".join(current_lines)
-            n_tokens = len(tokenizer.encode(combined, add_special_tokens=False))
+        
+        for text in formatted_texts:
+            current_chunk_text += text
+            
+            # 只有当 token 数达到阈值时才切分
+            n_tokens = len(tokenizer.encode(current_chunk_text, add_special_tokens=False))
+            
             if n_tokens >= max_context_len:
-                chunks.append(combined)
+                chunks.append(current_chunk_text)
+                current_chunk_text = "" # 重置
                 pbar.update(1)
+                
                 if len(chunks) >= max_calib_samples:
                     break
-                current_lines = []
 
         pbar.close()
         logger.info("Calibration data loaded, %d chunks", len(chunks))
