@@ -35,115 +35,45 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 from MoECompressor import MoECompressor
 
 
-def _get_moe_layers(model) -> list[tuple[int, Qwen3MoeSparseMoeBlock]]:
-    """
-    遍历模型，找出所有 MoE 层（Qwen3MoeSparseMoeBlock）。
-
-    Returns:
-        [(decoder_layer_idx, mlp_block), ...]
-    """
-    moe_layers = []
-    for i, layer in enumerate(model.model.layers):
-        if hasattr(layer, "mlp") and isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
-            moe_layers.append((i, layer.mlp))
-    return moe_layers
-
-
-def _experts_forward_with_micro_experts_ranking(
-    experts_module,
-    hidden_states: torch.Tensor,
-    top_k_index: torch.Tensor,
-    top_k_weights: torch.Tensor,
-    norm_stats: dict,
-    layer_idx: int,
-    prune_ratio: float,
-) -> torch.Tensor:
-    """
-    执行 experts forward，同时收集每个专家输出的 L2 范数统计。
-
-    与 Qwen3MoeExperts.forward 逻辑一致，但在乘 routing weight 之前计算每个 token 输出的 L2 范数，
-    按专家累加 sum_norm 和 count。
-    """
-    num_experts = experts_module.num_experts
-    intermediate_dim = experts_module.intermediate_dim
-    final_hidden_states = torch.zeros_like(hidden_states)
-
-    with torch.no_grad():
-        expert_mask = F.one_hot(top_k_index, num_classes=num_experts).permute(2, 1, 0)
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-    for idx in expert_hit:
-        expert_idx = idx[0].item()
-        if expert_idx >= num_experts:
-            continue
-        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-        current_state = hidden_states[token_idx]
-        gate, up = F.linear(current_state, experts_module.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-        current_hidden_states = experts_module.act_fn(gate) * up
-        # 专家输出（乘 routing weight 之前）
-        expert_output = F.linear(current_hidden_states, experts_module.down_proj[expert_idx])
-        Gamma = expert_output * top_k_weights[token_idx, top_k_pos, None]
-        # 计算每个 token 输出的 L2 范数和无穷范数
-        norms_l2 = Gamma.pow(2).sum(dim=(0, 1))
-        norms_inf = Gamma.abs().pow(2).max(dim=(0, 1))
-        # 累加统计
-        if layer_idx not in norm_stats:
-            norm_stats[layer_idx] = {}
-        if expert_idx not in norm_stats[layer_idx]:
-            norm_stats[layer_idx][expert_idx] = [
-                0.0,
-                torch.zeros(intermediate_dim).type_as(hidden_states),
-                torch.zeros(intermediate_dim).type_as(hidden_states),
-            ]
-        norm_stats[layer_idx][expert_idx][0] += top_k_index.shape[0]
-        norm_stats[layer_idx][expert_idx][1] += norms_l2
-        norm_stats[layer_idx][expert_idx][2] = torch.maximum(norm_stats[layer_idx][expert_idx][2], norms_inf)
-
-        current_hidden_states = expert_output * top_k_weights[token_idx, top_k_pos, None]
-        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-    return final_hidden_states
-
-
 class PrunedQwen3MoeSparseMoeBlock(nn.Module):
     """
     剪枝后的 SparseMoeBlock。
 
+    使用 keep_mask (num_experts, inter_size) 的 0/1 向量记录每个 micro-expert 是否保留。
     """
 
     def __init__(
         self,
         original_block: Qwen3MoeSparseMoeBlock,
-        keep_indices_dict: dict[int, torch.LongTensor],
+        keep_mask: torch.Tensor,
     ):
+        """
+        Args:
+            original_block: 原始 MoE 块
+            keep_mask: (num_experts, inter_size) bool，True 表示保留该 micro-expert
+        """
         super().__init__()
         self.gate = copy.deepcopy(original_block.gate)
         self.top_k = self.gate.top_k
         self.num_experts = self.gate.num_experts
-
         self.act_fn = copy.deepcopy(original_block.experts.act_fn)
-        
-        # 核心改动：使用 ParameterList 容纳不同尺寸的裁剪后张量
+
         self.gate_up_proj = nn.ParameterList()
         self.down_proj = nn.ParameterList()
 
         for i in range(self.num_experts):
-            if i in keep_indices_dict:
-                keep_idx = keep_indices_dict[i]
-                old_gu = original_block.experts.gate_up_proj[i]
-                old_d = original_block.experts.down_proj[i]
+            mask_i = keep_mask[i]
+            keep_idx = mask_i.nonzero(as_tuple=True)[0]
+            old_gu = original_block.experts.gate_up_proj[i]
+            old_d = original_block.experts.down_proj[i]
+            inter_size = old_d.shape[1]
 
-                inter_size = old_d.shape[1]
-                
-                # Qwen 的 gate 和 up 是在维度 0 上 concat 起来的
-                # 所以要提取两次索引：一次给 gate，一次给 up
+            if keep_idx.numel() > 0:
+                # gate_up 在 dim 0 上 concat：前半 gate，后半 up
                 gu_indices = torch.cat([keep_idx, keep_idx + inter_size])
-
-                # 物理切片：真正抛弃多余参数，释放显存
                 self.gate_up_proj.append(nn.Parameter(old_gu[gu_indices].clone()))
                 self.down_proj.append(nn.Parameter(old_d[:, keep_idx].clone()))
             else:
-                # 应对极端情况：如果某个专家被完全剪空，塞入空张量占位
                 self.gate_up_proj.append(nn.Parameter(torch.empty(0)))
                 self.down_proj.append(nn.Parameter(torch.empty(0)))
 
@@ -152,7 +82,7 @@ class PrunedQwen3MoeSparseMoeBlock(nn.Module):
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
 
         # 1. 路由计算 (无需再做 -inf mask，因为我们改变的是专家内部结构，而不是直接抛弃整只专家)
-        router_logits = self.gate(hidden_states_reshaped)
+        router_logits = F.linear(hidden_states_reshaped, self.gate.weight)
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.gate.norm_topk_prob:
@@ -293,8 +223,8 @@ class CAMERAPruningQwen3Moe(MoECompressor):
         
         torch.cuda.empty_cache()
 
-        all_keep_indices = {}
-        
+        all_keep_masks = {}
+
         for i in tqdm(range(len(layers)), desc="Layer-wise processing"):
             layer = layers[i].to(self.device)
             
@@ -311,8 +241,8 @@ class CAMERAPruningQwen3Moe(MoECompressor):
                     hs_reshaped = hs.view(-1, hs.shape[-1])
                     
                     with torch.no_grad():
-                        router_logits = layer.mlp.gate(hs_reshaped)
-                        routing_weights = F.softmax(router_logits, dim=-1)
+                        router_logits = F.linear(hs_reshaped, layer.mlp.gate.weight)
+                        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
                         routing_weights, selected_experts = torch.topk(routing_weights, layer.mlp.gate.top_k, dim=-1)
                         if layer.mlp.gate.norm_topk_prob:
                             routing_weights = (routing_weights / routing_weights.sum(dim=-1, keepdim=True)).to(router_logits.dtype)
@@ -335,23 +265,29 @@ class CAMERAPruningQwen3Moe(MoECompressor):
                             expert_l2_norm[expert_idx] += norm_l2
                             expert_inf_norm[expert_idx] = torch.maximum(expert_inf_norm[expert_idx], norm_inf)
                             
-                
-                            
-                # 2. 依据重要度计算每个专家需保留的 keep_indices
-                keep_indices_dict = {}
-                num_keep = max(1, int(inter_size * (1 - self.prune_ratio)))
+                # 2. 【CAMERA 核心】全局排序：本层所有 experts 的 micro-experts 放在一起比较，
+                #    取 top (1-λ) 比例的微专家。每个 expert 的保留比例由其在全局排序中的占比决定，各不相同。
+                total_micro_experts = num_experts * inter_size
+                global_energy = torch.zeros(total_micro_experts, device=self.device)
+
                 for expert_idx in range(num_experts):
                     expert_importance = (1 - alpha) * expert_l2_norm[expert_idx] + alpha * expert_inf_norm[expert_idx]
                     weight_l2_norm = layer.mlp.experts.down_proj[expert_idx].pow(2).sum(dim=0)
                     expert_importance = expert_importance * weight_l2_norm
-                    _, top_indices = torch.topk(expert_importance, num_keep)
-                    keep_indices = top_indices.sort().values
-                    keep_indices_dict[expert_idx] = keep_indices.cpu()
-                    
-                all_keep_indices[i] = keep_indices_dict
-                
+                    global_base = expert_idx * inter_size
+                    global_energy[global_base : global_base + inter_size] = expert_importance
+
+                num_keep_total = max(1, int(total_micro_experts * (1 - self.prune_ratio)))
+                _, top_global_indices = torch.topk(global_energy, num_keep_total)
+
+                # 向量化：将 top 索引转为 0/1 mask，按 expert 分段，无 Python 循环
+                global_mask = torch.zeros(total_micro_experts, dtype=torch.bool, device=self.device)
+                global_mask[top_global_indices] = True
+                keep_mask = global_mask.view(num_experts, inter_size)
+                all_keep_masks[i] = keep_mask.cpu()
+
                 # 3. 对该层进行物理瘦身 Patch
-                layer.mlp = PrunedQwen3MoeSparseMoeBlock(layer.mlp, keep_indices_dict).to(self.device)
+                layer.mlp = PrunedQwen3MoeSparseMoeBlock(layer.mlp, keep_mask).to(self.device)
             
             # 4. 更新缓存特征：用当前层（如果是 MoE 则已经是剪枝后的结构）推导出下一层的输入
             for j in range(len(cached_hidden_states)):
@@ -360,7 +296,7 @@ class CAMERAPruningQwen3Moe(MoECompressor):
                 
                 with torch.no_grad():
                     out = layer(hs, **kwargs_device)
-                cached_hidden_states[j] = out[0].cpu() # 存回 CPU
+                cached_hidden_states[j] = out.cpu() # 存回 CPU
                 
             # 处理完该层后释放显存
             layer.cpu()
@@ -369,11 +305,10 @@ class CAMERAPruningQwen3Moe(MoECompressor):
             
         logger.info("[calib] Step 4/4: Saving adapter")
         self.adapter_dir.mkdir(parents=True, exist_ok=True)
-        state_dict = {}
-        for layer_idx, keep_dict in all_keep_indices.items():
-            for expert_idx, indices in keep_dict.items():
-                state_dict[f"layer_{layer_idx}.expert_{expert_idx}.keep_indices"] = indices
-                
+        state_dict = {
+            f"layer_{layer_idx}.keep_mask": mask_val
+            for layer_idx, mask_val in all_keep_masks.items()
+        }
         save_file(state_dict, str(self._get_adapter_path()))
 
     def patch(self, model, **kwargs) -> Any:
@@ -396,14 +331,13 @@ class CAMERAPruningQwen3Moe(MoECompressor):
         logger.info("[patch] Replacing %d MoE layers", len(moe_indices))
 
         for decoder_layer_idx in tqdm(moe_indices, desc="Patching layers", unit="layer"):
-            block = layers[decoder_layer_idx].mlp
-            keep_indices_dict = {}
-            for e_idx in range(block.gate.num_experts):
-                key = f"layer_{decoder_layer_idx}.expert_{e_idx}.keep_indices"
-                if key in state:
-                    keep_indices_dict[e_idx] = state[key].to(block.gate.weight.device)
-            
-            layers[decoder_layer_idx].mlp = PrunedQwen3MoeSparseMoeBlock(block, keep_indices_dict)
+            if hasattr(layers[decoder_layer_idx], "mlp") and isinstance(layers[decoder_layer_idx].mlp, Qwen3MoeSparseMoeBlock):
+                block = layers[decoder_layer_idx].mlp
+                mask_key = f"layer_{decoder_layer_idx}.keep_mask"
+                if mask_key not in state:
+                    raise KeyError(f"Adapter 缺少 {mask_key}，请重新运行 calib 生成 adapter")
+                keep_mask = state[mask_key].to(block.gate.weight.device).bool()
+                layers[decoder_layer_idx].mlp = PrunedQwen3MoeSparseMoeBlock(block, keep_mask)
 
         gc.collect()
         if torch.cuda.is_available():
