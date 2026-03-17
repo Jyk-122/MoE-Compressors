@@ -10,9 +10,10 @@
 #
 # 参数:
 #   可命令行指定：
-#     METHOD                剪枝方法 (frequency_pruning|ean_pruning|reap_pruning)
+#     METHOD                剪枝方法 (frequency_pruning|ean_pruning|reap_pruning|camera_pruning)
 #     PRUNE_RATIO           剪枝比例 (默认 0.5)
 #     MODEL                 模型路径
+#     CALIB_EXTRA           方法专用 calib 超参，JSON 格式，如 '{"alpha": 0.95}'（camera_pruning）
 #   CALIBRATION_DATASET   校准数据集
 #   MAX_CALIB_SAMPLES     校准样本数
 #   MAX_CONTEXT_LEN       校准最大上下文长度
@@ -76,13 +77,14 @@ if [ "$MODE" = "calib" ]; then
     echo "ERROR: ADAPTER_DIR 不能为空"
     exit 1
   fi
-  # 单卡校准
-  python run.py $METHOD calib $BASE_ARGS \
-    --adapter_dir "$ADAPTER_DIR" \
+  # 单卡校准（CALIB_EXTRA 可选，用于方法专用超参如 camera_pruning 的 alpha）
+  CALIB_PY_ARGS=(--adapter_dir "$ADAPTER_DIR" \
     --calibration_dataset "$CALIBRATION_DATASET" \
     --max_calib_samples $MAX_CALIB_SAMPLES \
     --max_context_len $MAX_CONTEXT_LEN \
-    --batch_size 1
+    --batch_size 1)
+  [ -n "${CALIB_EXTRA:-}" ] && CALIB_PY_ARGS+=(--calib_extra "$CALIB_EXTRA")
+  python run.py $METHOD calib $BASE_ARGS "${CALIB_PY_ARGS[@]}"
 
 elif [ "$MODE" = "eval" ]; then
   # 多卡评测（accelerate launch）

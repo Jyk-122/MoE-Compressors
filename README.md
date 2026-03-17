@@ -53,7 +53,7 @@ accelerate launch run.py frequency_pruning eval --model Qwen/Qwen3-30B-A3B-Instr
   --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
 ```
 
-### 3. Outputs Organization
+### 3. 输出目录
 
 通过 `DEFAULT_DIR` 和 `MODEL_NAME` 统一管理输出路径（见 `run.sh`）：
 
@@ -67,9 +67,25 @@ outputs/{model_name}/
         └── results_20250305_123456.json    # 剪枝模型评测结果
 ```
 
-### 4. Run Script
+### 4. 方法专用超参（--calib_extra）
 
-使用根目录 `run.sh`，支持通过环境变量覆盖 `METHOD`、`PRUNE_RATIO`、`MODEL`：
+各压缩方法可能有各自专用的 calib 超参（如 CAMERA 的 $\alpha$ ）。框架通过 `--calib_extra` 以 JSON 格式透传，无需为每种方法单独添加 CLI 参数：
+
+```bash
+# camera_pruning：设置 alpha（L2/inf 范数平衡系数，论文常用 0.95）
+python run.py camera_pruning calib --model ... --adapter_dir ... --calib_extra '{"alpha": 0.95}'
+
+# 多参数示例（未来方法）
+python run.py some_method calib ... --calib_extra '{"alpha": 0.8, "temperature": 0.1}'
+```
+
+- 透传逻辑：`calib_extra` 解析后作为 `**kwargs` 传给 `compressor.calib()`，各方法在 `calib(**kwargs)` 中按需提取
+- 保存与复现：calib 完成后，`config.json` 会保存 `calib_extra` 字段，便于审计和复现
+- 各方法支持的字段见对应 `methods/*/model_*.py` 中 `calib()` 的文档字符串
+
+### 5. Run Script
+
+使用根目录 `run.sh`，支持通过环境变量覆盖 `METHOD`、`PRUNE_RATIO`、`MODEL` 等：
 
 ```bash
 # 默认参数（METHOD=frequency_pruning, PRUNE_RATIO=0.5）
@@ -81,6 +97,9 @@ METHOD=ean_pruning PRUNE_RATIO=0.5 bash run.sh calib
 METHOD=ean_pruning PRUNE_RATIO=0.5 bash run.sh eval
 MODEL=Qwen/Qwen3-8B bash run.sh eval
 EVAL_RAW=1 bash run.sh eval  # 强制评测原模型（不 patch）
+
+# 方法专用超参：通过 CALIB_EXTRA 传入 JSON
+METHOD=camera_pruning CALIB_EXTRA='{"alpha": 0.95}' bash run.sh calib
 ```
 
 ## Algorithms
@@ -90,6 +109,7 @@ EVAL_RAW=1 bash run.sh eval  # 强制评测原模型（不 patch）
 | ✓ | **frequency_pruning** | 常见 baseline，见 MoE 剪枝文献 |
 | ✓ | **ean_pruning** | [Finding Fantastic Experts in MoEs: A Unified Study for Expert Dropping Strategies and Observations](https://arxiv.org/abs/2504.05586) |
 | ✓ | **reap_pruning** | [REAP the Experts: Why Pruning Prevails for One-Shot MoE compression](http://arxiv.org/abs/2510.13999) |
+| ✓ | **camera_pruning** | [CAMERA: Multi-Matrix Joint Compression for MoE Models via Micro-Expert Redundancy Analysis](https://arxiv.org/abs/2508.02322) |
 | ☐ | **TODO_EXAMPLE** |   |
 
 ## Design Notes

@@ -35,6 +35,7 @@ from transformers import AutoConfig
 from methods.frequency_pruning.model_qwen3_moe import FrequencyPruningQwen3Moe
 from methods.ean_pruning.model_qwen3_moe import EANPruningQwen3Moe
 from methods.reap_pruning.model_qwen3_moe import REAPPruningQwen3Moe
+from methods.camera_pruning.model_qwen3_moe import CAMERAPruningQwen3Moe
 
 # 方法注册表：method_name -> { model_type -> compressor_cls }
 # model_type 与 HuggingFace config.model_type 保持一致，便于自动推断
@@ -48,6 +49,9 @@ METHOD_REGISTRY = {
     "reap_pruning": {
         "qwen3_moe": REAPPruningQwen3Moe,
     },
+    "camera_pruning": {
+        "qwen3_moe": CAMERAPruningQwen3Moe,
+    }
 }
 
 
@@ -61,9 +65,14 @@ def infer_model_type(model_name_or_path: str, trust_remote_code: bool = True) ->
 
 
 def _save_calib_config(args: argparse.Namespace, adapter_dir: Path, model_type: str) -> None:
-    """将 calib 涉及的全部参数保存到 adapter_dir/config.json。"""
+    """
+    将 calib 涉及的全部参数保存到 adapter_dir/config.json，便于复现与审计。
+
+    包含通用参数（prune_ratio、calibration_dataset 等）以及方法专用参数 calib_extra。
+    """
     config_path = adapter_dir / "config.json"
     adapter_dir.mkdir(parents=True, exist_ok=True)
+    calib_extra = _parse_calib_extra(getattr(args, "calib_extra", None))
     config = {
         "method": args.method,
         "mode": "calib",
@@ -77,10 +86,29 @@ def _save_calib_config(args: argparse.Namespace, adapter_dir: Path, model_type: 
         "max_calib_samples": args.max_calib_samples,
         "max_context_len": args.max_context_len,
         "batch_size": args.batch_size,
+        "calib_extra": calib_extra,
     }
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
     logging.info("Calib config saved to: %s", config_path)
+
+
+def _parse_calib_extra(calib_extra_str: str | None) -> dict:
+    """
+    解析 --calib_extra 的 JSON 字符串为 dict，透传给 calib(**kwargs)。
+
+    Returns:
+        解析后的 dict；空字符串或 None 返回 {}。
+    """
+    if not calib_extra_str or not calib_extra_str.strip():
+        return {}
+    try:
+        parsed = json.loads(calib_extra_str)
+        if not isinstance(parsed, dict):
+            raise ValueError("calib_extra 必须是 JSON 对象 (dict)，而非数组或标量")
+        return parsed
+    except json.JSONDecodeError as e:
+        raise ValueError(f"calib_extra JSON 解析失败: {e}") from e
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -110,6 +138,13 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_calib_samples", type=int, default=512)
     parser.add_argument("--max_context_len", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument(
+        "--calib_extra",
+        type=str,
+        default=None,
+        help="方法专用的 calib 超参，JSON 格式透传给 calib(**kwargs)。例如 camera_pruning 可用 "
+             "'{\"alpha\": 0.95}'。各方法支持的字段见方法文档/源码。未指定时传空 dict。",
+    )
     parser.add_argument("--tasks", type=str, nargs="+", default=["wikitext"])
     parser.add_argument("--num_fewshot", type=int, default=None)
     parser.add_argument("--eval_batch_size", type=str, default="auto")
@@ -163,11 +198,13 @@ def main() -> None:
     )
 
     if args.mode == "calib":
+        calib_extra = _parse_calib_extra(args.calib_extra)
         compressor.calib(
             calibration_dataset=args.calibration_dataset,
             max_calib_samples=args.max_calib_samples,
             max_context_len=args.max_context_len,
             batch_size=args.batch_size,
+            **calib_extra,
         )
         logging.info("Calibration done, adapter saved to: %s", compressor._get_adapter_path())
 
