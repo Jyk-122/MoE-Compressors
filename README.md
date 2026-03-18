@@ -110,6 +110,7 @@ METHOD=camera_pruning CALIB_EXTRA='{"alpha": 0.95}' bash run.sh calib
 | ✓ | **ean_pruning** | [Finding Fantastic Experts in MoEs: A Unified Study for Expert Dropping Strategies and Observations](https://arxiv.org/abs/2504.05586) |
 | ✓ | **reap_pruning** | [REAP the Experts: Why Pruning Prevails for One-Shot MoE compression](http://arxiv.org/abs/2510.13999) |
 | ✓ | **camera_pruning** | [CAMERA: Multi-Matrix Joint Compression for MoE Models via Micro-Expert Redundancy Analysis](https://arxiv.org/abs/2508.02322) |
+| ✓ | **moei2_pruning** | [MoE-I²: Compressing Mixture of Experts Models through Inter-Expert Pruning and Intra-Expert Low-Rank Decomposition](https://arxiv.org/abs/2411.01016) |
 | ☐ | **TODO_EXAMPLE** |   |
 
 ## Design Notes

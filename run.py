@@ -36,6 +36,7 @@ from methods.frequency_pruning.model_qwen3_moe import FrequencyPruningQwen3Moe
 from methods.ean_pruning.model_qwen3_moe import EANPruningQwen3Moe
 from methods.reap_pruning.model_qwen3_moe import REAPPruningQwen3Moe
 from methods.camera_pruning.model_qwen3_moe import CAMERAPruningQwen3Moe
+from methods.moei2_pruning.model_qwen3_moe import MoEI2PruningQwen3Moe
 
 # 方法注册表：method_name -> { model_type -> compressor_cls }
 # model_type 与 HuggingFace config.model_type 保持一致，便于自动推断
@@ -51,6 +52,9 @@ METHOD_REGISTRY = {
     },
     "camera_pruning": {
         "qwen3_moe": CAMERAPruningQwen3Moe,
+    },
+    "moei2_pruning": {
+        "qwen3_moe": MoEI2PruningQwen3Moe,
     }
 }
 
