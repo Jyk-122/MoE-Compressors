@@ -37,24 +37,24 @@ DEFAULT_DIR="./outputs"
 MODEL_NAME="${MODEL##*/}"
 OUTPUT_BASE="${DEFAULT_DIR}/${MODEL_NAME}"
 ADAPTER_DIR="${OUTPUT_BASE}/${METHOD}/${PRUNE_RATIO}"
-CALIBRATION_DATASET="${CALIBRATION_DATASET:-wikitext:wikitext-2-raw-v1}"
+CALIBRATION_DATASET="wikitext:wikitext-2-raw-v1"
 
 # ========== 校准参数配置 =====================
-MAX_CALIB_SAMPLES="${MAX_CALIB_SAMPLES:-128}"
-MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-2048}"
+MAX_CALIB_SAMPLES=128
+MAX_CONTEXT_LEN=2048
 
 # ========== 评测参数配置 =====================
 TASKS=(
   piqa hellaswag winogrande arc_easy arc_challenge mmlu 
   gsm8k minerva_math500 mbpp humaneval
 )
-EVAL_LIMIT="${EVAL_LIMIT:-100000}"
-GEN_KWARGS="${GEN_KWARGS:-max_gen_toks=1024}"
-EVAL_OUTPUT_PATH="${EVAL_OUTPUT_PATH:-}"
-EVAL_OUTPUT_CONTENT="${EVAL_OUTPUT_CONTENT:-metrics}"
+EVAL_LIMIT=100000
+GEN_KWARGS="max_gen_toks=1024"
+EVAL_OUTPUT_PATH=""
+EVAL_OUTPUT_CONTENT="metrics"
 
-DEVICE="${DEVICE:-cuda}"
-DTYPE="${DTYPE:-bfloat16}"
+DEVICE="cuda"
+DTYPE="bfloat16"
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
@@ -62,7 +62,8 @@ cd "$ROOT"
 MODE="${1:-}"
 if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
   echo "用法: bash run.sh calib | eval"
-  echo "  可选环境变量: METHOD, PRUNE_RATIO, MODEL, CALIBRATION_DATASET, MAX_CALIB_SAMPLES, MAX_CONTEXT_LEN, CALIB_EXTRA, TASKS, EVAL_LIMIT, GEN_KWARGS, EVAL_OUTPUT_PATH, EVAL_OUTPUT_CONTENT, EVAL_RAW, DEVICE, DTYPE"
+  echo "  可选环境变量: METHOD, PRUNE_RATIO, MODEL, CALIB_EXTRA"
+  echo "  示例: METHOD=ean_pruning PRUNE_RATIO=0.5 bash run.sh eval"
   echo "  示例: METHOD=moei2_pruning PRUNE_RATIO=0.25 CALIB_EXTRA='{\"ga_population\":100,\"ga_iters\":50,\"kt_k\":3,\"kt_t\":3}' bash run.sh calib"
   echo ""
   echo "  calib: 单卡校准，保存 adapter 到 ADAPTER_DIR"
