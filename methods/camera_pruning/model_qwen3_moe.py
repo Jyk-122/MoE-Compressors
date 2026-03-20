@@ -315,8 +315,20 @@ class CAMERAPruningQwen3Moe(MoECompressor):
         """
         打补丁：读取 adapter，将给定 model 的每层 MoE 替换为 PrunedQwen3MoeSparseMoeBlock。
         """
+        accelerate_config = kwargs.get("accelerate_config", {}) or {}
+        if self.adapter_dir is None and accelerate_config:
+            logger.warning(
+                "[camera][patch] 当前方法不支持激活计算加速，且未提供 adapter，保持原模型不变并忽略 accelerate_config=%s",
+                accelerate_config,
+            )
+            return model
         if self.adapter_dir is None:
             raise ValueError("patch 需提供 adapter_dir")
+        if accelerate_config:
+            logger.warning(
+                "[camera][patch] 当前方法不支持激活计算加速，已忽略 accelerate_config=%s",
+                accelerate_config,
+            )
 
         logger.info("[patch] Loading adapter")
         if not self.adapter_path.exists():

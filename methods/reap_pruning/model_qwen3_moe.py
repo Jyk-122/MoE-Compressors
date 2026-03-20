@@ -32,6 +32,8 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 )
 
 from MoECompressor import MoECompressor
+from methods.utils.acceleration import build_strategy
+from methods.utils.moe_stats import MoEStatsCollector, build_router_prob_hist
 
 
 def _get_moe_layers(model) -> list[tuple[int, Qwen3MoeSparseMoeBlock]]:
@@ -110,6 +112,10 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
         original_block: Qwen3MoeSparseMoeBlock,
         keep_indices: torch.LongTensor,
         old_to_new: torch.LongTensor,
+        layer_idx: int,
+        accelerate_config: dict[str, Any] | None = None,
+        layer_stats: dict[str, torch.Tensor] | None = None,
+        stats_collector: MoEStatsCollector | None = None,
     ):
         super().__init__()
         # deepcopy gate 避免引用 original_block，防止 GC 无法回收原始 experts 导致显存泄漏
@@ -119,6 +125,12 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
         self.keep_indices = keep_indices
         self.old_to_new = old_to_new
         self.num_kept = len(keep_indices)
+        self.layer_idx = layer_idx
+        self.layer_stats = layer_stats or {}
+        self.accelerate_config = accelerate_config or {}
+        self.accelerate_kwargs = self.accelerate_config.get("kwargs", {})
+        self.accel_strategy = build_strategy(self.accelerate_config)
+        self.stats_collector = stats_collector
         experts = original_block.experts
         self.gate_up_proj = torch.nn.Parameter(experts.gate_up_proj[keep_indices].clone())
         self.down_proj = torch.nn.Parameter(experts.down_proj[keep_indices].clone())
@@ -132,23 +144,46 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
         router_logits = router_logits.clone()
         pruned_mask = self.old_to_new == -1
         router_logits[:, pruned_mask] = float("-inf")
-        router_logits = F.softmax(router_logits, dim=-1, dtype=torch.float32).to(router_logits.dtype)
-        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
-        if self.gate.norm_topk_prob:
-            router_top_value = (router_top_value / router_top_value.sum(dim=-1, keepdim=True)).to(router_logits.dtype)
-        routing_weights = router_top_value
+        router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32).to(router_logits.dtype)
+        if "expert_importance" in self.layer_stats:
+            importance = self.layer_stats["expert_importance"].to(router_probs.device, dtype=router_probs.dtype)
+            if importance.numel() == router_probs.shape[-1]:
+                importance = importance.clamp_min(0)
+                importance = importance / importance.max().clamp_min(1e-12)
+                router_probs = router_probs * importance.unsqueeze(0)
+                router_probs = router_probs / router_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
-        selected_experts_new = self.old_to_new[router_indices]
+        if self.accel_strategy is None:
+            router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
+            if self.gate.norm_topk_prob:
+                router_top_value = (router_top_value / router_top_value.sum(dim=-1, keepdim=True)).to(router_probs.dtype)
+            routing_weights = router_top_value
+        else:
+            selected = self.accel_strategy.select(
+                router_probs=router_probs,
+                default_top_k=self.top_k,
+                norm_topk_prob=self.gate.norm_topk_prob,
+                kwargs=self.accelerate_kwargs,
+            )
+            router_indices = selected.selected_indices
+            routing_weights = selected.selected_weights
+
+        selected_experts_new = torch.full_like(router_indices, -1)
+        valid_old = router_indices >= 0
+        if valid_old.any():
+            selected_experts_new[valid_old] = self.old_to_new[router_indices[valid_old]]
+        if self.stats_collector is not None:
+            self.stats_collector.update(
+                layer_idx=self.layer_idx,
+                selected_indices=router_indices.detach(),
+                default_top_k=self.top_k,
+            )
 
         final_hidden_states = torch.zeros_like(hidden_states_reshaped)
-        with torch.no_grad():
-            expert_mask = F.one_hot(selected_experts_new, num_classes=self.num_kept).permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for idx in expert_hit:
-            expert_idx = idx[0].item()
-            if expert_idx >= self.num_kept:
+        for expert_idx in range(self.num_kept):
+            token_idx, top_k_pos = torch.where(selected_experts_new == expert_idx)
+            if token_idx.numel() == 0:
                 continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states_reshaped[token_idx]
             gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
             current_hidden_states = self.act_fn(gate) * up
@@ -229,6 +264,12 @@ class REAPPruningQwen3Moe(MoECompressor):
 
         # norm_stats[layer_idx][expert_idx] = [sum_norm, count]
         norm_stats: dict[int, dict[int, list[float]]] = {}
+        expert_counts: dict[int, torch.Tensor] = {i: torch.zeros(num_experts) for i, _ in moe_layers}
+        router_hist_bins = 16
+        router_hist: dict[int, torch.Tensor] = {
+            i: torch.zeros(router_hist_bins, dtype=torch.float32) for i, _ in moe_layers
+        }
+        layer_tokens: dict[int, int] = {i: 0 for i, _ in moe_layers}
 
         # 用 MethodType 替换 experts.forward，默认参数在定义时求值，正确捕获当前层的 decoder_layer_idx
         for decoder_layer_idx, block in moe_layers:
@@ -259,7 +300,19 @@ class REAPPruningQwen3Moe(MoECompressor):
             )
             inputs = {k: v.to(model.device) for k, v in inputs.items()}
             with torch.no_grad():
-                model(**inputs)
+                outputs = model(**inputs, output_router_logits=True)
+            for router_pos, (decoder_layer_idx, _) in enumerate(moe_layers):
+                logits = outputs.router_logits[router_pos]
+                if logits.dim() == 3:
+                    logits = logits.reshape(-1, logits.shape[-1])
+                probs = F.softmax(logits.float(), dim=-1)
+                _, selected = torch.topk(probs, top_k, dim=-1)
+                expert_counts[decoder_layer_idx] += torch.bincount(
+                    selected.view(-1), minlength=num_experts
+                ).type_as(expert_counts[decoder_layer_idx])
+                hist, _ = build_router_prob_hist(probs, bins=router_hist_bins)
+                router_hist[decoder_layer_idx] += hist
+                layer_tokens[decoder_layer_idx] += int(logits.shape[0])
 
         logger.info("[calib] Step 3/4: Determining kept experts by REAP")
         keep_per_layer = {}
@@ -279,25 +332,50 @@ class REAPPruningQwen3Moe(MoECompressor):
             keep_per_layer[str(decoder_layer_idx)] = {
                 "keep_indices": keep_indices.cpu(),
                 "old_to_new": old_to_new.cpu(),
+                "expert_importance": mean_norms.cpu(),
+                "expert_activation_count": expert_counts[decoder_layer_idx].cpu(),
+                "router_prob_hist": router_hist[decoder_layer_idx].cpu(),
+                "router_cdf": torch.cumsum(
+                    router_hist[decoder_layer_idx] / router_hist[decoder_layer_idx].sum().clamp_min(1e-12),
+                    dim=0,
+                ).cpu(),
+                "calib_tokens": torch.tensor(layer_tokens[decoder_layer_idx], dtype=torch.long),
             }
 
         logger.info("[calib] Step 4/4: Saving adapter")
         self.adapter_dir.mkdir(parents=True, exist_ok=True)
-        state = {f"layer_{k}.keep_indices": v["keep_indices"] for k, v in keep_per_layer.items()}
-        state.update({f"layer_{k}.old_to_new": v["old_to_new"] for k, v in keep_per_layer.items()})
+        state = {
+            "meta.adapter_version": torch.tensor(2, dtype=torch.int32),
+            "meta.router_hist_bins": torch.tensor(router_hist_bins, dtype=torch.int32),
+        }
+        for k, v in keep_per_layer.items():
+            state[f"layer_{k}.keep_indices"] = v["keep_indices"]
+            state[f"layer_{k}.old_to_new"] = v["old_to_new"]
+            state[f"layer_{k}.expert_importance"] = v["expert_importance"]
+            state[f"layer_{k}.expert_activation_count"] = v["expert_activation_count"]
+            state[f"layer_{k}.router_prob_hist"] = v["router_prob_hist"]
+            state[f"layer_{k}.router_cdf"] = v["router_cdf"]
+            state[f"layer_{k}.calib_tokens"] = v["calib_tokens"]
         save_file(state, str(self._get_adapter_path()))
 
     def patch(self, model, **kwargs) -> Any:
         """
         打补丁：读取 adapter，将给定 model 的每层 MoE 替换为 PrunedQwen3MoeSparseMoeBlock。
         """
-        if self.adapter_dir is None:
-            raise ValueError("patch 需提供 adapter_dir")
+        accelerate_config = kwargs.get("accelerate_config", {}) or {}
+        if self.adapter_dir is None and not accelerate_config:
+            raise ValueError("patch 需提供 adapter_dir，或传入 accelerate_config 启用原始模型加速")
 
-        logger.info("[patch] Loading adapter")
-        if not self.adapter_path.exists():
-            raise FileNotFoundError(f"未找到 adapter: {self.adapter_path}，请先运行 calib()")
-        state = load_file(str(self.adapter_path))
+        state = {}
+        if self.adapter_dir is not None:
+            logger.info("[patch] Loading adapter")
+            if not self.adapter_path.exists():
+                raise FileNotFoundError(f"未找到 adapter: {self.adapter_path}，请先运行 calib()")
+            state = load_file(str(self.adapter_path))
+        else:
+            logger.info("[patch] No adapter provided, using identity expert mapping for acceleration-only mode")
+
+        stats_collector = MoEStatsCollector(num_experts=model.config.num_experts)
 
         layers = model.model.layers
         moe_indices = [
@@ -309,14 +387,31 @@ class REAPPruningQwen3Moe(MoECompressor):
         for decoder_layer_idx in tqdm(moe_indices, desc="Patching layers", unit="layer"):
             block = layers[decoder_layer_idx].mlp
             key_pre = f"layer_{decoder_layer_idx}"
-            keep_indices = state[f"{key_pre}.keep_indices"]
-            old_to_new = state[f"{key_pre}.old_to_new"]
+            keep_key = f"{key_pre}.keep_indices"
+            map_key = f"{key_pre}.old_to_new"
+            if keep_key in state and map_key in state:
+                keep_indices = state[keep_key]
+                old_to_new = state[map_key]
+            else:
+                num_experts = block.gate.num_experts
+                keep_indices = torch.arange(num_experts, dtype=torch.long)
+                old_to_new = torch.arange(num_experts, dtype=torch.long)
+            layer_stats = {}
+            for stat_key in ("expert_importance", "expert_activation_count", "router_prob_hist", "router_cdf", "calib_tokens"):
+                full_key = f"{key_pre}.{stat_key}"
+                if full_key in state:
+                    layer_stats[stat_key] = state[full_key]
             pruned_block = PrunedQwen3MoeSparseMoeBlock(
                 block,
                 keep_indices.to(block.gate.weight.device),
                 old_to_new.to(block.gate.weight.device),
+                layer_idx=decoder_layer_idx,
+                accelerate_config=accelerate_config,
+                layer_stats=layer_stats,
+                stats_collector=stats_collector,
             )
             layers[decoder_layer_idx].mlp = pruned_block
+        self._acceleration_stats_collector = stats_collector
 
         gc.collect()
         if torch.cuda.is_available():

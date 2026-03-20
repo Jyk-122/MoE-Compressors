@@ -20,6 +20,7 @@
 #   TASKS                 评测任务列表（见脚本内）
 #   EVAL_LIMIT            评测 limit
 #   GEN_KWARGS            lm_eval 生成参数 (如 max_gen_toks=1024)
+#   ACCELERATE_CONFIG     eval 阶段激活加速配置，JSON 格式（如 '{"method":"topK","kwargs":{"k":0.5}}'）
 #   EVAL_OUTPUT_PATH      评测结果文件路径（空则自动）
 #   EVAL_OUTPUT_CONTENT   results 保存内容：metrics=仅数值，full=完整
 #   EVAL_RAW              1=评测原模型（忽略 ADAPTER_DIR）
@@ -50,6 +51,7 @@ TASKS=(
 )
 EVAL_LIMIT=100000
 GEN_KWARGS="max_gen_toks=1024"
+ACCELERATE_CONFIG=""
 EVAL_OUTPUT_PATH=""
 EVAL_OUTPUT_CONTENT="metrics"
 
@@ -93,6 +95,7 @@ elif [ "$MODE" = "eval" ]; then
   EXTRA_ARGS=()
   [ -n "$EVAL_OUTPUT_PATH" ] && EXTRA_ARGS+=(--eval_output_path "$EVAL_OUTPUT_PATH")
   [ -n "$GEN_KWARGS" ] && EXTRA_ARGS+=(--gen_kwargs "$GEN_KWARGS")
+  [ -n "$ACCELERATE_CONFIG" ] && EXTRA_ARGS+=(--accelerate_config "$ACCELERATE_CONFIG")
   EXTRA_ARGS+=(--eval_output_content "$EVAL_OUTPUT_CONTENT")
   # EVAL_RAW=1 或 ADAPTER_DIR 为空 → 不传 adapter_dir，评测原模型
   if [ "${EVAL_RAW:-0}" = "1" ] || [ -z "$ADAPTER_DIR" ]; then

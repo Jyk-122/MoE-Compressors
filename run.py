@@ -115,6 +115,35 @@ def _parse_calib_extra(calib_extra_str: str | None) -> dict:
         raise ValueError(f"calib_extra JSON 解析失败: {e}") from e
 
 
+def _parse_accelerate_config(accelerate_config_str: str | None) -> dict:
+    """
+    解析 --accelerate_config 的 JSON 字符串为 dict，透传给 patch/forward。
+
+    期望格式:
+        {
+          "method": "topK" | "topP" | ...,
+          "kwargs": {...}
+        }
+    """
+    if not accelerate_config_str or not accelerate_config_str.strip():
+        return {}
+    try:
+        parsed = json.loads(accelerate_config_str)
+        if not isinstance(parsed, dict):
+            raise ValueError("accelerate_config 必须是 JSON 对象 (dict)，而非数组或标量")
+        if "method" not in parsed:
+            raise ValueError("accelerate_config 缺少必填字段: method")
+        kwargs = parsed.get("kwargs", {})
+        if kwargs is None:
+            kwargs = {}
+            parsed["kwargs"] = kwargs
+        if not isinstance(kwargs, dict):
+            raise ValueError("accelerate_config.kwargs 必须是 dict")
+        return parsed
+    except json.JSONDecodeError as e:
+        raise ValueError(f"accelerate_config JSON 解析失败: {e}") from e
+
+
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="MoE-Compressors: calib（校准）| eval（评测）"
@@ -159,6 +188,14 @@ def get_parser() -> argparse.ArgumentParser:
                         help="eval 结果保存路径。默认：剪枝 model 用 adapter_dir/results_{时间}.json，原 model 用 output_base/results_{时间}.json")
     parser.add_argument("--gen_kwargs", type=str, default=None,
                         help="lm_eval 生成参数，如 max_gen_toks=1024 或 max_gen_toks=1024,temperature=0.8。对 generate_until 类任务（mbpp、humaneval 等）生效")
+    parser.add_argument(
+        "--accelerate_config",
+        type=str,
+        default=None,
+        help="eval 阶段激活计算加速配置，JSON 格式透传给 patch/forward。"
+             "例如 '{\"method\":\"topK\",\"kwargs\":{\"k\":0.5}}' 或 "
+             "'{\"method\":\"topP\",\"kwargs\":{\"threshold\":0.9}}'。",
+    )
     parser.add_argument("--eval_output_content", type=str, default="metrics",
                         choices=["metrics", "full"],
                         help="eval 结果保存内容：metrics=仅数值结果，full=完整输出（含 samples、config 等）。默认 metrics")
@@ -216,12 +253,14 @@ def main() -> None:
         _save_calib_config(args, Path(args.adapter_dir), model_type)
 
     elif args.mode == "eval":
+        accelerate_config = _parse_accelerate_config(args.accelerate_config)
         results = compressor.eval(
             tasks=args.tasks,
             num_fewshot=args.num_fewshot,
             batch_size=args.eval_batch_size,
             limit=args.limit,
             gen_kwargs=args.gen_kwargs,
+            accelerate_config=accelerate_config,
         )
 
         # 确定结果保存路径：显式指定 或 按规范默认
@@ -249,6 +288,9 @@ def main() -> None:
             Path(eval_output).parent.mkdir(parents=True, exist_ok=True)
             obj = results.get("results", results) if isinstance(results, dict) else getattr(results, "results", results)
             obj = obj if obj is not None else {}
+            if isinstance(results, dict) and "acceleration" in results and isinstance(obj, dict):
+                obj = dict(obj)
+                obj["acceleration"] = results["acceleration"]
 
             if args.eval_output_content == "metrics":
                 to_dump = obj

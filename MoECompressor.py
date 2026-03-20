@@ -103,6 +103,7 @@ class MoECompressor(ABC):
     def patch(
         self,
         model: PreTrainedModel,
+        accelerate_config: dict | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -112,6 +113,7 @@ class MoECompressor(ABC):
 
         Args:
             model: 待 patch 的 ModelForCausalLM（通常为 HFLM._model）
+            accelerate_config: 激活计算加速配置，透传给 patch/forward
             **kwargs: 与压缩方法相关的参数。
 
         Returns:
@@ -130,6 +132,7 @@ class MoECompressor(ABC):
         batch_size: int | str = 1,
         limit: float | None = None,
         gen_kwargs: str | dict | None = None,
+        accelerate_config: dict | None = None,
         **lm_eval_kwargs,
     ) -> dict[str, Any]:
         """
@@ -144,6 +147,7 @@ class MoECompressor(ABC):
             batch_size: 评测 batch size，可为 "auto"
             limit: 每任务样本上限，如 0.1 表示 10%
             gen_kwargs: 生成参数，如 "max_gen_toks=1024" 或 dict，对 generate_until 任务生效
+            accelerate_config: 激活计算加速配置，透传给 patch/forward
             **lm_eval_kwargs: 传给 simple_evaluate 的额外参数
 
         Returns:
@@ -170,9 +174,14 @@ class MoECompressor(ABC):
             trust_remote_code=self.trust_remote_code,
         )
 
-        if self.adapter_dir is not None:
-            logger.info("[eval] Applying prune patch to lm._model")
-            self.patch(lm._model)
+        # 避免跨次 eval 复用上一次 patch 写入的统计对象
+        self._acceleration_stats_collector = None
+        if self.adapter_dir is not None or (accelerate_config and len(accelerate_config) > 0):
+            logger.info("[eval] Applying patch to lm._model")
+            self.patch(
+                lm._model,
+                accelerate_config=accelerate_config or {},
+            )
 
         tasks = tasks or ["wikitext"]
         results = simple_evaluate(
@@ -185,6 +194,12 @@ class MoECompressor(ABC):
             gen_kwargs=gen_kwargs,
             **lm_eval_kwargs,
         )
+        
+        collector = getattr(self, "_acceleration_stats_collector", None)
+        if collector is not None and isinstance(results, dict):
+            summary = collector.summary()
+            summary["config"] = accelerate_config or {}
+            results["acceleration"] = summary
         return results
 
     # -------------------------------------------------------------------------

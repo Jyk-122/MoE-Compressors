@@ -100,7 +100,40 @@ EVAL_RAW=1 bash run.sh eval  # 强制评测原模型（不 patch）
 
 # 方法专用超参：通过 CALIB_EXTRA 传入 JSON
 METHOD=camera_pruning CALIB_EXTRA='{"alpha": 0.95}' bash run.sh calib
+
+# eval 阶段激活计算加速：通过 ACCELERATE_CONFIG 传入 JSON
+METHOD=frequency_pruning ACCELERATE_CONFIG='{"method":"topK","kwargs":{"k":0.5}}' bash run.sh eval
+METHOD=ean_pruning ACCELERATE_CONFIG='{"method":"topP","kwargs":{"threshold":0.9}}' bash run.sh eval
 ```
+
+### 6. Eval 激活计算加速（ACCELERATE_CONFIG）
+
+在 `eval` 模式可以传入加速配置（`run.sh` 里通过环境变量 `ACCELERATE_CONFIG`，`run.py` 对应参数 `--accelerate_config`）：
+
+```json
+{"method":"topK","kwargs":{"k":0.5}}
+```
+
+或
+
+```json
+{"method":"topP","kwargs":{"threshold":0.9}}
+```
+
+约定如下：
+
+- `method`：当前支持 `topK` / `topP`
+- `kwargs`：方法参数字典
+  - `topK.k`：`0<k<=1` 表示按原始 `top_k` 的比例；`k>=1` 表示绝对专家个数
+  - `topP.threshold`：累计概率阈值，范围 `(0,1]`
+- 仅在 `eval` 阶段生效，`calib` 不使用该参数
+
+当前方法支持情况：
+
+- 支持：`frequency_pruning`、`ean_pruning`、`reap_pruning`
+- 暂不支持（会 warning 并忽略配置）：`camera_pruning`、`moei2_pruning`
+
+补充：支持方法在**不传 `adapter_dir`** 时，也可仅用 `ACCELERATE_CONFIG` 对原始模型启用动态激活裁剪（identity expert mapping，不做结构剪枝）。
 
 ## Algorithms
 
@@ -124,6 +157,15 @@ METHOD=camera_pruning CALIB_EXTRA='{"alpha": 0.95}' bash run.sh calib
 - 使用剪枝模型的正确方式是：**加载 base 模型 → 加载 adapter → 执行 patch()**，三者缺一不可
 
 **推荐使用流程**：calib 后仅分发 adapter 目录，推理/评测时加载 base 和 adapter_dir 再 patch 即可。
+
+对于支持激活计算加速的方法，`adapter` 还会额外保存统计量，供 `patch/forward` 在运行时结合 `router logits` 做动态专家选择。典型字段包括：
+
+- `layer_{i}.keep_indices`、`layer_{i}.old_to_new`
+- `layer_{i}.expert_importance`（每专家重要性）
+- `layer_{i}.expert_activation_count`（校准期激活次数）
+- `layer_{i}.router_prob_hist`、`layer_{i}.router_cdf`
+- `layer_{i}.calib_tokens`
+- `meta.adapter_version`、`meta.router_hist_bins`
 
 ### model_type 与扩展新模型
 

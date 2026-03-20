@@ -625,8 +625,20 @@ class MoEI2PruningQwen3Moe(MoECompressor):
 
     def patch(self, model, **kwargs) -> Any:
         """读取 adapter 后替换每层 MoE block。"""
+        accelerate_config = kwargs.get("accelerate_config", {}) or {}
+        if self.adapter_dir is None and accelerate_config:
+            logger.warning(
+                "[moei2][patch] 当前方法不支持激活计算加速，且未提供 adapter，保持原模型不变并忽略 accelerate_config=%s",
+                accelerate_config,
+            )
+            return model
         if self.adapter_dir is None:
             raise ValueError("patch 需提供 adapter_dir")
+        if accelerate_config:
+            logger.warning(
+                "[moei2][patch] 当前方法不支持激活计算加速，已忽略 accelerate_config=%s",
+                accelerate_config,
+            )
         if not self.adapter_path.exists():
             raise FileNotFoundError(f"未找到 adapter: {self.adapter_path}，请先运行 calib()")
 
