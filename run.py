@@ -13,6 +13,7 @@ run.py 仅做 JSON 解析与透传：
   accelerate launch run.py frequency_pruning eval --model ... --adapter_dir ... \\
     --patch_kwargs '{"prune_ratio":0.3}'
   accelerate launch run.py topk_skip eval --model ... --patch_kwargs '{"k":2}'
+  accelerate launch run.py topp_skip eval --model ... --patch_kwargs '{"threshold":0.8}'
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from methods_pruning.frequency_pruning.model_qwen3_moe import FrequencyPruningQw
 from methods_pruning.moei2_pruning.model_qwen3_moe import MoEI2PruningQwen3Moe
 from methods_pruning.reap_pruning.model_qwen3_moe import REAPPruningQwen3Moe
 from methods_skipping.topk_skip.model_qwen3_moe import TopKSkipQwen3Moe
+from methods_skipping.topp_skip.model_qwen3_moe import TopPSkipQwen3Moe
 
 from transformers import AutoConfig
 from utils.method_kwargs import parse_json_object
@@ -52,6 +54,7 @@ METHOD_REGISTRY: dict[str, dict[str, type]] = {
     "camera_pruning": {"qwen3_moe": CAMERAPruningQwen3Moe},
     "moei2_pruning": {"qwen3_moe": MoEI2PruningQwen3Moe},
     "topk_skip": {"qwen3_moe": TopKSkipQwen3Moe},
+    "topp_skip": {"qwen3_moe": TopPSkipQwen3Moe},
 }
 
 
@@ -150,8 +153,6 @@ def write_eval_results_file(
     with open(eval_output, "w", encoding="utf-8") as f:
         json.dump(to_dump, f, ensure_ascii=False, indent=2, default=str)
     logging.info("Evaluation done, results saved to: %s (%s)", eval_output, eval_output_content)
-    logging.info("Evaluation results: %s", obj)
-
 
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -160,7 +161,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "method",
         choices=sorted(METHOD_REGISTRY.keys()),
-        help="方法名（剪枝 *_pruning 或 topk_skip）",
+        help="方法名（剪枝 *_pruning 或 skipping: topk_skip/topp_skip）",
     )
     parser.add_argument(
         "mode",

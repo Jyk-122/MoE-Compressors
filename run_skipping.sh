@@ -2,35 +2,40 @@
 # MoE-Compressors（skipping）脚本入口 -> run.py
 #
 # 用法:
-#   bash run_skipping.sh calib   # 单卡校准（按方法定义，topk_skip 为空流程）
+#   bash run_skipping.sh calib   # 单卡校准（按方法定义，topk_skip/topp_skip 为空流程）
 #   bash run_skipping.sh eval    # 多卡评测（accelerate）
 #
 # 关键环境变量:
-#   METHOD           skipping 方法名（当前默认 topk_skip）
+#   METHOD           skipping 方法名（topk_skip | topp_skip，必填）
 #   MODEL            模型路径或 HF 名称
 #   CALIB_KWARGS     calib 参数 JSON，默认 {}
-#   PATCH_KWARGS     eval 参数 JSON，默认 {"k":2}
+#   PATCH_KWARGS     eval 参数 JSON（topk_skip 默认 {"k":2}；topp_skip 默认 {"threshold":0.8}）
 #   ADAPTER_DIR      calib 输出目录，默认 ./outputs/{MODEL_NAME}/{METHOD}
 #   EVAL_ADAPTER_DIR eval 时显式指定 adapter 目录（可选）
 #
 # 示例:
-#   bash run_skipping.sh calib
-#   bash run_skipping.sh eval
-#   CALIB_KWARGS='{"foo":1}' bash run_skipping.sh calib
-#   PATCH_KWARGS='{"k":1}' bash run_skipping.sh eval
-#   METHOD=topk_skip MODEL=Qwen/Qwen3-8B PATCH_KWARGS='{"k":1}' bash run_skipping.sh eval
+#   METHOD=topk_skip bash run_skipping.sh calib
+#   METHOD=topk_skip bash run_skipping.sh eval
+#   METHOD=topk_skip CALIB_KWARGS='{}' bash run_skipping.sh calib
+#   METHOD=topk_skip PATCH_KWARGS='{"k":1}' bash run_skipping.sh eval
+#   METHOD=topp_skip PATCH_KWARGS='{"threshold":0.8}' bash run_skipping.sh eval
 
 export HF_ALLOW_CODE_EVAL=1
 
 MODEL="${MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
-METHOD="${METHOD:-topk_skip}"
+METHOD="${METHOD:-}"
 DEFAULT_DIR="./outputs"
 MODEL_NAME="${MODEL##*/}"
 OUTPUT_BASE="${OUTPUT_BASE:-$DEFAULT_DIR/$MODEL_NAME}"
 ADAPTER_DIR="${ADAPTER_DIR:-$OUTPUT_BASE/$METHOD}"
 
-DEFAULT_PATCH_KWARGS='{"k":2}'
 DEFAULT_CALIB_KWARGS='{}'
+DEFAULT_PATCH_KWARGS='{}'
+if [ "$METHOD" = "topk_skip" ]; then
+  DEFAULT_PATCH_KWARGS='{"k":2}'
+elif [ "$METHOD" = "topp_skip" ]; then
+  DEFAULT_PATCH_KWARGS='{"threshold":0.8}'
+fi
 
 CALIBRATION_DATASET="${CALIBRATION_DATASET:-wikitext:wikitext-2-raw-v1}"
 MAX_CALIB_SAMPLES="${MAX_CALIB_SAMPLES:-128}"
@@ -57,9 +62,16 @@ MODE="${1:-}"
 if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
   echo "用法: bash run_skipping.sh calib | eval"
   echo "  关键变量: METHOD, MODEL, CALIB_KWARGS, PATCH_KWARGS, ADAPTER_DIR, EVAL_ADAPTER_DIR"
-  echo "  示例1: CALIB_KWARGS='{\"foo\":1}' bash run_skipping.sh calib"
-  echo "  示例2: PATCH_KWARGS='{\"k\":1}' bash run_skipping.sh eval"
-  echo "  示例3: EVAL_ADAPTER_DIR=./outputs/... bash run_skipping.sh eval"
+  echo "  示例1: METHOD=topk_skip PATCH_KWARGS='{\"k\":1}' bash run_skipping.sh eval"
+  echo "  示例2: METHOD=topk_skip PATCH_KWARGS='{\"k\":1}' bash run_skipping.sh eval"
+  echo "  示例3: METHOD=topp_skip PATCH_KWARGS='{\"threshold\":0.8}' bash run_skipping.sh eval"
+  echo "  示例4: EVAL_ADAPTER_DIR=./outputs/... bash run_skipping.sh eval"
+  exit 1
+fi
+
+if [ -z "$METHOD" ]; then
+  echo "错误: 必须显式设置 METHOD（topk_skip 或 topp_skip）"
+  echo "示例: METHOD=topk_skip bash run_skipping.sh eval"
   exit 1
 fi
 

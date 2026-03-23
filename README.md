@@ -29,7 +29,7 @@ MoE-Compressors/
 
 | 入口 | 说明 |
 |------|------|
-| **`python run.py <method> calib\|eval ...`** | 单一 CLI：`method` 为 `*_pruning` 或 `topk_skip`（互不重复） |
+| **`python run.py <method> calib\|eval ...`** | 单一 CLI：`method` 为 `*_pruning` 或 skipping（`topk_skip` / `topp_skip`） |
 | **`run_pruning.sh` / `run_skipping.sh`** | 拼好 `--calib_kwargs` / `--patch_kwargs` 后调用 `run.py` |
 
 **方法参数 JSON**
@@ -134,7 +134,7 @@ METHOD=camera_pruning CALIB_KWARGS='{"prune_ratio":0.5,"alpha":0.95}' bash run_p
 
 ### Skipping（`run.py` + `run_skipping.sh`）
 
-与剪枝相同，框架层都是 **`calib` + `eval`**；skipping 一般**不改 checkpoint 形状**。**topk_skip** 的 `calib()` 为空，但仍可走 **`run.py … calib`** 写 `config.json`。
+与剪枝相同，框架层都是 **`calib` + `eval`**；skipping 一般**不改 checkpoint 形状**。`topk_skip` / `topp_skip` 的 `calib()` 为空，但仍可走 **`run.py … calib`** 写 `config.json`。
 
 #### 1. 校准（单卡）
 
@@ -152,6 +152,12 @@ accelerate launch run.py topk_skip eval \
   --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
   --patch_kwargs '{"k":2}' \
   --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
+
+# top-p skipping：保留累计 router prob 首次 >= threshold 的最小专家集合
+accelerate launch run.py topp_skip eval \
+  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --patch_kwargs '{"threshold":0.8}' \
+  --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
 ```
 
 #### 3. 输出目录
@@ -160,30 +166,37 @@ accelerate launch run.py topk_skip eval \
 
 #### 4. `calib_kwargs` / `patch_kwargs`
 
-**路由/跳过相关参数只来自 JSON**（无单独 `--k`）。eval 阶段用 **`patch_kwargs`** 传 `k`（`1 <= k <= num_experts_per_tok`），并在 `topk_skip.patch` 内校验。
+**路由/跳过相关参数只来自 JSON**：
+- `topk_skip`：`patch_kwargs={"k":...}`，要求 `1 <= k <= num_experts_per_tok`。
+- `topp_skip`：`patch_kwargs={"threshold":...}`，要求 `0 < threshold <= 1`，并在默认 `top_k` 路由结果中按累计概率动态保留最少专家。
 
 #### 5. run_skipping.sh
 
+`run_skipping.sh` 要求显式设置 `METHOD`，避免误用默认方法。
+
 ```bash
 # 最常用
-bash run_skipping.sh calib
-bash run_skipping.sh eval
+METHOD=topk_skip bash run_skipping.sh calib
+METHOD=topk_skip bash run_skipping.sh eval
 
 # 改 k
-MODEL=Qwen/Qwen3-8B PATCH_KWARGS='{"k":1}' bash run_skipping.sh eval
+METHOD=topk_skip MODEL=Qwen/Qwen3-8B PATCH_KWARGS='{"k":1}' bash run_skipping.sh eval
+
+# top-p
+METHOD=topp_skip PATCH_KWARGS='{"threshold":0.8}' bash run_skipping.sh eval
 
 # eval 时显式指定 adapter 目录
-EVAL_ADAPTER_DIR=... bash run_skipping.sh eval
+METHOD=topk_skip EVAL_ADAPTER_DIR=... bash run_skipping.sh eval
 ```
 
 常用环境变量：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `METHOD` | `topk_skip` | skipping 方法名 |
+| `METHOD` | 无（必填） | skipping 方法名（`topk_skip` / `topp_skip`） |
 | `MODEL` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 模型路径/名称 |
 | `CALIB_KWARGS` | `{}` | 校准 JSON（按方法定义） |
-| `PATCH_KWARGS` | `{"k":2}` | 评测 JSON（topk_skip 需含 `k`） |
+| `PATCH_KWARGS` | 按 `METHOD` 自动给默认值 | 评测 JSON（topk: `{"k":2}`；topp: `{"threshold":0.8}`） |
 | `ADAPTER_DIR` | `./outputs/{model}/{method}` | calib 输出目录 |
 | `EVAL_ADAPTER_DIR` | 空 | eval 时可覆盖 adapter 目录 |
 | `TASKS` / `EVAL_LIMIT` | 脚本内默认 | 评测任务与样本上限 |
@@ -212,13 +225,14 @@ EVAL_ADAPTER_DIR=... bash run_skipping.sh eval
 | 状态 | 方法 | 说明 |
 |:----:|------|------|
 | ✓ | **topk_skip** | 仅 router logits 的大小判断裁剪专家。 |
+| ✓ | **topp_skip** | 在默认 top-k 路由中按累计概率阈值动态保留最少专家。 |
 | ☐ | **TODO** |   |
 
 ## Design Notes
 
 ### 仅保存 Adapter（剪枝为主）
 
-剪枝方法保存 `adapter.safetensors`；使用方式：**加载 base → 指定 adapter_dir → `patch()`**。**topk_skip** 可无权重 adapter，仅 `config.json`（若跑 calib）。
+剪枝方法保存 `adapter.safetensors`；使用方式：**加载 base → 指定 adapter_dir → `patch()`**。skipping（如 `topk_skip` / `topp_skip`）可无权重 adapter，仅 `config.json`（若跑 calib）。
 
 部分剪枝方法会在 adapter 中保存统计字段（如 `layer_{i}.expert_importance`、`router_prob_hist`），用于在 `patch` 阶段按 `patch_kwargs.prune_ratio` 重算 keep。
 
