@@ -1,6 +1,6 @@
 # MoE-Compressors
 
-Implementations of training-free MoE pruning/merging algorithms for LLMs with Mixture-of-Experts architecture.
+Implementations of training-free MoE pruning/skipping algorithms for LLMs with Mixture-of-Experts architecture.
 
 ## Requirements
 
@@ -8,170 +8,223 @@ Implementations of training-free MoE pruning/merging algorithms for LLMs with Mi
 pip install -r requirements.txt
 ```
 
-
 ## Overview
 
 ```
 MoE-Compressors/
 ├── MoECompressor.py          # 抽象基类（calib / patch / eval）
-├── run.py                    # 统一入口，两种模式：calib | eval
-├── run.sh                    # 运行脚本：calib 单卡，eval 多卡（accelerate），支持 METHOD/PRUNE_RATIO/MODEL 覆盖
-├── methods/
-│   ├── frequency_pruning/    # 方法：基于激活频率的专家剪枝
-│   │   └── model_qwen3_moe.py
-│   ├── ean_pruning/         # 方法：基于 Expert Activation Norm 的专家剪枝
-│   │   └── model_qwen3_moe.py
-│   └── ...
+├── run.py                    # 统一入口：剪枝 + skipping，calib | eval
+├── run_pruning.sh            # 封装 run.py（剪枝默认 CALIB_KWARGS / PATCH_KWARGS）
+├── run_skipping.sh           # 封装 run.py（skipping）
+├── utils/
+│   ├── moe_stats.py          # 路由统计
+│   ├── adapter_calib_config.py
+│   └── pruning_keep.py       # 按新 prune_ratio 从 adapter 统计量重算 keep（frequency/ean/reap）
+├── methods_pruning/
+├── methods_skipping/
 └── requirements.txt
 ```
 
-MoE-Compressors支持以下两种运行模式：
+### 运行模式
 
-| 模式 | 说明 | 运行方式 |
-|------|------|----------|
-| **calib** | 单卡校准，在校准集上计算统计量，保存 `adapter.safetensors` | `python run.py ...` |
-| **eval** | 多卡评测。`adapter_dir` 非空则先 patch 再评测剪枝模型；空则评测原模型 | `accelerate launch run.py ...` |
+| 入口 | 说明 |
+|------|------|
+| **`python run.py <method> calib\|eval ...`** | 单一 CLI：`method` 为 `*_pruning` 或 `topk_skip`（互不重复） |
+| **`run_pruning.sh` / `run_skipping.sh`** | 拼好 `--calib_kwargs` / `--patch_kwargs` 后调用 `run.py` |
 
-## Quick Start
+**方法参数 JSON**
 
-### 1. 校准（单卡）
+- **`--calib_kwargs`**：run.py 仅做 JSON 解析后原样透传给 `calib(**kwargs)`；字段含义与合法性由各方法 `calib` 自行处理。
+- **`--patch_kwargs`**：eval 阶段唯一的方法参数入口；`run.py` **不做方法语义判断**，只把 JSON 原样传给 `patch(**patch_kwargs)`。剪枝可传 `{"prune_ratio": ...}`，skipping 可传 `{"k": ...}`，合法性在各方法 `patch` 内判断。
+- **参数优先级（脚本层）**：显式设置 `CALIB_KWARGS` / `PATCH_KWARGS` 时直接使用；未设置时才使用脚本默认拼接逻辑。
+- **JSON 书写建议**：优先用单引号包裹 JSON（如 `PATCH_KWARGS='{"k":2}'`），避免 shell 转义问题。
+
+**eval 与 calib 的 `prune_ratio` 不一致时**：`frequency_pruning` / `ean_pruning` / `reap_pruning` 在 **`patch`** 中若发现与 `config.json` 不同且 adapter 含统计量，会**按当前 `prune_ratio` 重算** keep；**`camera_pruning` / `moei2_pruning`** 会在 **`patch`** 中报错，要求与校准一致。
+
+## Quick Start（`run.py`）
+
+### 剪枝（`run_pruning.sh` 封装）
+
+#### 1. 校准（单卡）
 
 ```bash
-# adapter 保存在 outputs/model_name/method/
-python run.py frequency_pruning calib --model Qwen/Qwen3-30B-A3B-Instruct-2507 --adapter_dir ./outputs/Qwen3-30B-A3B-Instruct-2507/frequency_pruning/0.5
+python run.py frequency_pruning calib --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --adapter_dir ./outputs/Qwen3-30B-A3B-Instruct-2507/frequency_pruning/0.5 \
+  --calib_kwargs '{"prune_ratio":0.5}'
 ```
 
-### 2. 评测（多卡，建议 accelerate launch）
+#### 2. 评测（多卡，建议 accelerate launch）
 
 ```bash
-# 评测剪枝模型（需先完成 calib）
 accelerate launch run.py frequency_pruning eval --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
-  --adapter_dir ./outputs/Qwen3-30B-A3B-Instruct-2507/frequency_pruning/0.5 --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
-
-# 评测原模型（不传 adapter_dir）
-accelerate launch run.py frequency_pruning eval --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --adapter_dir ./outputs/Qwen3-30B-A3B-Instruct-2507/frequency_pruning/0.5 \
+  --patch_kwargs '{"prune_ratio":0.5}' \
   --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
+
+# 与 calib 不同剪枝率（仅 frequency / ean / reap 等支持从 adapter 统计量重算）
+accelerate launch run.py frequency_pruning eval --model ... --adapter_dir ... \
+  --patch_kwargs '{"prune_ratio":0.3}'
 ```
 
-### 3. 输出目录
+#### 3. 输出目录
 
-通过 `DEFAULT_DIR` 和 `MODEL_NAME` 统一管理输出路径（见 `run.sh`）：
+通过 `DEFAULT_DIR` 和 `MODEL_NAME` 统一管理输出路径（见 `run_pruning.sh`）：
 
 ```
 outputs/{model_name}/
-├── results_20250305_123456.json            # 原模型评测结果
+├── results_20250305_123456.json
 └── {method}/
-    └── {prune_ratio}/                      # 如 0.5
-        ├── adapter.safetensors             # 剪枝 adapter
-        ├── config.json                     # calib 参数（自动保存）
-        └── results_20250305_123456.json    # 剪枝模型评测结果
+    └── {prune_ratio}/
+        ├── adapter.safetensors
+        ├── config.json
+        └── results_20250305_123456.json
 ```
 
-### 4. 方法专用超参（--calib_extra）
+#### 4. 方法专用 calib 超参
 
-各压缩方法可能有各自专用的 calib 超参（如 CAMERA 的 $\alpha$ ）。框架通过 `--calib_extra` 以 JSON 格式透传，无需为每种方法单独添加 CLI 参数：
+写入 **`--calib_kwargs`**（与 `prune_ratio` 同一 JSON），例如：
 
 ```bash
-# camera_pruning：设置 alpha（L2/inf 范数平衡系数，论文常用 0.95）
-python run.py camera_pruning calib --model ... --adapter_dir ... --calib_extra '{"alpha": 0.95}'
-
-# 多参数示例（未来方法）
-python run.py some_method calib ... --calib_extra '{"alpha": 0.8, "temperature": 0.1}'
+python run.py camera_pruning calib --model ... --adapter_dir ... \
+  --calib_kwargs '{"prune_ratio":0.5,"alpha":0.95}'
 ```
 
-- 透传逻辑：`calib_extra` 解析后作为 `**kwargs` 传给 `compressor.calib()`，各方法在 `calib(**kwargs)` 中按需提取
-- 保存与复现：calib 完成后，`config.json` 会保存 `calib_extra` 字段，便于审计和复现
-- 各方法支持的字段见对应 `methods/*/model_*.py` 中 `calib()` 的文档字符串
+`run_pruning.sh` 默认使用：
+- `CALIB_KWARGS='{"prune_ratio":0.5}'`
+- `PATCH_KWARGS='{"prune_ratio":0.5}'`
 
-### 5. Run Script
-
-使用根目录 `run.sh`，支持通过环境变量覆盖 `METHOD`、`PRUNE_RATIO`、`MODEL` 等：
+#### 5. run_pruning.sh
 
 ```bash
-# 默认参数（METHOD=frequency_pruning, PRUNE_RATIO=0.5）
-bash run.sh calib           # 单卡校准
-bash run.sh eval            # 多卡评测剪枝模型（ADAPTER_DIR 非空）
+# 最常用
+bash run_pruning.sh calib
+bash run_pruning.sh eval
 
-# 覆盖参数
-METHOD=ean_pruning PRUNE_RATIO=0.5 bash run.sh calib
-METHOD=ean_pruning PRUNE_RATIO=0.5 bash run.sh eval
-MODEL=Qwen/Qwen3-8B bash run.sh eval
-EVAL_RAW=1 bash run.sh eval  # 强制评测原模型（不 patch）
+# 指定方法（并显式给 patch 参数）
+METHOD=ean_pruning PATCH_KWARGS='{"prune_ratio":0.5}' bash run_pruning.sh eval
 
-# 方法专用超参：通过 CALIB_EXTRA 传入 JSON
-METHOD=camera_pruning CALIB_EXTRA='{"alpha": 0.95}' bash run.sh calib
+# 覆盖 eval patch 参数（例如与 calib 不同剪枝率）
+PATCH_KWARGS='{"prune_ratio":0.3}' bash run_pruning.sh eval
 
-# eval 阶段激活计算加速：通过 ACCELERATE_CONFIG 传入 JSON
-METHOD=frequency_pruning ACCELERATE_CONFIG='{"method":"topK","kwargs":{"k":0.5}}' bash run.sh eval
-METHOD=ean_pruning ACCELERATE_CONFIG='{"method":"topP","kwargs":{"threshold":0.9}}' bash run.sh eval
+# 只评测原模型（忽略 adapter）
+EVAL_RAW=1 bash run_pruning.sh eval
+
+# 方法专用校准超参（直接显式设置 CALIB_KWARGS）
+METHOD=camera_pruning CALIB_KWARGS='{"prune_ratio":0.5,"alpha":0.95}' bash run_pruning.sh calib
 ```
 
-### 6. Eval 激活计算加速（ACCELERATE_CONFIG）
+未设置 `CALIB_KWARGS` / `PATCH_KWARGS` 时，脚本分别使用 `{"prune_ratio":0.5}`。
+当 `EVAL_RAW=1` 时，脚本会强制走原模型评测路径（不传 `adapter_dir`，并传空 `patch_kwargs`）。
 
-在 `eval` 模式可以传入加速配置（`run.sh` 里通过环境变量 `ACCELERATE_CONFIG`，`run.py` 对应参数 `--accelerate_config`）：
+常用环境变量：
 
-```json
-{"method":"topK","kwargs":{"k":0.5}}
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `METHOD` | `frequency_pruning` | 剪枝方法名 |
+| `MODEL` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 模型路径/名称 |
+| `CALIB_KWARGS` | `{"prune_ratio":0.5}` | 校准 JSON |
+| `PATCH_KWARGS` | `{"prune_ratio":0.5}` | 评测 JSON |
+| `ADAPTER_DIR` | `./outputs/{model}/{method}` | calib 输出 / eval 输入目录 |
+| `EVAL_RAW` | `0` | `1` 时不加载 adapter |
+| `TASKS` / `EVAL_LIMIT` | 脚本内默认 | 评测任务与样本上限 |
+| `GEN_KWARGS` | `max_gen_toks=1024` | lm_eval 生成参数 |
+| `EVAL_OUTPUT_PATH` / `EVAL_OUTPUT_CONTENT` | 空 / `metrics` | 结果输出路径与内容 |
+
+评测结果中的运行时统计在 **`results["runtime_routing"]`**（含 `patch_kwargs` 与 collector 摘要）。
+
+### Skipping（`run.py` + `run_skipping.sh`）
+
+与剪枝相同，框架层都是 **`calib` + `eval`**；skipping 一般**不改 checkpoint 形状**。**topk_skip** 的 `calib()` 为空，但仍可走 **`run.py … calib`** 写 `config.json`。
+
+#### 1. 校准（单卡）
+
+```bash
+python run.py topk_skip calib \
+  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --adapter_dir ./outputs/Qwen3-30B-A3B-Instruct-2507/topk_skip \
+  --calib_kwargs '{}'
 ```
 
-或
+#### 2. 评测（多卡，建议 accelerate launch）
 
-```json
-{"method":"topP","kwargs":{"threshold":0.9}}
+```bash
+accelerate launch run.py topk_skip eval \
+  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --patch_kwargs '{"k":2}' \
+  --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
 ```
 
-约定如下：
+#### 3. 输出目录
 
-- `method`：当前支持 `topK` / `topP`
-- `kwargs`：方法参数字典
-  - `topK.k`：`0<k<=1` 表示按原始 `top_k` 的比例；`k>=1` 表示绝对专家个数
-  - `topP.threshold`：累计概率阈值，范围 `(0,1]`
-- 仅在 `eval` 阶段生效，`calib` 不使用该参数
+与剪枝类似；可用 `--eval_output_path` 指定路径。
 
-当前方法支持情况：
+#### 4. `calib_kwargs` / `patch_kwargs`
 
-- 支持：`frequency_pruning`、`ean_pruning`、`reap_pruning`
-- 暂不支持（会 warning 并忽略配置）：`camera_pruning`、`moei2_pruning`
+**路由/跳过相关参数只来自 JSON**（无单独 `--k`）。eval 阶段用 **`patch_kwargs`** 传 `k`（`1 <= k <= num_experts_per_tok`），并在 `topk_skip.patch` 内校验。
 
-补充：支持方法在**不传 `adapter_dir`** 时，也可仅用 `ACCELERATE_CONFIG` 对原始模型启用动态激活裁剪（identity expert mapping，不做结构剪枝）。
+#### 5. run_skipping.sh
+
+```bash
+# 最常用
+bash run_skipping.sh calib
+bash run_skipping.sh eval
+
+# 改 k
+MODEL=Qwen/Qwen3-8B PATCH_KWARGS='{"k":1}' bash run_skipping.sh eval
+
+# eval 时显式指定 adapter 目录
+EVAL_ADAPTER_DIR=... bash run_skipping.sh eval
+```
+
+常用环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `METHOD` | `topk_skip` | skipping 方法名 |
+| `MODEL` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 模型路径/名称 |
+| `CALIB_KWARGS` | `{}` | 校准 JSON（按方法定义） |
+| `PATCH_KWARGS` | `{"k":2}` | 评测 JSON（topk_skip 需含 `k`） |
+| `ADAPTER_DIR` | `./outputs/{model}/{method}` | calib 输出目录 |
+| `EVAL_ADAPTER_DIR` | 空 | eval 时可覆盖 adapter 目录 |
+| `TASKS` / `EVAL_LIMIT` | 脚本内默认 | 评测任务与样本上限 |
+| `GEN_KWARGS` | `max_gen_toks=1024` | lm_eval 生成参数 |
+| `EVAL_OUTPUT_PATH` / `EVAL_OUTPUT_CONTENT` | 空 / `metrics` | 结果输出路径与内容 |
+
+#### 6. 评测结果
+
+同剪枝，关注 **`results["runtime_routing"]`**。
 
 ## Algorithms
 
+### Pruning Methods
+
 | 状态 | 方法 | 论文来源 |
 |:----:|------|----------|
-| ✓ | **frequency_pruning** | 常见 baseline，见 MoE 剪枝文献 |
+| ✓ | **frequency_pruning** | 根据专家被激活的频率剪枝。 |
 | ✓ | **ean_pruning** | [Finding Fantastic Experts in MoEs: A Unified Study for Expert Dropping Strategies and Observations](https://arxiv.org/abs/2504.05586) |
 | ✓ | **reap_pruning** | [REAP the Experts: Why Pruning Prevails for One-Shot MoE compression](http://arxiv.org/abs/2510.13999) |
 | ✓ | **camera_pruning** | [CAMERA: Multi-Matrix Joint Compression for MoE Models via Micro-Expert Redundancy Analysis](https://arxiv.org/abs/2508.02322) |
 | ✓ | **moei2_pruning** | [MoE-I²: Compressing Mixture of Experts Models through Inter-Expert Pruning and Intra-Expert Low-Rank Decomposition](https://arxiv.org/abs/2411.01016) |
-| ☐ | **TODO_EXAMPLE** |   |
+| ☐ | **TODO** |   |
+
+### Skipping Methods
+
+| 状态 | 方法 | 说明 |
+|:----:|------|------|
+| ✓ | **topk_skip** | 仅 router logits 的大小判断裁剪专家。 |
+| ☐ | **TODO** |   |
 
 ## Design Notes
 
-### 仅保存 Adapter
+### 仅保存 Adapter（剪枝为主）
 
-本框架**只保存 adapter**（`adapter.safetensors`），不保存剪枝后的完整模型权重。原因如下：
+剪枝方法保存 `adapter.safetensors`；使用方式：**加载 base → 指定 adapter_dir → `patch()`**。**topk_skip** 可无权重 adapter，仅 `config.json`（若跑 calib）。
 
-- base 模型仅留 1 份，仅保存与剪枝相关的adapter，随时可以 `patch` 得到等效的剪枝模型，无需预先保存剪枝后权重，节省存储空间
-- MoE的专家剪枝只涉及FFN的修改，非侵入式的`patch`更简洁高效，不提供 `modeling_xxx.py`，且剪枝后模型的 `forward` 逻辑通常与 base 模型不一致，无法用 `from_pretrained()` 直接加载
-- 使用剪枝模型的正确方式是：**加载 base 模型 → 加载 adapter → 执行 patch()**，三者缺一不可
+部分剪枝方法会在 adapter 中保存统计字段（如 `layer_{i}.expert_importance`、`router_prob_hist`），用于在 `patch` 阶段按 `patch_kwargs.prune_ratio` 重算 keep。
 
-**推荐使用流程**：calib 后仅分发 adapter 目录，推理/评测时加载 base 和 adapter_dir 再 patch 即可。
+### model_type 与扩展
 
-对于支持激活计算加速的方法，`adapter` 还会额外保存统计量，供 `patch/forward` 在运行时结合 `router logits` 做动态专家选择。典型字段包括：
+`--model_type` 未指定时从 `AutoConfig.model_type` 推断。新增实现时注册表 key 须与 HF `config.model_type` 一致。
 
-- `layer_{i}.keep_indices`、`layer_{i}.old_to_new`
-- `layer_{i}.expert_importance`（每专家重要性）
-- `layer_{i}.expert_activation_count`（校准期激活次数）
-- `layer_{i}.router_prob_hist`、`layer_{i}.router_cdf`
-- `layer_{i}.calib_tokens`
-- `meta.adapter_version`、`meta.router_hist_bins`
-
-### model_type 与扩展新模型
-
-`--model_type` 未指定时，会从 base 模型的 `config.model_type`（HuggingFace 标准字段）自动推断。
-
-**开发者约定**：新增方法实现时，`model_type` 必须与 HuggingFace 的 `config.model_type` **严格保持一致**，不做二次映射。例如 Qwen3-MoE 的 config 中 `model_type="qwen3_moe"`，则注册表中对应 key 也应为 `"qwen3_moe"`。这样 `run.py` 才能通过 `AutoConfig.from_pretrained(model).model_type` 自动推断并正确查找到实现类。
-
-目录组织示例：为 `ean_pruning` 新增 GPT-OSS 适配时，创建 `methods/ean_pruning/model_gpt_oss.py`，在 `run.py` 的 `METHOD_REGISTRY` 中注册 `"ean_pruning": { ..., "gpt_oss": EANPruningGptOss }`（HF 中该模型的 `config.model_type` 为 `"gpt_oss"`）。
-
+- pruning：在 `methods_pruning/<method>/` 实现，并在 **`run.py` 的 `METHOD_REGISTRY`** 注册；建议在 `calib`/`patch` 内统一从 kwargs 读取 `prune_ratio` 等字段。
+- skipping：在 `methods_skipping/<method>/` 实现并注册到 **`run.py`**；在 `calib` / `patch` 中直接校验各自 kwargs 字段（如 `k`）。

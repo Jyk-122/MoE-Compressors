@@ -15,7 +15,6 @@ MoE Compressor - MoE 剪枝/合并方法的抽象基类
 
 from __future__ import annotations
 
-import argparse
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -103,18 +102,16 @@ class MoECompressor(ABC):
     def patch(
         self,
         model: PreTrainedModel,
-        accelerate_config: dict | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
-        打补丁：读取 adapter，对给定 model 原地修改 MoE 层结构、权重和 forward 逻辑。
+        打补丁：读取 adapter（若有），对给定 model 原地修改 MoE 层结构、权重和 forward 逻辑。
 
         由 eval() 在 HFLM 初始化后、simple_evaluate 前调用，对 lm._model 做 patch。
 
         Args:
             model: 待 patch 的 ModelForCausalLM（通常为 HFLM._model）
-            accelerate_config: 激活计算加速配置，透传给 patch/forward
-            **kwargs: 与压缩方法相关的参数。
+            **kwargs: 由 eval 将 **patch_kwargs（解析后的 dict）传入 patch（如 pruning 的 prune_ratio、skipping 的 k）。
 
         Returns:
             model: 打过补丁的 model（原地修改，返回同一对象）
@@ -132,14 +129,14 @@ class MoECompressor(ABC):
         batch_size: int | str = 1,
         limit: float | None = None,
         gen_kwargs: str | dict | None = None,
-        accelerate_config: dict | None = None,
+        patch_kwargs: dict | None = None,
         **lm_eval_kwargs,
     ) -> dict[str, Any]:
         """
         评测：用 lm_eval 评估模型。
 
         使用 HFLM(pretrained=model_path) 传入路径，以支持 accelerate 分布式数据并行。
-        若 adapter_dir 非空，则对 lm._model 原地 patch 后再评测剪枝模型。
+        若 `adapter_dir` 非空或 `patch_kwargs` 非空，则对 lm._model 调用 patch 后再评测。
 
         Args:
             tasks: 评测任务名列表，如 ["wikitext", "hellaswag"]
@@ -147,7 +144,7 @@ class MoECompressor(ABC):
             batch_size: 评测 batch size，可为 "auto"
             limit: 每任务样本上限，如 0.1 表示 10%
             gen_kwargs: 生成参数，如 "max_gen_toks=1024" 或 dict，对 generate_until 任务生效
-            accelerate_config: 激活计算加速配置，透传给 patch/forward
+            patch_kwargs: 传给 patch(**patch_kwargs) 的参数字典（如 skipping 的 k）；剪枝默认可为空
             **lm_eval_kwargs: 传给 simple_evaluate 的额外参数
 
         Returns:
@@ -176,12 +173,12 @@ class MoECompressor(ABC):
 
         # 避免跨次 eval 复用上一次 patch 写入的统计对象
         self._acceleration_stats_collector = None
-        if self.adapter_dir is not None or (accelerate_config and len(accelerate_config) > 0):
+        should_patch = self.adapter_dir is not None or (
+            patch_kwargs is not None and len(patch_kwargs) > 0
+        )
+        if should_patch:
             logger.info("[eval] Applying patch to lm._model")
-            self.patch(
-                lm._model,
-                accelerate_config=accelerate_config or {},
-            )
+            self.patch(lm._model, **(patch_kwargs or {}))
 
         tasks = tasks or ["wikitext"]
         results = simple_evaluate(
@@ -198,8 +195,10 @@ class MoECompressor(ABC):
         collector = getattr(self, "_acceleration_stats_collector", None)
         if collector is not None and isinstance(results, dict):
             summary = collector.summary()
-            summary["config"] = accelerate_config or {}
-            results["acceleration"] = summary
+            results["runtime_routing"] = {
+                **summary,
+                "patch_kwargs": patch_kwargs or {},
+            }
         return results
 
     # -------------------------------------------------------------------------

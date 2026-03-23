@@ -33,6 +33,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 )
 
 from MoECompressor import MoECompressor
+from utils.adapter_calib_config import saved_prune_ratio_from_adapter_dir
 
 
 class PrunedQwen3MoeSparseMoeBlock(nn.Module):
@@ -148,7 +149,6 @@ class CAMERAPruningQwen3Moe(MoECompressor):
         self,
         model_name_or_path: str,
         adapter_dir: str | Path | None = None,
-        prune_ratio: float = 0.5,
         device: str = "cuda",
         torch_dtype: torch.dtype | None = None,
         trust_remote_code: bool = True,
@@ -162,8 +162,6 @@ class CAMERAPruningQwen3Moe(MoECompressor):
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
-        self.prune_ratio = prune_ratio
-
     def calib(
         self,
         calibration_dataset: str,
@@ -178,6 +176,7 @@ class CAMERAPruningQwen3Moe(MoECompressor):
         """
         if self.adapter_dir is None:
             raise ValueError("calib 需提供 adapter_dir")
+        prune_ratio = float(kwargs.get("prune_ratio", 0.5))
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -277,7 +276,7 @@ class CAMERAPruningQwen3Moe(MoECompressor):
                     global_base = expert_idx * inter_size
                     global_energy[global_base : global_base + inter_size] = expert_importance
 
-                num_keep_total = max(1, int(total_micro_experts * (1 - self.prune_ratio)))
+                num_keep_total = max(1, int(total_micro_experts * (1 - prune_ratio)))
                 _, top_global_indices = torch.topk(global_energy, num_keep_total)
 
                 # 向量化：将 top 索引转为 0/1 mask，按 expert 分段，无 Python 循环
@@ -315,19 +314,18 @@ class CAMERAPruningQwen3Moe(MoECompressor):
         """
         打补丁：读取 adapter，将给定 model 的每层 MoE 替换为 PrunedQwen3MoeSparseMoeBlock。
         """
-        accelerate_config = kwargs.get("accelerate_config", {}) or {}
-        if self.adapter_dir is None and accelerate_config:
-            logger.warning(
-                "[camera][patch] 当前方法不支持激活计算加速，且未提供 adapter，保持原模型不变并忽略 accelerate_config=%s",
-                accelerate_config,
-            )
-            return model
+        prune_ratio = kwargs.get("prune_ratio")
+        if prune_ratio is None:
+            raise ValueError("[camera][patch] 需要在 patch_kwargs 中提供 prune_ratio")
+        prune_ratio = float(prune_ratio)
         if self.adapter_dir is None:
             raise ValueError("patch 需提供 adapter_dir")
-        if accelerate_config:
-            logger.warning(
-                "[camera][patch] 当前方法不支持激活计算加速，已忽略 accelerate_config=%s",
-                accelerate_config,
+
+        saved_pr = saved_prune_ratio_from_adapter_dir(self.adapter_dir)
+        if saved_pr is not None and abs(prune_ratio - float(saved_pr)) > 1e-5:
+            raise ValueError(
+                f"[camera_pruning] eval 的 prune_ratio={prune_ratio} 与 adapter 目录 config.json 中的 "
+                f"{saved_pr} 不一致；CAMERA adapter 与校准剪枝率绑定，请重新 calib 或勿在 patch_kwargs 中改 prune_ratio。"
             )
 
         logger.info("[patch] Loading adapter")

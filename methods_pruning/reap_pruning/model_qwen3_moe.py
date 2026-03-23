@@ -1,14 +1,14 @@
 """
-Frequency Pruning 方法 - 基于激活频率的专家剪枝（Qwen3-MoE 实现）
+REAP (Why Pruning Prevails for One-Shot MoE compression) 方法 - 基于专家激活范数与 top-k weights 的剪枝（Qwen3-MoE 实现）
 
 【原理】
-在校准集上统计每个 token 被路由到哪些专家，累加得到每层各专家的激活次数。
-根据 prune_ratio 裁剪每层中激活次数最少的那部分专家。
+在校准集上统计每个专家所输出的激活向量的 L2 范数（Norm）与 top-k weights 的乘积的均值。
+值越大表示专家越重要，越小越优先被裁剪。
 
 【适配 Qwen3-MoE】
 - MoE 层为 Qwen3MoeSparseMoeBlock，内含 gate (Router) 和 experts
-- 通过 output_router_logits 获取每层 router_logits，对 logits 做 topk 得到选中的专家索引
-- patch 时：替换为 PrunedQwen3MoeSparseMoeBlock，对 router 做 mask、对 experts 做切片
+- 在校准 forward 时，对每个专家的输出（乘 routing weight 之前）计算 L2 范数与 top-k weights 的乘积，按专家累加求均值
+- patch 时：与 frequency_pruning 相同，替换为 PrunedQwen3MoeSparseMoeBlock
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import gc
 import logging
+import types
 from pathlib import Path
 from typing import Any
 
@@ -31,8 +32,9 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 )
 
 from MoECompressor import MoECompressor
-from methods.utils.acceleration import build_strategy
-from methods.utils.moe_stats import MoEStatsCollector, build_router_prob_hist
+from utils.adapter_calib_config import saved_prune_ratio_from_adapter_dir
+from utils.moe_stats import MoEStatsCollector, build_router_prob_hist
+from utils.pruning_keep import recompute_keep_indices_from_scores
 
 
 def _get_moe_layers(model) -> list[tuple[int, Qwen3MoeSparseMoeBlock]]:
@@ -49,14 +51,61 @@ def _get_moe_layers(model) -> list[tuple[int, Qwen3MoeSparseMoeBlock]]:
     return moe_layers
 
 
+def _experts_forward_with_norm_collection(
+    experts_module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    norm_stats: dict,
+    layer_idx: int,
+) -> torch.Tensor:
+    """
+    执行 experts forward，同时收集每个专家输出的 L2 范数统计。
+
+    与 Qwen3MoeExperts.forward 逻辑一致，但在乘 routing weight 之前计算每个 token 输出的 L2 范数，
+    按专家累加 sum_norm 和 count。
+    """
+    num_experts = experts_module.num_experts
+    final_hidden_states = torch.zeros_like(hidden_states)
+
+    with torch.no_grad():
+        expert_mask = F.one_hot(top_k_index, num_classes=num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+    for idx in expert_hit:
+        expert_idx = idx[0].item()
+        if expert_idx >= num_experts:
+            continue
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[token_idx]
+        gate, up = F.linear(current_state, experts_module.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+        current_hidden_states = experts_module.act_fn(gate) * up
+        # 专家输出（乘 routing weight 之前）
+        expert_output = F.linear(current_hidden_states, experts_module.down_proj[expert_idx])
+        # 计算每个 token 输出的 L2 范数
+        norms = torch.norm(expert_output.float(), p=2, dim=-1)
+        # 计算每个 token 输出的 L2 范数与 top-k weights 的乘积
+        norms = norms * top_k_weights[token_idx, top_k_pos, None]
+        # 累加统计
+        if layer_idx not in norm_stats:
+            norm_stats[layer_idx] = {}
+        if expert_idx not in norm_stats[layer_idx]:
+            norm_stats[layer_idx][expert_idx] = [0.0, 0]  # [sum_norm, count]
+        norm_stats[layer_idx][expert_idx][0] += norms.sum().item()
+        norm_stats[layer_idx][expert_idx][1] += norms.numel()
+
+        current_hidden_states = expert_output * top_k_weights[token_idx, top_k_pos, None]
+        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+    return final_hidden_states
+
+
 class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
     """
-    剪枝后的 SparseMoeBlock。
+    剪枝后的 SparseMoeBlock（与 frequency_pruning 共用同一实现）。
 
-    1. Router：在原 logits 上将「被剪专家」对应位置置为 -inf，再 softmax+topk，
-       保证只有保留专家会被选中。
-    2. Experts：只保留 keep_indices 对应的专家权重，forward 时用 old_to_new 映射
-       将 router 输出的旧索引转为新索引。
+    1. Router：在原 logits 上将「被剪专家」对应位置置为 -inf
+    2. Experts：只保留 keep_indices 对应的专家权重
     """
 
     def __init__(
@@ -65,16 +114,9 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
         keep_indices: torch.LongTensor,
         old_to_new: torch.LongTensor,
         layer_idx: int,
-        accelerate_config: dict[str, Any] | None = None,
         layer_stats: dict[str, torch.Tensor] | None = None,
         stats_collector: MoEStatsCollector | None = None,
     ):
-        """
-        Args:
-            original_block: 原始 SparseMoeBlock
-            keep_indices: 保留的专家索引，shape (num_kept,)
-            old_to_new: 旧索引 -> 新索引，shape (num_experts,)，被剪专家为 -1
-        """
         super().__init__()
         # deepcopy gate 避免引用 original_block，防止 GC 无法回收原始 experts 导致显存泄漏
         self.gate = copy.deepcopy(original_block.gate)
@@ -85,9 +127,6 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
         self.num_kept = len(keep_indices)
         self.layer_idx = layer_idx
         self.layer_stats = layer_stats or {}
-        self.accelerate_config = accelerate_config or {}
-        self.accelerate_kwargs = self.accelerate_config.get("kwargs", {})
-        self.accel_strategy = build_strategy(self.accelerate_config)
         self.stats_collector = stats_collector
         experts = original_block.experts
         self.gate_up_proj = torch.nn.Parameter(experts.gate_up_proj[keep_indices].clone())
@@ -98,7 +137,6 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
 
-        # 1. 计算 router logits，将被剪专家的 logits 置为 -inf
         router_logits = F.linear(hidden_states_reshaped, self.gate.weight)
         router_logits = router_logits.clone()
         pruned_mask = self.old_to_new == -1
@@ -112,22 +150,11 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
                 router_probs = router_probs * importance.unsqueeze(0)
                 router_probs = router_probs / router_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
-        if self.accel_strategy is None:
-            router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
-            if self.gate.norm_topk_prob:
-                router_top_value = (router_top_value / router_top_value.sum(dim=-1, keepdim=True)).to(router_probs.dtype)
-            routing_weights = router_top_value
-        else:
-            selected = self.accel_strategy.select(
-                router_probs=router_probs,
-                default_top_k=self.top_k,
-                norm_topk_prob=self.gate.norm_topk_prob,
-                kwargs=self.accelerate_kwargs,
-            )
-            router_indices = selected.selected_indices
-            routing_weights = selected.selected_weights
+        router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        if self.gate.norm_topk_prob:
+            router_top_value = (router_top_value / router_top_value.sum(dim=-1, keepdim=True)).to(router_probs.dtype)
+        routing_weights = router_top_value
 
-        # 2. 将 router 输出的旧索引映射到新索引（0..num_kept-1）
         selected_experts_new = torch.full_like(router_indices, -1)
         valid_old = router_indices >= 0
         if valid_old.any():
@@ -139,7 +166,6 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
                 default_top_k=self.top_k,
             )
 
-        # 3. 用切片后的专家权重做 forward（与原 Qwen3MoeExperts 逻辑一致）
         final_hidden_states = torch.zeros_like(hidden_states_reshaped)
         for expert_idx in range(self.num_kept):
             token_idx, top_k_pos = torch.where(selected_experts_new == expert_idx)
@@ -154,27 +180,22 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 
-class FrequencyPruningQwen3Moe(MoECompressor):
+class REAPPruningQwen3Moe(MoECompressor):
     """
-    基于激活频率的专家剪枝，适配 Qwen3-MoE。
+    基于 REAP 的专家剪枝，适配 Qwen3-MoE。
 
-    根据 prune_ratio 在每层剪掉激活次数最少的专家，保留激活频繁的专家。
+    统计每个专家输出激活向量的 L2 范数与 top-k weights 的乘积的均值，剪掉均值最小的专家。
     """
 
     def __init__(
         self,
         model_name_or_path: str,
         adapter_dir: str | Path | None = None,
-        prune_ratio: float = 0.5,
         device: str = "cuda",
         torch_dtype: torch.dtype | None = None,
         trust_remote_code: bool = True,
         **kwargs,
     ):
-        """
-        Args:
-            prune_ratio: 剪枝比例 (0~1)，如 0.5 表示剪掉 50% 专家
-        """
         super().__init__(
             model_name_or_path=model_name_or_path,
             adapter_dir=adapter_dir,
@@ -183,8 +204,6 @@ class FrequencyPruningQwen3Moe(MoECompressor):
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
-        self.prune_ratio = prune_ratio
-
     def calib(
         self,
         calibration_dataset: str,
@@ -194,20 +213,11 @@ class FrequencyPruningQwen3Moe(MoECompressor):
         **kwargs,
     ) -> None:
         """
-        校准：在校准数据上计算统计量，并保存 adapter，需要指定 adapter_dir。
-
-        Args:
-            calibration_dataset: HuggingFace 数据集路径，格式如 "wikitext:wikitext-2-raw-v1"
-            max_calib_samples: 最大校准样本数
-            max_context_len: 每个校准样本的目标 token 数
-            batch_size: 批量大小
-            **kwargs: 其它方法相关的参数
-
-        Returns:
-            None
+        校准：在校准数据上统计每个专家输出的 L2 范数均值，保存 adapter。
         """
         if self.adapter_dir is None:
             raise ValueError("calib 需提供 adapter_dir")
+        prune_ratio = float(kwargs.get("prune_ratio", 0.5))
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -231,13 +241,14 @@ class FrequencyPruningQwen3Moe(MoECompressor):
             max_context_len=max_context_len,
         )
 
-        logger.info("[calib] Step 2/4: Forward pass to collect expert activation stats")
+        logger.info("[calib] Step 2/4: Forward pass to collect expert activation norms (REAP)")
         model.eval()
-        if hasattr(model.config, "output_router_logits"):
-            model.config.output_router_logits = True
         moe_layers = _get_moe_layers(model)
         num_experts = model.config.num_experts
         top_k = model.config.num_experts_per_tok
+
+        # norm_stats[layer_idx][expert_idx] = [sum_norm, count]
+        norm_stats: dict[int, dict[int, list[float]]] = {}
         expert_counts: dict[int, torch.Tensor] = {i: torch.zeros(num_experts) for i, _ in moe_layers}
         router_hist_bins = 16
         router_hist: dict[int, torch.Tensor] = {
@@ -245,6 +256,23 @@ class FrequencyPruningQwen3Moe(MoECompressor):
         }
         layer_tokens: dict[int, int] = {i: 0 for i, _ in moe_layers}
 
+        # 用 MethodType 替换 experts.forward，默认参数在定义时求值，正确捕获当前层的 decoder_layer_idx
+        for decoder_layer_idx, block in moe_layers:
+            experts = block.experts
+
+            def _forward(self, hidden_states, top_k_index, top_k_weights, _layer=decoder_layer_idx):
+                return _experts_forward_with_norm_collection(
+                    experts_module=self,
+                    hidden_states=hidden_states,
+                    top_k_index=top_k_index,
+                    top_k_weights=top_k_weights,
+                    norm_stats=norm_stats,
+                    layer_idx=_layer,
+                )
+
+            experts.forward = types.MethodType(_forward, experts)
+
+        # 运行校准 forward
         n_batches = (len(texts) + batch_size - 1) // batch_size
         for start in tqdm(range(0, len(texts), batch_size), total=n_batches, desc="Calibration forward", unit="batch"):
             batch_texts = texts[start : start + batch_size]
@@ -258,12 +286,6 @@ class FrequencyPruningQwen3Moe(MoECompressor):
             inputs = {k: v.to(model.device) for k, v in inputs.items()}
             with torch.no_grad():
                 outputs = model(**inputs, output_router_logits=True)
-            if outputs.router_logits is None:
-                raise RuntimeError(
-                    "模型未返回 router_logits，请确保 config.output_router_logits=True"
-                )
-
-            # 从 router_logits 推断每 token 选中的 topk 专家，累加计数
             for router_pos, (decoder_layer_idx, _) in enumerate(moe_layers):
                 logits = outputs.router_logits[router_pos]
                 if logits.dim() == 3:
@@ -277,11 +299,17 @@ class FrequencyPruningQwen3Moe(MoECompressor):
                 router_hist[decoder_layer_idx] += hist
                 layer_tokens[decoder_layer_idx] += int(logits.shape[0])
 
-        logger.info("[calib] Step 3/4: Determining kept experts by activation frequency")
+        logger.info("[calib] Step 3/4: Determining kept experts by REAP")
         keep_per_layer = {}
-        for decoder_layer_idx, counts in expert_counts.items():
-            num_keep = max(1, int(num_experts * (1 - self.prune_ratio)))
-            _, top_indices = torch.topk(counts, num_keep)
+        for decoder_layer_idx, _ in moe_layers:
+            layer_stats = norm_stats.get(decoder_layer_idx, {})
+            
+            mean_norms = torch.full((num_experts,), 0.0, dtype=torch.float64)
+            for expert_idx, (sum_norm, count) in layer_stats.items():
+                mean_norms[expert_idx] = sum_norm / count
+
+            num_keep = max(1, int(num_experts * (1 - prune_ratio)))
+            _, top_indices = torch.topk(mean_norms, num_keep)
             keep_indices = top_indices.sort().values
             old_to_new = torch.full((num_experts,), -1, dtype=torch.long)
             for new_idx, old_idx in enumerate(keep_indices.tolist()):
@@ -289,8 +317,8 @@ class FrequencyPruningQwen3Moe(MoECompressor):
             keep_per_layer[str(decoder_layer_idx)] = {
                 "keep_indices": keep_indices.cpu(),
                 "old_to_new": old_to_new.cpu(),
-                "expert_importance": counts.cpu(),
-                "expert_activation_count": counts.cpu(),
+                "expert_importance": mean_norms.cpu(),
+                "expert_activation_count": expert_counts[decoder_layer_idx].cpu(),
                 "router_prob_hist": router_hist[decoder_layer_idx].cpu(),
                 "router_cdf": torch.cumsum(
                     router_hist[decoder_layer_idx] / router_hist[decoder_layer_idx].sum().clamp_min(1e-12),
@@ -298,7 +326,7 @@ class FrequencyPruningQwen3Moe(MoECompressor):
                 ).cpu(),
                 "calib_tokens": torch.tensor(layer_tokens[decoder_layer_idx], dtype=torch.long),
             }
-        
+
         logger.info("[calib] Step 4/4: Saving adapter")
         self.adapter_dir.mkdir(parents=True, exist_ok=True)
         state = {
@@ -318,11 +346,13 @@ class FrequencyPruningQwen3Moe(MoECompressor):
     def patch(self, model, **kwargs) -> Any:
         """
         打补丁：读取 adapter，将给定 model 的每层 MoE 替换为 PrunedQwen3MoeSparseMoeBlock。
-        由 eval() 在 HFLM 初始化后对 lm._model 调用。
         """
-        accelerate_config = kwargs.get("accelerate_config", {}) or {}
-        if self.adapter_dir is None and not accelerate_config:
-            raise ValueError("patch 需提供 adapter_dir，或传入 accelerate_config 启用原始模型加速")
+        prune_ratio = kwargs.get("prune_ratio")
+        if prune_ratio is None:
+            raise ValueError("[reap][patch] 需要在 patch_kwargs 中提供 prune_ratio")
+        prune_ratio = float(prune_ratio)
+        if self.adapter_dir is None:
+            raise ValueError("patch 需提供 adapter_dir")
 
         state = {}
         if self.adapter_dir is not None:
@@ -342,16 +372,36 @@ class FrequencyPruningQwen3Moe(MoECompressor):
         ]
         logger.info("[patch] Replacing %d MoE layers", len(moe_indices))
 
+        saved_pr = saved_prune_ratio_from_adapter_dir(self.adapter_dir)
+
         for decoder_layer_idx in tqdm(moe_indices, desc="Patching layers", unit="layer"):
             block = layers[decoder_layer_idx].mlp
             key_pre = f"layer_{decoder_layer_idx}"
             keep_key = f"{key_pre}.keep_indices"
             map_key = f"{key_pre}.old_to_new"
-            if keep_key in state and map_key in state:
+            imp_key = f"{key_pre}.expert_importance"
+            num_experts = block.gate.num_experts
+            recompute = (
+                saved_pr is not None
+                and abs(prune_ratio - float(saved_pr)) > 1e-5
+                and imp_key in state
+                and state[imp_key].numel() == num_experts
+            )
+            if recompute:
+                importance = state[imp_key]
+                keep_indices, old_to_new = recompute_keep_indices_from_scores(
+                    importance, num_experts, prune_ratio
+                )
+                logger.info(
+                    "[reap][patch] layer %d: eval prune_ratio=%s 与 calib(%s) 不同，从 expert_importance 重算 keep",
+                    decoder_layer_idx,
+                    prune_ratio,
+                    saved_pr,
+                )
+            elif keep_key in state and map_key in state:
                 keep_indices = state[keep_key]
                 old_to_new = state[map_key]
             else:
-                num_experts = block.gate.num_experts
                 keep_indices = torch.arange(num_experts, dtype=torch.long)
                 old_to_new = torch.arange(num_experts, dtype=torch.long)
             layer_stats = {}
@@ -364,7 +414,6 @@ class FrequencyPruningQwen3Moe(MoECompressor):
                 keep_indices.to(block.gate.weight.device),
                 old_to_new.to(block.gate.weight.device),
                 layer_idx=decoder_layer_idx,
-                accelerate_config=accelerate_config,
                 layer_stats=layer_stats,
                 stats_collector=stats_collector,
             )

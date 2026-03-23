@@ -6,7 +6,7 @@ import torch
 
 
 class MoEStatsCollector:
-    """Collect runtime MoE routing stats for eval-time acceleration reports."""
+    """Collect runtime MoE routing stats for eval-time reports (pruning acceleration / skipping)."""
 
     def __init__(self, num_experts: int):
         self.num_experts = int(num_experts)
@@ -67,7 +67,9 @@ class MoEStatsCollector:
                 "total_selected_before": global_before,
                 "total_selected_after": global_after,
                 "activation_reduction_ratio": global_reduction,
-                "effective_selected_per_token_ratio": 0.0 if global_before == 0 else (global_after / global_before),
+                "effective_selected_per_token_ratio": 0.0
+                if global_before == 0
+                else (global_after / global_before),
             },
             "layers": layers,
         }
@@ -79,4 +81,3 @@ def build_router_prob_hist(router_probs: torch.Tensor, bins: int = 16) -> tuple[
     hist = torch.histc(probs, bins=bins, min=0.0, max=1.0)
     cdf = torch.cumsum(hist / hist.sum().clamp_min(1.0), dim=0)
     return hist, cdf
-

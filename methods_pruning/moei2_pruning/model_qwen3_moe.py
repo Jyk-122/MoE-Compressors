@@ -25,6 +25,7 @@ from tqdm import tqdm
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
 
 from MoECompressor import MoECompressor
+from utils.adapter_calib_config import saved_prune_ratio_from_adapter_dir
 
 logger = logging.getLogger("MoECompressor")
 
@@ -119,7 +120,6 @@ class MoEI2PruningQwen3Moe(MoECompressor):
         self,
         model_name_or_path: str,
         adapter_dir: str | Path | None = None,
-        prune_ratio: float = 0.5,
         device: str = "cuda",
         torch_dtype: torch.dtype | None = None,
         trust_remote_code: bool = True,
@@ -133,8 +133,6 @@ class MoEI2PruningQwen3Moe(MoECompressor):
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
-        self.prune_ratio = prune_ratio
-
     def _moe_output_with_pruned_experts(
         self,
         block: Qwen3MoeSparseMoeBlock,
@@ -256,13 +254,14 @@ class MoEI2PruningQwen3Moe(MoECompressor):
         num_experts: int,
         top_k: int,
         num_layers: int,
+        prune_ratio: float,
     ) -> dict[int, int]:
         """
         给定全局剪枝率，将待剪专家数分配到各层（重要层少剪）。
         """
         max_prune_per_layer = max(0, num_experts - top_k)
         total_capacity = max_prune_per_layer * num_layers
-        target_total_prune = int(round(self.prune_ratio * num_experts * num_layers))
+        target_total_prune = int(round(prune_ratio * num_experts * num_layers))
         target_total_prune = min(max(target_total_prune, 0), total_capacity)
 
         if target_total_prune == 0:
@@ -466,27 +465,14 @@ class MoEI2PruningQwen3Moe(MoECompressor):
         - kt_t=3
         - search_max_batches=2048
 
-        可直接通过 run.sh 调用（单卡 calib）：
-        METHOD=moei2_pruning \
-        PRUNE_RATIO=0.25 \
-        MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 \
-        CALIBRATION_DATASET=c4:en \
-        MAX_CALIB_SAMPLES=2048 \
-        MAX_CONTEXT_LEN=2048 \
-        CALIB_EXTRA='{"ga_population":100,"ga_iters":50,"kt_k":3,"kt_t":3,"search_max_batches":2048,"seed":42}' \
-        bash run.sh calib
-
-        小规模快速验证（调试）：
-        METHOD=moei2_pruning \
-        PRUNE_RATIO=0.25 \
-        CALIBRATION_DATASET=wikitext:wikitext-2-raw-v1 \
-        MAX_CALIB_SAMPLES=128 \
-        CALIB_EXTRA='{"ga_population":16,"ga_iters":8,"kt_k":2,"kt_t":2,"search_max_batches":16,"seed":42}' \
-        bash run.sh calib
+        可直接通过 run_pruning.sh / run.py 调用（单卡 calib），例如：
+        CALIB_KWARGS='{"prune_ratio":0.25,"ga_population":100,"ga_iters":50,"kt_k":3,"kt_t":3,"search_max_batches":2048,"seed":42}' \\
+        bash run_pruning.sh calib
         """
         if self.adapter_dir is None:
             raise ValueError("calib 需提供 adapter_dir")
 
+        prune_ratio = float(kwargs.get("prune_ratio", 0.5))
         ga_population = int(kwargs.get("ga_population", 100))
         ga_iters = int(kwargs.get("ga_iters", 50))
         ga_parent_fraction = float(kwargs.get("ga_parent_fraction", 0.2))
@@ -567,6 +553,7 @@ class MoEI2PruningQwen3Moe(MoECompressor):
             num_experts=num_experts,
             top_k=top_k,
             num_layers=len(moe_layers),
+            prune_ratio=prune_ratio,
         )
 
         logger.info("[moei2][calib] Non-uniform prune counts: %s", prune_counts)
@@ -625,19 +612,17 @@ class MoEI2PruningQwen3Moe(MoECompressor):
 
     def patch(self, model, **kwargs) -> Any:
         """读取 adapter 后替换每层 MoE block。"""
-        accelerate_config = kwargs.get("accelerate_config", {}) or {}
-        if self.adapter_dir is None and accelerate_config:
-            logger.warning(
-                "[moei2][patch] 当前方法不支持激活计算加速，且未提供 adapter，保持原模型不变并忽略 accelerate_config=%s",
-                accelerate_config,
-            )
-            return model
         if self.adapter_dir is None:
             raise ValueError("patch 需提供 adapter_dir")
-        if accelerate_config:
-            logger.warning(
-                "[moei2][patch] 当前方法不支持激活计算加速，已忽略 accelerate_config=%s",
-                accelerate_config,
+        prune_ratio = kwargs.get("prune_ratio")
+        if prune_ratio is None:
+            raise ValueError("[moei2][patch] 需要在 patch_kwargs 中提供 prune_ratio")
+        prune_ratio = float(prune_ratio)
+        saved_pr = saved_prune_ratio_from_adapter_dir(self.adapter_dir)
+        if saved_pr is not None and abs(prune_ratio - float(saved_pr)) > 1e-5:
+            raise ValueError(
+                f"[moei2_pruning] eval 的 prune_ratio={prune_ratio} 与 adapter 目录 config.json 中的 "
+                f"{saved_pr} 不一致；MoE-I² adapter 与校准搜索绑定，请重新 calib 或勿在 patch_kwargs 中改 prune_ratio。"
             )
         if not self.adapter_path.exists():
             raise FileNotFoundError(f"未找到 adapter: {self.adapter_path}，请先运行 calib()")
