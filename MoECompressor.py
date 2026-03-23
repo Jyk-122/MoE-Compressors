@@ -194,7 +194,7 @@ class MoECompressor(ABC):
         
         collector = getattr(self, "_acceleration_stats_collector", None)
         if collector is not None and isinstance(results, dict):
-            summary = collector.summary()
+            summary = collector.distributed_summary()
             results["runtime_routing"] = {
                 **summary,
                 "patch_kwargs": patch_kwargs or {},

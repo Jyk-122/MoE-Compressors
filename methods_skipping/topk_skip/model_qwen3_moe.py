@@ -89,6 +89,7 @@ class TopKSkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
                 layer_idx=self.layer_idx,
                 selected_indices=padded.detach(),
                 default_top_k=self.top_k,
+                sequence_length=sequence_length,
             )
 
         final_hidden_states = torch.zeros_like(hidden_states_reshaped)
@@ -154,6 +155,7 @@ class TopKSkipQwen3Moe(MoECompressor):
             for i, layer in enumerate(layers)
             if hasattr(layer, "mlp") and isinstance(layer.mlp, Qwen3MoeSparseMoeBlock)
         ]
+        stats_collector.initialize_layers(moe_indices)
         logger.info("[topk_skip][patch] Replacing %d MoE layers with k=%d", len(moe_indices), k)
 
         for decoder_layer_idx in tqdm(moe_indices, desc="Patching layers (topk_skip)", unit="layer"):

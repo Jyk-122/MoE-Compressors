@@ -124,6 +124,7 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
                 layer_idx=self.layer_idx,
                 selected_indices=router_indices.detach(),
                 default_top_k=self.top_k,
+                sequence_length=sequence_length,
             )
 
         # 3. 用切片后的专家权重做 forward（与原 Qwen3MoeExperts 逻辑一致）
@@ -328,6 +329,7 @@ class FrequencyPruningQwen3Moe(MoECompressor):
             i for i, layer in enumerate(layers)
             if hasattr(layer, "mlp") and isinstance(layer.mlp, Qwen3MoeSparseMoeBlock)
         ]
+        stats_collector.initialize_layers(moe_indices)
         logger.info("[patch] Replacing %d MoE layers", len(moe_indices))
 
         saved_pr = saved_prune_ratio_from_adapter_dir(self.adapter_dir)

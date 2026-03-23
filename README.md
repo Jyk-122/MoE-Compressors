@@ -29,7 +29,7 @@ MoE-Compressors/
 
 | 入口 | 说明 |
 |------|------|
-| **`python run.py <method> calib\|eval ...`** | 单一 CLI：`method` 为 `*_pruning` 或 skipping（`topk_skip` / `topp_skip`） |
+| **`python run.py <method> calib\|eval ...`** | 单一 CLI：`method` 为 `*_pruning` 或 skipping（`topk_skip` / `topp_skip` / `sere_skip`） |
 | **`run_pruning.sh` / `run_skipping.sh`** | 拼好 `--calib_kwargs` / `--patch_kwargs` 后调用 `run.py` |
 
 **方法参数 JSON**
@@ -131,10 +131,13 @@ METHOD=camera_pruning CALIB_KWARGS='{"prune_ratio":0.5,"alpha":0.95}' bash run_p
 | `EVAL_OUTPUT_PATH` / `EVAL_OUTPUT_CONTENT` | 空 / `metrics` | 结果输出路径与内容 |
 
 评测结果中的运行时统计在 **`results["runtime_routing"]`**（含 `patch_kwargs` 与 collector 摘要）。
+其中 `runtime_routing["by_stage"]` 仅按两类拆分：
+- `prefill`：`sequence_length > 1` 的前填充阶段
+- `decode`：`sequence_length == 1` 的逐 token 解码阶段
 
 ### Skipping（`run.py` + `run_skipping.sh`）
 
-与剪枝相同，框架层都是 **`calib` + `eval`**；skipping 一般**不改 checkpoint 形状**。`topk_skip` / `topp_skip` 的 `calib()` 为空，但仍可走 **`run.py … calib`** 写 `config.json`。
+与剪枝相同，框架层都是 **`calib` + `eval`**；skipping 一般**不改 checkpoint 形状**。`topk_skip` / `topp_skip` 的 `calib()` 为空，但仍可走 **`run.py … calib`** 写 `config.json`。`sere_skip` 的 `calib()` 会计算并保存每层专家相似度矩阵到 adapter。
 
 #### 1. 校准（单卡）
 
@@ -158,6 +161,18 @@ accelerate launch run.py topp_skip eval \
   --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
   --patch_kwargs '{"threshold":0.8}' \
   --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
+
+# SERE skipping：secondary expert 按相似度重路由到 primary expert
+python run.py sere_skip calib \
+  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --adapter_dir ./outputs/Qwen3-30B-A3B-Instruct-2507/sere_skip \
+  --calib_kwargs '{"similarity_method":"frobenius","similarity_max_len":128,"similarity_max_tokens":64}'
+
+accelerate launch run.py sere_skip eval \
+  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --adapter_dir ./outputs/Qwen3-30B-A3B-Instruct-2507/sere_skip \
+  --patch_kwargs '{"select_top_k":2,"threshold":0.3}' \
+  --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
 ```
 
 #### 3. 输出目录
@@ -169,6 +184,9 @@ accelerate launch run.py topp_skip eval \
 **路由/跳过相关参数只来自 JSON**：
 - `topk_skip`：`patch_kwargs={"k":...}`，要求 `1 <= k <= num_experts_per_tok`。
 - `topp_skip`：`patch_kwargs={"threshold":...}`，要求 `0 < threshold <= 1`，并在默认 `top_k` 路由结果中按累计概率动态保留最少专家。
+- `sere_skip`：
+  - `calib_kwargs={"similarity_method":"frobenius|cosine|cka","kernel":"linear|rbf|polynomial","similarity_batch_size":...,"similarity_max_len":...,"similarity_max_tokens":...}`
+  - `patch_kwargs={"select_top_k":...,"threshold":...}`，要求 `1 <= select_top_k <= num_experts_per_tok` 且 `0 <= threshold <= 1`。
 
 #### 5. run_skipping.sh
 
@@ -185,6 +203,10 @@ METHOD=topk_skip MODEL=Qwen/Qwen3-8B PATCH_KWARGS='{"k":1}' bash run_skipping.sh
 # top-p
 METHOD=topp_skip PATCH_KWARGS='{"threshold":0.8}' bash run_skipping.sh eval
 
+# SERE
+METHOD=sere_skip CALIB_KWARGS='{"similarity_method":"frobenius","similarity_max_len":128,"similarity_max_tokens":64}' bash run_skipping.sh calib
+METHOD=sere_skip PATCH_KWARGS='{"select_top_k":2,"threshold":0.3}' bash run_skipping.sh eval
+
 # eval 时显式指定 adapter 目录
 METHOD=topk_skip EVAL_ADAPTER_DIR=... bash run_skipping.sh eval
 ```
@@ -193,10 +215,10 @@ METHOD=topk_skip EVAL_ADAPTER_DIR=... bash run_skipping.sh eval
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `METHOD` | 无（必填） | skipping 方法名（`topk_skip` / `topp_skip`） |
+| `METHOD` | 无（必填） | skipping 方法名（`topk_skip` / `topp_skip` / `sere_skip`） |
 | `MODEL` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 模型路径/名称 |
 | `CALIB_KWARGS` | `{}` | 校准 JSON（按方法定义） |
-| `PATCH_KWARGS` | 按 `METHOD` 自动给默认值 | 评测 JSON（topk: `{"k":2}`；topp: `{"threshold":0.8}`） |
+| `PATCH_KWARGS` | 按 `METHOD` 自动给默认值 | 评测 JSON（topk: `{"k":2}`；topp: `{"threshold":0.8}`；sere: `{"select_top_k":2,"threshold":0.3}`） |
 | `ADAPTER_DIR` | `./outputs/{model}/{method}` | calib 输出目录 |
 | `EVAL_ADAPTER_DIR` | 空 | eval 时可覆盖 adapter 目录 |
 | `TASKS` / `EVAL_LIMIT` | 脚本内默认 | 评测任务与样本上限 |
@@ -226,6 +248,7 @@ METHOD=topk_skip EVAL_ADAPTER_DIR=... bash run_skipping.sh eval
 |:----:|------|------|
 | ✓ | **topk_skip** | 仅 router logits 的大小判断裁剪专家。 |
 | ✓ | **topp_skip** | 在默认 top-k 路由中按累计概率阈值动态保留最少专家。 |
+| ✓ | **sere_skip** | [SERE: Similarity-based Expert Re-routing for Efficient Batch Decoding in MoE Models](https://arxiv.org/abs/2602.07616) |
 | ☐ | **TODO** |   |
 
 ## Design Notes

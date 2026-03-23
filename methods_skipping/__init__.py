@@ -1,1 +1,1 @@
-"""Skipping-based MoE inference methods (no structural pruning)."""
+"""Skipping-based MoE inference methods (topk/topp/sere, no structural pruning)."""
