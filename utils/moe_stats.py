@@ -66,7 +66,7 @@ class MoEStatsCollector:
         # 存为 bool，后续按当前 sequence_length 取尾段并展平过滤 padding token。
         self._active_attention_mask = attention_mask.detach().to(dtype=torch.bool)
 
-    def _apply_attention_mask(
+    def _apply_active_mask(
         self,
         selected_indices: torch.LongTensor,
         sequence_length: int | None,
@@ -94,7 +94,11 @@ class MoEStatsCollector:
         default_top_k: int,
         sequence_length: int | None = None,
     ) -> None:
-        selected_indices = self._apply_attention_mask(selected_indices, sequence_length)
+        # 根据 _active_attention_mask 来判断是否进行统计
+        if self._active_attention_mask is None:
+            return
+
+        selected_indices = self._apply_active_mask(selected_indices, sequence_length)
         self._update_bucket(
             self._layers,
             layer_idx=layer_idx,

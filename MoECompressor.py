@@ -184,7 +184,14 @@ class MoECompressor(ABC):
                 raw_forward = lm._model.forward
 
                 def _forward_with_stats(*args, **kwargs):
-                    attention_mask = kwargs.get("attention_mask")
+                    # 获取 input_ids，处理 loglikelihood 和 generate 两种情况
+                    input_ids = args[0] if args else kwargs["input_ids"]
+                    # 如果 input_ids 全为 1，则在进行auto batch，不能进行统计
+                    if (input_ids == 1).all():
+                        collector.set_active_attention_mask(None)
+                        return raw_forward(*args, **kwargs)
+                    # 根据 input_ids 生成 attention_mask，0为padding
+                    attention_mask = torch.where(input_ids > 0, 1, 0)
                     collector.set_active_attention_mask(attention_mask)
                     try:
                         return raw_forward(*args, **kwargs)
@@ -206,8 +213,13 @@ class MoECompressor(ABC):
         )
         
         collector = getattr(self, "_acceleration_stats_collector", None)
+        
+        torch.distributed.barrier()
+        
+        # 确保每个进程都进行all_reduce，如果只有主进程发起会卡死
         if collector is not None:
             summary = collector.distributed_summary()
+        
         if isinstance(results, dict):
             results["runtime_routing"] = {
                 **summary,
