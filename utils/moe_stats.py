@@ -7,11 +7,14 @@ import torch
 
 class MoEStatsCollector:
     """Collect runtime MoE routing stats for eval-time reports (pruning acceleration / skipping)."""
+    STAGE_KEYS = ("prefill", "decode")
 
     def __init__(self, num_experts: int):
         self.num_experts = int(num_experts)
         self._layers: dict[int, dict[str, Any]] = {}
-        self._stage_layers: dict[str, dict[int, dict[str, Any]]] = {}
+        self._stage_layers: dict[str, dict[int, dict[str, Any]]] = {
+            key: {} for key in self.STAGE_KEYS
+        }
 
     def initialize_layers(self, layer_indices: list[int]) -> None:
         for layer_idx in layer_indices:
@@ -70,7 +73,7 @@ class MoEStatsCollector:
         )
         stage = self._resolve_stage(sequence_length)
         if stage is not None:
-            stage_bucket = self._stage_layers.setdefault(stage, {})
+            stage_bucket = self._stage_layers[stage]
             self._update_bucket(
                 stage_bucket,
                 layer_idx=layer_idx,
@@ -184,8 +187,8 @@ class MoEStatsCollector:
 
         overall = self._store_to_tensors(self._layers, layer_indices, device)
         stage_tensors = {
-            stage: self._store_to_tensors(store, layer_indices, device)
-            for stage, store in self._stage_layers.items()
+            stage: self._store_to_tensors(self._stage_layers[stage], layer_indices, device)
+            for stage in self.STAGE_KEYS
         }
 
         dist = None
@@ -195,7 +198,8 @@ class MoEStatsCollector:
         if dist is not None:
             for t in overall:
                 dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            for tensors in stage_tensors.values():
+            for stage in self.STAGE_KEYS:
+                tensors = stage_tensors[stage]
                 for t in tensors:
                     dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
@@ -209,12 +213,12 @@ class MoEStatsCollector:
         by_stage = {
             stage: self._summary_from_tensors(
                 layer_indices=layer_indices,
-                tokens=tensors[0],
-                before=tensors[1],
-                after=tensors[2],
-                activation=tensors[3],
+                tokens=stage_tensors[stage][0],
+                before=stage_tensors[stage][1],
+                after=stage_tensors[stage][2],
+                activation=stage_tensors[stage][3],
             )
-            for stage, tensors in stage_tensors.items()
+            for stage in self.STAGE_KEYS
         }
         return {
             **summary,
@@ -224,8 +228,8 @@ class MoEStatsCollector:
     def summary(self) -> dict[str, Any]:
         overall = self._summary_from_layers(self._layers)
         by_stage = {
-            stage: self._summary_from_layers(layers_store)
-            for stage, layers_store in self._stage_layers.items()
+            stage: self._summary_from_layers(self._stage_layers[stage])
+            for stage in self.STAGE_KEYS
         }
         return {
             **overall,
