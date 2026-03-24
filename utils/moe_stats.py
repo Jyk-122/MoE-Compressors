@@ -15,6 +15,7 @@ class MoEStatsCollector:
         self._stage_layers: dict[str, dict[int, dict[str, Any]]] = {
             key: {} for key in self.STAGE_KEYS
         }
+        self._active_attention_mask: torch.Tensor | None = None
 
     def initialize_layers(self, layer_indices: list[int]) -> None:
         for layer_idx in layer_indices:
@@ -58,6 +59,34 @@ class MoEStatsCollector:
         # 生成时 sequence_length==1 通常表示增量 decode；>1 视作 prefill。
         return "decode" if int(sequence_length) == 1 else "prefill"
 
+    def set_active_attention_mask(self, attention_mask: torch.Tensor | None) -> None:
+        if attention_mask is None:
+            self._active_attention_mask = None
+            return
+        # 存为 bool，后续按当前 sequence_length 取尾段并展平过滤 padding token。
+        self._active_attention_mask = attention_mask.detach().to(dtype=torch.bool)
+
+    def _apply_attention_mask(
+        self,
+        selected_indices: torch.LongTensor,
+        sequence_length: int | None,
+    ) -> torch.LongTensor:
+        mask = self._active_attention_mask
+        if mask is None or sequence_length is None:
+            return selected_indices
+        if mask.dim() != 2:
+            return selected_indices
+
+        seq_len = int(sequence_length)
+        if seq_len <= 0 or mask.shape[1] < seq_len:
+            return selected_indices
+
+        # 对齐当前 forward 的最后 seq_len 个位置（兼容 generate decode 时 attention_mask 长于 input）。
+        token_mask = mask[:, -seq_len:].reshape(-1)
+        if token_mask.numel() != selected_indices.shape[0]:
+            return selected_indices
+        return selected_indices[token_mask]
+
     def update(
         self,
         layer_idx: int,
@@ -65,6 +94,7 @@ class MoEStatsCollector:
         default_top_k: int,
         sequence_length: int | None = None,
     ) -> None:
+        selected_indices = self._apply_attention_mask(selected_indices, sequence_length)
         self._update_bucket(
             self._layers,
             layer_idx=layer_idx,
@@ -220,10 +250,7 @@ class MoEStatsCollector:
             )
             for stage in self.STAGE_KEYS
         }
-        return {
-            **summary,
-            "by_stage": by_stage,
-        }
+        return self._reformat_axes(summary, by_stage)
 
     def summary(self) -> dict[str, Any]:
         overall = self._summary_from_layers(self._layers)
@@ -231,9 +258,25 @@ class MoEStatsCollector:
             stage: self._summary_from_layers(self._stage_layers[stage])
             for stage in self.STAGE_KEYS
         }
+        return self._reformat_axes(overall, by_stage)
+
+    def _reformat_axes(
+        self,
+        overall: dict[str, Any],
+        by_stage: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
         return {
-            **overall,
-            "by_stage": by_stage,
+            "enabled": bool(overall.get("enabled", False)),
+            "global": {
+                "all": overall.get("global", {}),
+                "prefill": by_stage["prefill"].get("global", {}),
+                "decode": by_stage["decode"].get("global", {}),
+            },
+            "layers": {
+                "all": overall.get("layers", {}),
+                "prefill": by_stage["prefill"].get("layers", {}),
+                "decode": by_stage["decode"].get("layers", {}),
+            },
         }
 
 

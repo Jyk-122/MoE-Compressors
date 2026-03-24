@@ -131,9 +131,10 @@ METHOD=camera_pruning CALIB_KWARGS='{"prune_ratio":0.5,"alpha":0.95}' bash run_p
 | `EVAL_OUTPUT_PATH` / `EVAL_OUTPUT_CONTENT` | 空 / `metrics` | 结果输出路径与内容 |
 
 评测结果中的运行时统计在 **`results["runtime_routing"]`**（含 `patch_kwargs` 与 collector 摘要）。
-其中 `runtime_routing["by_stage"]` 仅按两类拆分：
-- `prefill`：`sequence_length > 1` 的前填充阶段
-- `decode`：`sequence_length == 1` 的逐 token 解码阶段
+其中统计结构按轴重排为：
+- `runtime_routing["global"]["all|prefill|decode"]`
+- `runtime_routing["layers"]["all|prefill|decode"]`
+并且仅统计 `attention_mask=1` 的真实 token（过滤 padding 位置）。
 
 ### Skipping（`run.py` + `run_skipping.sh`）
 

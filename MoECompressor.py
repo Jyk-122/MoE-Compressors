@@ -179,6 +179,19 @@ class MoECompressor(ABC):
         if should_patch:
             logger.info("[eval] Applying patch to lm._model")
             self.patch(lm._model, **(patch_kwargs or {}))
+            collector = getattr(self, "_acceleration_stats_collector", None)
+            if collector is not None and hasattr(lm._model, "forward"):
+                raw_forward = lm._model.forward
+
+                def _forward_with_stats(*args, **kwargs):
+                    attention_mask = kwargs.get("attention_mask")
+                    collector.set_active_attention_mask(attention_mask)
+                    try:
+                        return raw_forward(*args, **kwargs)
+                    finally:
+                        collector.set_active_attention_mask(None)
+
+                lm._model.forward = _forward_with_stats
 
         tasks = tasks or ["wikitext"]
         results = simple_evaluate(
@@ -193,8 +206,9 @@ class MoECompressor(ABC):
         )
         
         collector = getattr(self, "_acceleration_stats_collector", None)
-        if collector is not None and isinstance(results, dict):
+        if collector is not None:
             summary = collector.distributed_summary()
+        if isinstance(results, dict):
             results["runtime_routing"] = {
                 **summary,
                 "patch_kwargs": patch_kwargs or {},
