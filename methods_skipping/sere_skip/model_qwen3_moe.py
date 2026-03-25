@@ -2,7 +2,7 @@
 SERE skipping for Qwen3-MoE.
 
 核心思路：
-1) calib: 在校准数据上计算每层 expert similarity matrix，并保存到 adapter.safetensors
+1) calib: 用校准专用 MoE forward（全专家算一次 → 更新 sim → 仅用 top-k 输出聚合），保存 adapter.safetensors
 2) patch: 推理时保留每个 token 的前 select_top_k(primary) 专家；
           对其余 secondary 专家按 similarity 重路由；若 best_sim < threshold 则保留原专家
 """
@@ -133,28 +133,73 @@ def _compute_similarity_matrix(
     return sim
 
 
-def _compute_layer_similarity_from_hidden_states(
-    block: Qwen3MoeSparseMoeBlock,
-    hidden_states: torch.Tensor,
-    method: str = "frobenius",
-    kernel: str = "linear",
-) -> torch.Tensor | None:
+class SERECalibSparseMoeBlock(torch.nn.Module):
     """
-    校准为单条序列、无 padding 时，MoE 输入 [1,S,H] 上所有位置参与统计。
-    单样本上先算 Sim，再对多条校准样本求平均（论文式 (1)）。
+    校准专用 MoE：单次 forward 内先对全部 expert 算一遍输出并更新相似度累加，
+    再用同一批 expert 输出按 top-k 加权聚合，避免 hook 里二次跑全专家导致算力翻倍。
     """
-    b, s, h = hidden_states.shape
-    x = hidden_states.reshape(b * s, h)
 
-    experts = block.experts
-    expert_outputs: list[torch.Tensor] = []
-    for expert_idx in range(block.gate.out_features):
-        gate, up = F.linear(x, experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-        out = experts.act_fn(gate) * up
-        out = F.linear(out, experts.down_proj[expert_idx])
-        expert_outputs.append(out.float())
+    def __init__(
+        self,
+        original_block: Qwen3MoeSparseMoeBlock,
+        layer_idx: int,
+        sum_sim_store: dict[int, torch.Tensor | None],
+        similarity_method: str,
+        kernel: str,
+    ):
+        super().__init__()
+        self.layer_idx = int(layer_idx)
+        self.sum_sim_store = sum_sim_store
+        self.similarity_method = str(similarity_method).lower()
+        self.kernel = str(kernel).lower()
 
-    return _compute_similarity_matrix(expert_outputs, method=method, kernel=kernel)
+        self.gate = copy.deepcopy(original_block.gate)
+        self.top_k = self.gate.top_k
+        self.num_experts = self.gate.num_experts
+        experts = original_block.experts
+        self.gate_up_proj = torch.nn.Parameter(experts.gate_up_proj.clone())
+        self.down_proj = torch.nn.Parameter(experts.down_proj.clone())
+        self.act_fn = copy.deepcopy(experts.act_fn)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        x = hidden_states.view(-1, hidden_dim)
+
+        router_logits = F.linear(x, self.gate.weight)
+        router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32).to(router_logits.dtype)
+        router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        if self.gate.norm_topk_prob:
+            router_top_value = (
+                router_top_value / router_top_value.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            ).to(router_probs.dtype)
+        routing_weights = router_top_value
+
+        expert_outputs: list[torch.Tensor] = []
+        for expert_idx in range(self.num_experts):
+            gate_h, up_h = F.linear(x, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            out = self.act_fn(gate_h) * up_h
+            out = F.linear(out, self.down_proj[expert_idx])
+            expert_outputs.append(out.float())
+
+        sim_batch = _compute_similarity_matrix(
+            expert_outputs, method=self.similarity_method, kernel=self.kernel
+        )
+        acc = self.sum_sim_store.get(self.layer_idx)
+        cpu_sim = sim_batch.detach().cpu()
+        if acc is None:
+            self.sum_sim_store[self.layer_idx] = cpu_sim.clone()
+        else:
+            acc += cpu_sim
+
+        final_hidden_states = torch.zeros_like(x)
+        for expert_idx in range(self.num_experts):
+            token_idx, top_k_pos = torch.where(router_indices == expert_idx)
+            if token_idx.numel() == 0:
+                continue
+            cur = expert_outputs[expert_idx][token_idx] * routing_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, cur.to(final_hidden_states.dtype))
+
+        return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
 
 class SERESkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
@@ -329,58 +374,39 @@ class SERESkipQwen3Moe(MoECompressor):
         n_samples_used = 0
 
         logger.info(
-            "[sere_skip][calib] Step 2/4: 逐条 forward %d 个样本，max_context_len=%d，"
-            "similarity_method=%s, kernel=%s（每层每样本算 Sim 后求平均）",
+            "[sere_skip][calib] Step 2/4: 替换为校准 MoE（单次 forward 内全专家算 sim + top-k 聚合），"
+            "逐条 forward %d 个样本，max_context_len=%d，similarity_method=%s, kernel=%s",
             len(texts),
             max_context_len,
             similarity_method,
             kernel,
         )
 
-        def _make_hook(layer_idx: int):
-            def _hook(module: Qwen3MoeSparseMoeBlock, module_inputs):
-                hidden_states = module_inputs[0]
-                sim = _compute_layer_similarity_from_hidden_states(
-                    module,
-                    hidden_states,
-                    method=similarity_method,
-                    kernel=kernel,
-                )
-                if sim is None:
-                    return
-                acc = sum_sim[layer_idx]
-                cpu_sim = sim.detach().cpu()
-                if acc is None:
-                    sum_sim[layer_idx] = cpu_sim.clone()
-                else:
-                    acc += cpu_sim
-
-            return _hook
-
-        hooks = [
-            block.register_forward_pre_hook(_make_hook(layer_idx))
-            for layer_idx, block in moe_layers
-        ]
+        layers = model.model.layers
+        for layer_idx, block in moe_layers:
+            layers[layer_idx].mlp = SERECalibSparseMoeBlock(
+                original_block=block,
+                layer_idx=layer_idx,
+                sum_sim_store=sum_sim,
+                similarity_method=similarity_method,
+                kernel=kernel,
+            )
 
         model.eval()
-        try:
-            with torch.no_grad():
-                for text in tqdm(texts, desc="SERE calib forward", unit="sample"):
-                    inputs = tokenizer(
-                        text,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=max_context_len,
-                        padding=False,
-                    )
-                    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-                    if inputs["input_ids"].numel() == 0:
-                        continue
-                    _ = model(**inputs)
-                    n_samples_used += 1
-        finally:
-            for h in hooks:
-                h.remove()
+        with torch.no_grad():
+            for text in tqdm(texts, desc="SERE calib forward", unit="sample"):
+                inputs = tokenizer(
+                    text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=max_context_len,
+                    padding=False,
+                )
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+                if inputs["input_ids"].numel() == 0:
+                    continue
+                _ = model(**inputs)
+                n_samples_used += 1
 
         if n_samples_used == 0:
             raise RuntimeError(
