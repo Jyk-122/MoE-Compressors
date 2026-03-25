@@ -186,7 +186,7 @@ accelerate launch run.py sere_skip eval \
 - `topk_skip`：`patch_kwargs={"k":...}`，要求 `1 <= k <= num_experts_per_tok`。
 - `topp_skip`：`patch_kwargs={"threshold":...}`，要求 `0 < threshold <= 1`，并在默认 `top_k` 路由结果中按累计概率动态保留最少专家。
 - `sere_skip`：
-  - 校准：固定 **每条校准文本单独一次 forward**（`padding=False`，忽略 CLI 的 `--batch_size`，非 1 会 warning）；临时将 MoE 换为 **单次 forward 内先跑全专家写 sim、再按 top-k 用已算输出聚合**（避免 hook 双算）；`--max_context_len` 控制截断；每层在每个样本上算相似度矩阵后对样本数 **求平均**。
+  - 校准：固定 **每条校准文本单独一次 forward**（`padding=False`，忽略 CLI 的 `--batch_size`，非 1 会 warning）；临时用 `MethodType` **替换各层 `mlp.forward`**，在单次 forward 内先跑全专家写 sim、再按 top-k 用已算输出聚合（避免 hook 双算）；`--max_context_len` 控制截断；每层在每个样本上算相似度矩阵后对样本数 **求平均**。
   - `calib_kwargs={"similarity_method":"frobenius|cosine|cka","kernel":"linear|rbf|polynomial"}`（`kernel` 仅 `cka` 使用）
   - `patch_kwargs={"select_top_k":...,"threshold":...}`，要求 `1 <= select_top_k <= num_experts_per_tok` 且 `0 <= threshold <= 1`。
 
