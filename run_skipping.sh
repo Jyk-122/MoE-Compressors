@@ -16,7 +16,7 @@
 # 示例:
 #   METHOD=topk_skip PATCH_KWARGS='{"k":1}' bash run_skipping.sh eval
 #   METHOD=topp_skip PATCH_KWARGS='{"threshold":0.8}' bash run_skipping.sh eval
-#   METHOD=sere_skip CALIB_KWARGS='{"similarity_method":"frobenius","similarity_max_len":128,"similarity_max_tokens":64}' bash run_skipping.sh calib
+#   METHOD=sere_skip CALIB_KWARGS='{"similarity_method":"frobenius"}' bash run_skipping.sh calib
 #   METHOD=sere_skip PATCH_KWARGS='{"select_top_k":2,"threshold":0.3}' bash run_skipping.sh eval
 
 export HF_ALLOW_CODE_EVAL=1

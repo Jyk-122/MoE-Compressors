@@ -167,7 +167,7 @@ accelerate launch run.py topp_skip eval \
 python run.py sere_skip calib \
   --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
   --adapter_dir ./outputs/Qwen3-30B-A3B-Instruct-2507/sere_skip \
-  --calib_kwargs '{"similarity_method":"frobenius","similarity_max_len":128,"similarity_max_tokens":64}'
+  --calib_kwargs '{"similarity_method":"frobenius"}'
 
 accelerate launch run.py sere_skip eval \
   --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
@@ -186,7 +186,8 @@ accelerate launch run.py sere_skip eval \
 - `topk_skip`：`patch_kwargs={"k":...}`，要求 `1 <= k <= num_experts_per_tok`。
 - `topp_skip`：`patch_kwargs={"threshold":...}`，要求 `0 < threshold <= 1`，并在默认 `top_k` 路由结果中按累计概率动态保留最少专家。
 - `sere_skip`：
-  - `calib_kwargs={"similarity_method":"frobenius|cosine|cka","kernel":"linear|rbf|polynomial","similarity_batch_size":...,"similarity_max_len":...,"similarity_max_tokens":...}`
+  - 校准：固定 **每条校准文本单独一次 forward**（`padding=False`，忽略 CLI 的 `--batch_size`，非 1 会 warning）；`--max_context_len` 控制截断；每层在每个样本上算相似度矩阵后对样本数 **求平均**。
+  - `calib_kwargs={"similarity_method":"frobenius|cosine|cka","kernel":"linear|rbf|polynomial"}`（`kernel` 仅 `cka` 使用）
   - `patch_kwargs={"select_top_k":...,"threshold":...}`，要求 `1 <= select_top_k <= num_experts_per_tok` 且 `0 <= threshold <= 1`。
 
 #### 5. run_skipping.sh
@@ -205,7 +206,7 @@ METHOD=topk_skip MODEL=Qwen/Qwen3-8B PATCH_KWARGS='{"k":1}' bash run_skipping.sh
 METHOD=topp_skip PATCH_KWARGS='{"threshold":0.8}' bash run_skipping.sh eval
 
 # SERE
-METHOD=sere_skip CALIB_KWARGS='{"similarity_method":"frobenius","similarity_max_len":128,"similarity_max_tokens":64}' bash run_skipping.sh calib
+METHOD=sere_skip CALIB_KWARGS='{"similarity_method":"frobenius"}' bash run_skipping.sh calib
 METHOD=sere_skip PATCH_KWARGS='{"select_top_k":2,"threshold":0.3}' bash run_skipping.sh eval
 
 # eval 时显式指定 adapter 目录
