@@ -14,6 +14,7 @@ run.py 仅做 JSON 解析与透传：
     --patch_kwargs '{"prune_ratio":0.3}'
   accelerate launch run.py topk_skip eval --model ... --patch_kwargs '{"k":2}'
   accelerate launch run.py topp_skip eval --model ... --patch_kwargs '{"threshold":0.8}'
+  accelerate launch run.py modes_skip eval --model ... --adapter_dir .../modes_skip --patch_kwargs '{"tau":0.05}'
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from methods_pruning.ean_pruning.model_qwen3_moe import EANPruningQwen3Moe
 from methods_pruning.frequency_pruning.model_qwen3_moe import FrequencyPruningQwen3Moe
 from methods_pruning.moei2_pruning.model_qwen3_moe import MoEI2PruningQwen3Moe
 from methods_pruning.reap_pruning.model_qwen3_moe import REAPPruningQwen3Moe
+from methods_skipping.modes_skip.model_qwen3_moe import MoDESSkipQwen3Moe
 from methods_skipping.sere_skip.model_qwen3_moe import SERESkipQwen3Moe
 from methods_skipping.topk_skip.model_qwen3_moe import TopKSkipQwen3Moe
 from methods_skipping.topp_skip.model_qwen3_moe import TopPSkipQwen3Moe
@@ -57,6 +59,7 @@ METHOD_REGISTRY: dict[str, dict[str, type]] = {
     "topk_skip": {"qwen3_moe": TopKSkipQwen3Moe},
     "topp_skip": {"qwen3_moe": TopPSkipQwen3Moe},
     "sere_skip": {"qwen3_moe": SERESkipQwen3Moe},
+    "modes_skip": {"qwen3_moe": MoDESSkipQwen3Moe},
 }
 
 
@@ -163,7 +166,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "method",
         choices=sorted(METHOD_REGISTRY.keys()),
-        help="方法名（剪枝 *_pruning 或 skipping: topk_skip/topp_skip/sere_skip）",
+        help="方法名（剪枝 *_pruning 或 skipping: topk_skip/topp_skip/sere_skip/modes_skip）",
     )
     parser.add_argument(
         "mode",

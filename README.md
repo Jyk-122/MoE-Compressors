@@ -29,7 +29,7 @@ MoE-Compressors/
 
 | 入口 | 说明 |
 |------|------|
-| **`python run.py <method> calib\|eval ...`** | 单一 CLI：`method` 为 `*_pruning` 或 skipping（`topk_skip` / `topp_skip` / `sere_skip`） |
+| **`python run.py <method> calib\|eval ...`** | 单一 CLI：`method` 为 `*_pruning` 或 skipping（`topk_skip` / `topp_skip` / `sere_skip` / `modes_skip`） |
 | **`run_pruning.sh` / `run_skipping.sh`** | 拼好 `--calib_kwargs` / `--patch_kwargs` 后调用 `run.py` |
 
 **方法参数 JSON**
@@ -138,7 +138,7 @@ METHOD=camera_pruning CALIB_KWARGS='{"prune_ratio":0.5,"alpha":0.95}' bash run_p
 
 ### Skipping（`run.py` + `run_skipping.sh`）
 
-与剪枝相同，框架层都是 **`calib` + `eval`**；skipping 一般**不改 checkpoint 形状**。`topk_skip` / `topp_skip` 的 `calib()` 为空，但仍可走 **`run.py … calib`** 写 `config.json`。`sere_skip` 的 `calib()` 会计算并保存每层专家相似度矩阵到 adapter。
+与剪枝相同，框架层都是 **`calib` + `eval`**；skipping 一般**不改 checkpoint 形状**。`topk_skip` / `topp_skip` 的 `calib()` 为空，但仍可走 **`run.py … calib`** 写 `config.json`。`sere_skip` 的 `calib()` 会计算并保存每层专家相似度矩阵到 adapter。`modes_skip`（MoDES 思路：层重要性 $\alpha$ 调制 router 后再用阈值 $\tau$）的 `calib()` 会逐层 zero-moe 估计 $\alpha$ 并写入 adapter。
 
 #### 1. 校准（单卡）
 
@@ -174,6 +174,18 @@ accelerate launch run.py sere_skip eval \
   --adapter_dir ./outputs/Qwen3-30B-A3B-Instruct-2507/sere_skip \
   --patch_kwargs '{"select_top_k":2,"threshold":0.3}' \
   --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
+
+# MoDES 风格（modes_skip）：先 calib 得 $\alpha$，eval 用 tau 控制跳过
+python run.py modes_skip calib \
+  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --adapter_dir ./outputs/Qwen3-30B-A3B-Instruct-2507/modes_skip \
+  --calib_kwargs '{"loss_type":"kl","temperature":1.0}'
+
+accelerate launch run.py modes_skip eval \
+  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --adapter_dir ./outputs/Qwen3-30B-A3B-Instruct-2507/modes_skip \
+  --patch_kwargs '{"tau":0.05}' \
+  --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
 ```
 
 #### 3. 输出目录
@@ -189,6 +201,9 @@ accelerate launch run.py sere_skip eval \
   - 校准：固定 **每条校准文本单独一次 forward**（`padding=False`，忽略 CLI 的 `--batch_size`，非 1 会 warning）；临时用 `MethodType` **替换各层 `mlp.forward`**，在单次 forward 内先跑全专家写 sim、再按 top-k 用已算输出聚合（避免 hook 双算）；`--max_context_len` 控制截断；每层在每个样本上算相似度矩阵后对样本数 **求平均**。
   - `calib_kwargs={"similarity_method":"frobenius|cosine|cka","kernel":"linear|rbf|polynomial"}`（`kernel` 仅 `cka` 使用）
   - `patch_kwargs={"select_top_k":...,"threshold":...}`，要求 `1 <= select_top_k <= num_experts_per_tok` 且 `0 <= threshold <= 1`。
+- `modes_skip`：
+  - 校准：每条样本一次 baseline forward，再对每个 MoE 层单独将 `mlp.forward` 换为零输出并 forward，在全序列非 padding 位置上累计 **KL 或 MSE**；各层 raw loss 归一化为 **$\alpha$（MoE 层间和为 1）**；`calib_kwargs={"loss_type":"kl|mse","temperature":1.0}`。
+  - `patch_kwargs={"tau":...}`（必填）；**需同时提供** `--adapter_dir` 以加载 $\alpha$。$\tau$ 与有效跳过率需自行尝试。
 
 #### 5. run_skipping.sh
 
@@ -251,6 +266,7 @@ METHOD=topk_skip EVAL_ADAPTER_DIR=... bash run_skipping.sh eval
 | ✓ | **topk_skip** | 仅 router logits 的大小判断裁剪专家。 |
 | ✓ | **topp_skip** | 在默认 top-k 路由中按累计概率阈值动态保留最少专家。 |
 | ✓ | **sere_skip** | [SERE: Similarity-based Expert Re-routing for Efficient Batch Decoding in MoE Models](https://arxiv.org/abs/2602.07616) |
+| ✓ | **modes_skip** | [MoDES: Accelerating Mixture-of-Experts Multimodal Large Language Models via Dynamic Expert Skipping](https://arxiv.org/abs/2511.15690) |
 | ☐ | **TODO** |   |
 
 ## Design Notes

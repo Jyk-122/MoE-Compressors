@@ -6,10 +6,10 @@
 #   bash run_skipping.sh eval    # 多卡评测（accelerate）
 #
 # 关键环境变量:
-#   METHOD           skipping 方法名（topk_skip | topp_skip | sere_skip，必填）
+#   METHOD           skipping 方法名（topk_skip | topp_skip | sere_skip | modes_skip，必填）
 #   MODEL            模型路径或 HF 名称
 #   CALIB_KWARGS     calib 参数 JSON，默认 {}
-#   PATCH_KWARGS     eval 参数 JSON（topk_skip 默认 {"k":2}；topp_skip 默认 {"threshold":0.8}；sere_skip 默认 {"select_top_k":2,"threshold":0.3}）
+#   PATCH_KWARGS     eval 参数 JSON（topk_skip 默认 {"k":2}；topp_skip 默认 {"threshold":0.8}；sere_skip 默认 {"select_top_k":2,"threshold":0.3}；modes_skip 默认 {"tau":0.05}）
 #   ADAPTER_DIR      calib 输出目录，默认 ./outputs/{MODEL_NAME}/{METHOD}
 #   EVAL_ADAPTER_DIR eval 时显式指定 adapter 目录（可选）
 #
@@ -18,6 +18,8 @@
 #   METHOD=topp_skip PATCH_KWARGS='{"threshold":0.8}' bash run_skipping.sh eval
 #   METHOD=sere_skip CALIB_KWARGS='{"similarity_method":"frobenius"}' bash run_skipping.sh calib
 #   METHOD=sere_skip PATCH_KWARGS='{"select_top_k":2,"threshold":0.3}' bash run_skipping.sh eval
+#   METHOD=modes_skip CALIB_KWARGS='{"loss_type":"kl"}' bash run_skipping.sh calib
+#   METHOD=modes_skip PATCH_KWARGS='{"tau":0.05}' bash run_skipping.sh eval
 
 export HF_ALLOW_CODE_EVAL=1
 
@@ -36,6 +38,8 @@ elif [ "$METHOD" = "topp_skip" ]; then
   DEFAULT_PATCH_KWARGS='{"threshold":0.8}'
 elif [ "$METHOD" = "sere_skip" ]; then
   DEFAULT_PATCH_KWARGS='{"select_top_k":2,"threshold":0.3}'
+elif [ "$METHOD" = "modes_skip" ]; then
+  DEFAULT_PATCH_KWARGS='{"tau":0.05}'
 fi
 
 CALIBRATION_DATASET="${CALIBRATION_DATASET:-wikitext:wikitext-2-raw-v1}"
@@ -71,7 +75,7 @@ if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
 fi
 
 if [ -z "$METHOD" ]; then
-  echo "错误: 必须显式设置 METHOD（topk_skip / topp_skip / sere_skip）"
+  echo "错误: 必须显式设置 METHOD（topk_skip / topp_skip / sere_skip / modes_skip）"
   echo "示例: METHOD=topk_skip bash run_skipping.sh eval"
   exit 1
 fi
