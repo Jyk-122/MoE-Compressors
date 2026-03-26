@@ -3,8 +3,10 @@ SERE skipping for Qwen3-MoE.
 
 核心思路：
 1) calib: 临时用 MethodType 替换各层 `mlp.forward`（全专家一次 → 累加 sim → 用已算输出做 top-k 聚合），保存 adapter
-2) patch: 推理时保留每个 token 的前 select_top_k(primary) 专家；
-          对其余 secondary 专家按 similarity 重路由；若 best_sim < threshold 则保留原专家
+2) patch: 本 batch 内各 token 的 top-S primary 取并集 `primary`；构造长度 `num_experts` 的 `expert_map`：
+          在并集中者为恒等；**补集**专家在 `primary` 上按 `similarity_matrix` 取最相似 primary，
+          `best_sim < threshold` 则恒等，否则映射到该 primary；`threshold<=0` 时补集一律映射到最相似 primary；
+          最终 `rerouted_indices = expert_map[router_indices]`
 """
 
 from __future__ import annotations
@@ -192,7 +194,7 @@ def _sere_calib_mlp_forward(
 
 
 class SERESkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
-    """SERE re-routing MoE block: reroute secondary experts by similarity."""
+    """SERE：batch primary 并集 + 全专家 expert_map，再对 router_indices 查表得到 rerouted_indices。"""
 
     def __init__(
         self,
@@ -243,26 +245,33 @@ class SERESkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
             ).to(router_probs.dtype)
         routing_weights = router_top_value
 
-        # SERE：每个 token 的 secondary 只在该 token 自己的 top-S primary 里找最相似专家重路由
-        rerouted_indices = router_indices.clone()
-        S, K = self.select_top_k, self.top_k
-        if S < K:
-            sim = self.similarity_matrix.to(
-                device=router_indices.device, dtype=torch.float32
-            )
-            prim = router_indices[:, :S].long()
-            sec = router_indices[:, S:K].long()
-            _, n_sec = sec.shape
-            prim_rep = prim.unsqueeze(1).expand(-1, n_sec, -1)
-            e_exp = sec.unsqueeze(-1).expand(-1, -1, S)
-            sim_cand = sim[e_exp, prim_rep]
-            best_sim, best_i = sim_cand.max(dim=-1)
-            best_primary = torch.gather(prim_rep, 2, best_i.unsqueeze(-1)).squeeze(-1)
-            if self.threshold > 0.0:
-                new_sec = torch.where(best_sim < self.threshold, sec, best_primary)
+        # SERE：primary = 本 batch 内 top-S primary 并集；expert_map[e] 为专家 e 重路由后的专家 id。
+        # 补集专家相对 primary 取最大相似度；best_sim < threshold 则 expert_map[e]=e，否则为最相似 primary。
+        S = self.select_top_k
+        device = router_indices.device
+        primary = torch.unique(router_indices[:, :S].long())
+
+        sim = self.similarity_matrix.to(device=device, dtype=torch.float32)
+        expert_map = torch.arange(self.num_experts, device=device, dtype=torch.long)
+
+        in_prim = torch.zeros(self.num_experts, dtype=torch.bool, device=device)
+        in_prim[primary] = True
+        secondary = torch.nonzero(~in_prim, as_tuple=False).squeeze(-1)
+
+        if secondary.numel() > 0 and primary.numel() > 0:
+            sim_sub = sim[secondary][:, primary]
+            best_sim, best_j = sim_sub.max(dim=-1)
+            best_primary = primary[best_j]
+            if self.threshold <= 0.0:
+                expert_map[secondary] = best_primary
             else:
-                new_sec = best_primary
-            rerouted_indices[:, S:K] = new_sec
+                expert_map[secondary] = torch.where(
+                    best_sim >= self.threshold,
+                    best_primary,
+                    secondary,
+                )
+
+        rerouted_indices = expert_map[router_indices.long()]
 
         if self.stats_collector is not None:
             self.stats_collector.update(

@@ -200,7 +200,7 @@ accelerate launch run.py modes_skip eval \
 - `sere_skip`：
   - 校准：固定 **每条校准文本单独一次 forward**（`padding=False`，忽略 CLI 的 `--batch_size`，非 1 会 warning）；临时用 `MethodType` **替换各层 `mlp.forward`**，在单次 forward 内先跑全专家写 sim、再按 top-k 用已算输出聚合（避免 hook 双算）；`--max_context_len` 控制截断；每层在每个样本上算相似度矩阵后对样本数 **求平均**。
   - `calib_kwargs={"similarity_method":"frobenius|cosine|cka","kernel":"linear|rbf|polynomial"}`（`kernel` 仅 `cka` 使用）
-  - `patch_kwargs={"select_top_k":...,"threshold":...}`，要求 `1 <= select_top_k <= num_experts_per_tok` 且 `0 <= threshold <= 1`。
+  - `patch_kwargs={"select_top_k":...,"threshold":...}`，要求 `1 <= select_top_k <= num_experts_per_tok` 且 `0 <= threshold <= 1`。**一次 forward 内**对 top-S primary 取并集，构造长度 `num_experts` 的映射：并集内恒等，**补集**专家在并集上取最相似 primary，`best_sim < threshold` 则保持原专家 id，`threshold<=0` 时补集一律映到最相似 primary；`rerouted_indices = expert_map[router_indices]`。
 - `modes_skip`：
   - 校准：每条样本一次 baseline forward，再对每个 MoE 层单独将 `mlp.forward` 换为零输出并 forward，在全序列非 padding 位置上累计 **KL 或 MSE**；各层 raw loss 归一化为 **$\alpha$（MoE 层间和为 1）**；`calib_kwargs={"loss_type":"kl|mse","temperature":1.0}`。
   - `patch_kwargs={"tau":...}`（必填）；**需同时提供** `--adapter_dir` 以加载 $\alpha$。$\tau$ 与有效跳过率需自行尝试。
