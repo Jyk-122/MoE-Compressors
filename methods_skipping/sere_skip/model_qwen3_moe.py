@@ -6,7 +6,7 @@ SERE skipping for Qwen3-MoE.
 2) patch: 本 batch 内各 token 的 top-S primary 取并集 `primary`；构造长度 `num_experts` 的 `expert_map`：
           在并集中者为恒等；**补集**专家在 `primary` 上按 `similarity_matrix` 取最相似 primary，
           `best_sim < threshold` 则恒等，否则映射到该 primary；`threshold<=0` 时补集一律映射到最相似 primary；
-          最终 `rerouted_indices = expert_map[router_indices]`
+          最终对 router_indices 和 router_weights 进行重路由。`
 """
 
 from __future__ import annotations
@@ -53,6 +53,50 @@ def _resolve_threshold(kwargs: dict[str, Any]) -> float:
     if not (0.0 <= v <= 1.0):
         raise ValueError("threshold 必须满足 0 <= threshold <= 1")
     return v
+
+def sere_reroute(
+    router_indices: torch.Tensor,
+    routing_weights: torch.Tensor,
+    similarity_matrix: torch.Tensor,
+    select_top_k: int,
+    threshold: float,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    SERE 重路由优化版（无 Padding 处理）。
+    利用映射后的碰撞矩阵实现 O(NK) 级别的逻辑映射与合并。
+    """
+    device = router_indices.device
+    N, K = router_indices.shape
+    S = int(select_top_k)
+    
+    # 对当前 Batch 统计 top-S 主专家
+    primary = torch.unique(router_indices[:, :S], sorted=False)
+    expert_map = torch.arange(num_experts, device=device, dtype=torch.long)
+    
+    # 找出非主专家 (Secondary)
+    all_mask = torch.ones(num_experts, dtype=torch.bool, device=device)
+    all_mask[primary] = False
+    secondary = torch.nonzero(all_mask, as_tuple=True)[0]
+
+    if secondary.numel() > 0:
+        sim = similarity_matrix.to(device=device, dtype=torch.float32)
+        sim_sub = sim[secondary][:, primary]
+        best_sim, best_j = sim_sub.max(dim=-1)
+        
+        # 应用阈值：只有超过 threshold 的才重路由到 best_primary
+        reroute_mask = best_sim >= threshold
+        expert_map[secondary[reroute_mask]] = primary[best_j[reroute_mask]]
+
+    rerouted_indices = expert_map[router_indices.long()]
+    
+    # 重路由权重
+    rerouted_weights = torch.zeros(N, num_experts, device=device, dtype=routing_weights.dtype)
+    rerouted_weights.scatter_add_(1, rerouted_indices, routing_weights)
+    
+    final_weights, final_indices = rerouted_weights.topk(K, dim=-1)
+    final_indices = final_indices.masked_fill(final_weights == 0, -1)
+    return final_indices, final_weights
 
 
 def _center_gram(k: torch.Tensor) -> torch.Tensor:
@@ -194,7 +238,7 @@ def _sere_calib_mlp_forward(
 
 
 class SERESkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
-    """SERE：batch primary 并集 + 全专家 expert_map，再对 router_indices 查表得到 rerouted_indices。"""
+    """SERE：batch primary 并集 + 全专家 expert_map，再对 router_indices 和 router_weights 进行重路由。"""
 
     def __init__(
         self,
@@ -245,33 +289,14 @@ class SERESkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
             ).to(router_probs.dtype)
         routing_weights = router_top_value
 
-        # SERE：primary = 本 batch 内 top-S primary 并集；expert_map[e] 为专家 e 重路由后的专家 id。
-        # 补集专家相对 primary 取最大相似度；best_sim < threshold 则 expert_map[e]=e，否则为最相似 primary。
-        S = self.select_top_k
-        device = router_indices.device
-        primary = torch.unique(router_indices[:, :S].long())
-
-        sim = self.similarity_matrix.to(device=device, dtype=torch.float32)
-        expert_map = torch.arange(self.num_experts, device=device, dtype=torch.long)
-
-        in_prim = torch.zeros(self.num_experts, dtype=torch.bool, device=device)
-        in_prim[primary] = True
-        secondary = torch.nonzero(~in_prim, as_tuple=False).squeeze(-1)
-
-        if secondary.numel() > 0 and primary.numel() > 0:
-            sim_sub = sim[secondary][:, primary]
-            best_sim, best_j = sim_sub.max(dim=-1)
-            best_primary = primary[best_j]
-            if self.threshold <= 0.0:
-                expert_map[secondary] = best_primary
-            else:
-                expert_map[secondary] = torch.where(
-                    best_sim >= self.threshold,
-                    best_primary,
-                    secondary,
-                )
-
-        rerouted_indices = expert_map[router_indices.long()]
+        rerouted_indices, rerouting_weights = sere_reroute(
+            router_indices,
+            routing_weights,
+            similarity_matrix=self.similarity_matrix,
+            select_top_k=self.select_top_k,
+            threshold=self.threshold,
+            num_experts=self.num_experts,
+        )
 
         if self.stats_collector is not None:
             self.stats_collector.update(
@@ -290,7 +315,7 @@ class SERESkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
             gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
             current_hidden_states = self.act_fn(gate) * up
             current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
+            current_hidden_states = current_hidden_states * rerouting_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
