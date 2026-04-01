@@ -77,14 +77,16 @@ class MoEStatsCollector:
         if mask.dim() != 2:
             return selected_indices
 
-        seq_len = int(sequence_length)
-        if seq_len <= 0 or mask.shape[1] < seq_len:
-            return selected_indices
+        # seq_len = int(sequence_length)
+        # if seq_len <= 0 or mask.shape[1] < seq_len:
+        #     return selected_indices
 
-        # 对齐当前 forward 的最后 seq_len 个位置（兼容 generate decode 时 attention_mask 长于 input）。
-        token_mask = mask[:, -seq_len:].reshape(-1)
-        if token_mask.numel() != selected_indices.shape[0]:
-            return selected_indices
+        # # 对齐当前 forward 的最后 seq_len 个位置（兼容 generate decode 时 attention_mask 长于 input）。
+        # token_mask = mask[:, -seq_len:].reshape(-1)
+        # if token_mask.numel() != selected_indices.shape[0]:
+        #     return selected_indices
+        
+        token_mask = mask.flatten().bool()
         return selected_indices[token_mask]
 
     def update(

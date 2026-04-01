@@ -50,15 +50,20 @@ def _zero_mlp_forward(_self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor
 def _per_position_loss(
     org_logits: torch.Tensor,
     ablated_logits: torch.Tensor,
+    attention_mask: torch.Tensor,
     loss_type: str,
     temperature: float,
 ) -> torch.Tensor:
     """Sum loss over token positions (2D logits: [n_pos, vocab])."""
     t = float(temperature)
+    mask = attention_mask.flatten(0, 1).bool()
+    org_logits = org_logits.flatten(0, 1)[mask]
+    ablated_logits = ablated_logits.flatten(0, 1)[mask]
+    
     if loss_type == "kl":
         log_p = F.log_softmax(ablated_logits / t, dim=-1)
         target = F.softmax(org_logits / t, dim=-1)
-        return F.relu(F.kl_div(log_p, target, reduction="sum"))
+        return F.kl_div(log_p, target, reduction="sum")
     if loss_type == "mse":
         return F.mse_loss(ablated_logits, org_logits, reduction="sum")
     raise ValueError(f"不支持的 loss_type: {loss_type}，支持 kl / mse")
@@ -240,18 +245,11 @@ class MoDESSkipQwen3Moe(MoECompressor):
                 if inputs["input_ids"].numel() == 0:
                     continue
 
-                attn = inputs.get("attention_mask")
-                if attn is None:
-                    attn = torch.ones_like(inputs["input_ids"], dtype=torch.bool)
-                else:
-                    attn = attn.bool()
+                attention_mask = inputs.get("attention_mask")
+                if attention_mask is None:
+                    attention_mask = torch.ones_like(inputs["input_ids"])
 
                 org_logits = model(**inputs).logits.float()
-                valid = attn[0].bool()
-                if not valid.any():
-                    continue
-
-                org_slice = org_logits[0, valid]
 
                 for layer_idx in moe_indices:
                     block = layers[layer_idx].mlp
@@ -262,9 +260,8 @@ class MoDESSkipQwen3Moe(MoECompressor):
                     finally:
                         block.forward = orig_forward
 
-                    abl_slice = ablated[0, valid]
                     loss = _per_position_loss(
-                        org_slice, abl_slice, loss_type=loss_type, temperature=temperature
+                        org_logits, ablated, attention_mask, loss_type=loss_type, temperature=temperature
                     )
                     loss_sum[layer_idx] += float(loss.item())
 

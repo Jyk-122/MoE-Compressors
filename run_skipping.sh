@@ -22,6 +22,7 @@
 #   METHOD=modes_skip PATCH_KWARGS='{"tau":0.05}' bash run_skipping.sh eval
 
 export HF_ALLOW_CODE_EVAL=1
+export HF_DATASETS_OFFLINE=1
 
 MODEL="${MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
 METHOD="${METHOD:-}"

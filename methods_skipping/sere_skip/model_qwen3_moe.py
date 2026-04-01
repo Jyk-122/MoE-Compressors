@@ -61,11 +61,19 @@ def sere_reroute(
     select_top_k: int,
     threshold: float,
     num_experts: int,
+    active_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     SERE 重路由优化版（无 Padding 处理）。
     利用映射后的碰撞矩阵实现 O(NK) 级别的逻辑映射与合并。
     """
+    output_indices = router_indices.clone()
+    output_weights = routing_weights.clone()
+    
+    if active_mask is not None:
+        mask = active_mask.flatten().bool()
+        router_indices = router_indices[mask]
+    
     device = router_indices.device
     N, K = router_indices.shape
     S = int(select_top_k)
@@ -96,7 +104,13 @@ def sere_reroute(
     
     final_weights, final_indices = rerouted_weights.topk(K, dim=-1)
     final_indices = final_indices.masked_fill(final_weights == 0, -1)
-    return final_indices, final_weights
+    
+    if active_mask is None:
+        return final_indices, final_weights
+    
+    output_indices[mask] = final_indices
+    output_weights[mask] = final_weights
+    return output_indices, output_weights
 
 
 def _center_gram(k: torch.Tensor) -> torch.Tensor:
@@ -288,6 +302,10 @@ class SERESkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
                 router_top_value / router_top_value.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             ).to(router_probs.dtype)
         routing_weights = router_top_value
+        
+        if self.stats_collector._active_attention_mask is not None:
+            padding_mask = ~self.stats_collector._active_attention_mask.flatten().bool()
+            router_indices[padding_mask] = -1
 
         rerouted_indices, rerouting_weights = sere_reroute(
             router_indices,
@@ -304,6 +322,7 @@ class SERESkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
                 selected_indices=rerouted_indices.detach(),
                 default_top_k=self.top_k,
                 sequence_length=sequence_length,
+                active_mask=self.stats_collector._active_attention_mask,
             )
 
         final_hidden_states = torch.zeros_like(hidden_states_reshaped)
