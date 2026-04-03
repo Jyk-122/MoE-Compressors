@@ -35,6 +35,21 @@ def _resolve_threshold(kwargs: dict[str, Any]) -> float:
     return threshold
 
 
+def _resolve_norm(kwargs: dict[str, Any]) -> bool:
+    norm = kwargs.get("norm", True)
+    if isinstance(norm, bool):
+        return norm
+    if isinstance(norm, (int, float)):
+        return bool(norm)
+    if isinstance(norm, str):
+        v = norm.strip().lower()
+        if v in {"1", "true", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError('norm 必须是布尔值（true/false），例如 {"threshold": 0.8, "norm": false}')
+
+
 class TopPSkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
     """Full expert weights; routing keeps minimal prefix with cumulative prob >= threshold."""
 
@@ -42,6 +57,7 @@ class TopPSkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
         self,
         original_block: Qwen3MoeSparseMoeBlock,
         threshold: float,
+        norm: bool,
         layer_idx: int,
         stats_collector: MoEStatsCollector | None,
     ):
@@ -50,6 +66,7 @@ class TopPSkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
         self.top_k = self.gate.top_k
         self.num_experts = self.gate.num_experts
         self.threshold = float(threshold)
+        self.norm = bool(norm)
         experts = original_block.experts
         self.gate_up_proj = torch.nn.Parameter(experts.gate_up_proj.clone())
         self.down_proj = torch.nn.Parameter(experts.down_proj.clone())
@@ -66,8 +83,7 @@ class TopPSkippedQwen3MoeSparseMoeBlock(torch.nn.Module):
 
         router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
 
-        # 在默认 top_k 集合内做归一化后再执行 top-p 判定，避免 top_k 总概率质量不足时
-        # threshold 语义失效（始终需要保留全部 top_k 才“最接近”阈值）。
+        # 在默认 top_k 集合内做归一化后再执行 top-p 判定
         router_top_value_for_topp = router_top_value / router_top_value.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         cumsum_probs = router_top_value_for_topp.cumsum(dim=-1)
         num_keep = (cumsum_probs < self.threshold).sum(dim=-1) + 1
@@ -141,6 +157,7 @@ class TopPSkipQwen3Moe(MoECompressor):
 
     def patch(self, model, **kwargs) -> Any:
         threshold = _resolve_threshold(kwargs)
+        norm = _resolve_norm(kwargs)
         stats_collector = MoEStatsCollector(num_experts=model.config.num_experts)
 
         layers = model.model.layers
@@ -151,9 +168,10 @@ class TopPSkipQwen3Moe(MoECompressor):
         ]
         stats_collector.initialize_layers(moe_indices)
         logger.info(
-            "[topp_skip][patch] Replacing %d MoE layers with threshold=%.4f",
+            "[topp_skip][patch] Replacing %d MoE layers with threshold=%.4f, norm=%s",
             len(moe_indices),
             threshold,
+            norm,
         )
 
         for decoder_layer_idx in tqdm(moe_indices, desc="Patching layers (topp_skip)", unit="layer"):
@@ -161,6 +179,7 @@ class TopPSkipQwen3Moe(MoECompressor):
             layers[decoder_layer_idx].mlp = TopPSkippedQwen3MoeSparseMoeBlock(
                 block,
                 threshold=threshold,
+                norm=norm,
                 layer_idx=decoder_layer_idx,
                 stats_collector=stats_collector,
             )

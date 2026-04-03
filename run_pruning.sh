@@ -12,6 +12,8 @@
 #   PATCH_KWARGS     eval 参数 JSON，默认 {"prune_ratio":0.5}
 #   ADAPTER_DIR      adapter 目录，默认 ./outputs/{MODEL_NAME}/{METHOD}
 #   EVAL_RAW=1       eval 原模型（不加载 adapter，不传 patch_kwargs）
+#   TASKS            eval 时 lm_eval 任务名，空格分隔；未设置则用脚本内默认列表
+#   EVAL_LIMIT       eval 时每个任务的 --limit，默认 100000
 #
 # 示例:
 #   bash run_pruning.sh calib
@@ -19,6 +21,8 @@
 #   PATCH_KWARGS='{"prune_ratio":0.3}' bash run_pruning.sh eval
 #   METHOD=camera_pruning CALIB_KWARGS='{"prune_ratio":0.5,"alpha":0.95}' bash run_pruning.sh calib
 #   EVAL_RAW=1 bash run_pruning.sh eval
+#   TASKS="piqa gsm8k" bash run_pruning.sh eval
+#   EVAL_LIMIT=500 bash run_pruning.sh eval
 
 export HF_ALLOW_CODE_EVAL=1
 
@@ -35,11 +39,13 @@ CALIBRATION_DATASET="${CALIBRATION_DATASET:-wikitext:wikitext-2-raw-v1}"
 MAX_CALIB_SAMPLES="${MAX_CALIB_SAMPLES:-128}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-2048}"
 
-TASKS=(
-  piqa hellaswag winogrande arc_easy arc_challenge mmlu
-  gsm8k minerva_math500 mbpp humaneval
-)
-EVAL_LIMIT=100000
+DEFAULT_TASKS="piqa hellaswag winogrande arc_easy arc_challenge mmlu gsm8k minerva_math500 mbpp humaneval"
+if [ -n "${TASKS:-}" ]; then
+  read -ra EVAL_TASKS <<< "$TASKS"
+else
+  read -ra EVAL_TASKS <<< "$DEFAULT_TASKS"
+fi
+EVAL_LIMIT="${EVAL_LIMIT:-100000}"
 GEN_KWARGS="max_gen_toks=1024"
 EVAL_OUTPUT_PATH="${EVAL_OUTPUT_PATH:-}"
 EVAL_OUTPUT_CONTENT="metrics"
@@ -56,7 +62,7 @@ PK="${PATCH_KWARGS:-$DEFAULT_PATCH_KWARGS}"
 MODE="${1:-}"
 if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
   echo "用法: bash run_pruning.sh calib | eval"
-  echo "  关键变量: METHOD, MODEL, CALIB_KWARGS, PATCH_KWARGS, ADAPTER_DIR, EVAL_RAW"
+  echo "  关键变量: METHOD, MODEL, CALIB_KWARGS, PATCH_KWARGS, ADAPTER_DIR, EVAL_RAW, TASKS, EVAL_LIMIT"
   echo "  示例1: METHOD=ean_pruning PATCH_KWARGS='{\"prune_ratio\":0.5}' bash run_pruning.sh eval"
   echo "  示例2: PATCH_KWARGS='{\"prune_ratio\":0.3}' bash run_pruning.sh eval"
   echo "  示例3: METHOD=camera_pruning CALIB_KWARGS='{\"prune_ratio\":0.5,\"alpha\":0.95}' bash run_pruning.sh calib"
@@ -81,12 +87,12 @@ elif [ "$MODE" = "eval" ]; then
   [ -n "$GEN_KWARGS" ] && EXTRA_ARGS+=(--gen_kwargs "$GEN_KWARGS")
   if [ "${EVAL_RAW:-0}" = "1" ] || [ -z "$ADAPTER_DIR" ]; then
     accelerate launch run.py "$METHOD" eval "${BASE_ARGS[@]}" \
-      --tasks "${TASKS[@]}" --limit "$EVAL_LIMIT" --output_base "$OUTPUT_BASE" \
+      --tasks "${EVAL_TASKS[@]}" --limit "$EVAL_LIMIT" --output_base "$OUTPUT_BASE" \
       --patch_kwargs "{}" "${EXTRA_ARGS[@]}"
   else
     accelerate launch run.py "$METHOD" eval "${BASE_ARGS[@]}" \
       --adapter_dir "$ADAPTER_DIR" \
-      --tasks "${TASKS[@]}" --limit "$EVAL_LIMIT" --output_base "$OUTPUT_BASE" \
+      --tasks "${EVAL_TASKS[@]}" --limit "$EVAL_LIMIT" --output_base "$OUTPUT_BASE" \
       --patch_kwargs "$PK" "${EXTRA_ARGS[@]}"
   fi
 fi

@@ -231,13 +231,14 @@ class MoEStatsCollector:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             dist = torch.distributed
 
-        if dist is not None:
-            for t in overall:
-                dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            for stage in self.STAGE_KEYS:
-                tensors = stage_tensors[stage]
-                for t in tensors:
-                    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        # 暂时不使用多卡allreduce，存在卡死的情况
+        # if dist is not None:
+        #     for t in overall:
+        #         dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        #     for stage in self.STAGE_KEYS:
+        #         tensors = stage_tensors[stage]
+        #         for t in tensors:
+        #             dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
         summary = self._summary_from_tensors(
             layer_indices=layer_indices,

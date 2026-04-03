@@ -163,6 +163,12 @@ accelerate launch run.py topp_skip eval \
   --patch_kwargs '{"threshold":0.8}' \
   --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
 
+# top-p（关闭归一化）：按 p' > threshold * p 判定保留前缀专家
+accelerate launch run.py topp_skip eval \
+  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --patch_kwargs '{"threshold":0.8,"norm":false}' \
+  --output_base ./outputs/Qwen3-30B-A3B-Instruct-2507
+
 # SERE skipping：secondary expert 按相似度重路由到 primary expert
 python run.py sere_skip calib \
   --model Qwen/Qwen3-30B-A3B-Instruct-2507 \

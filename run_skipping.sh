@@ -12,6 +12,8 @@
 #   PATCH_KWARGS     eval 参数 JSON（topk_skip 默认 {"k":2}；topp_skip 默认 {"threshold":0.8}；sere_skip 默认 {"select_top_k":2,"threshold":0.3}；modes_skip 默认 {"tau":0.05}）
 #   ADAPTER_DIR      calib 输出目录，默认 ./outputs/{MODEL_NAME}/{METHOD}
 #   EVAL_ADAPTER_DIR eval 时显式指定 adapter 目录（可选）
+#   TASKS            eval 时 lm_eval 任务名，空格分隔；未设置则用脚本内默认列表
+#   EVAL_LIMIT       eval 时每个任务的 --limit，默认 100000
 #
 # 示例:
 #   METHOD=topk_skip PATCH_KWARGS='{"k":1}' bash run_skipping.sh eval
@@ -20,6 +22,8 @@
 #   METHOD=sere_skip PATCH_KWARGS='{"select_top_k":2,"threshold":0.3}' bash run_skipping.sh eval
 #   METHOD=modes_skip CALIB_KWARGS='{"loss_type":"kl"}' bash run_skipping.sh calib
 #   METHOD=modes_skip PATCH_KWARGS='{"tau":0.05}' bash run_skipping.sh eval
+#   TASKS="piqa gsm8k" METHOD=topk_skip bash run_skipping.sh eval
+#   EVAL_LIMIT=500 METHOD=topp_skip bash run_skipping.sh eval
 
 export HF_ALLOW_CODE_EVAL=1
 export HF_DATASETS_OFFLINE=1
@@ -47,11 +51,13 @@ CALIBRATION_DATASET="${CALIBRATION_DATASET:-wikitext:wikitext-2-raw-v1}"
 MAX_CALIB_SAMPLES="${MAX_CALIB_SAMPLES:-128}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-2048}"
 
-TASKS=(
-  piqa hellaswag winogrande arc_easy arc_challenge mmlu
-  gsm8k minerva_math500 mbpp humaneval
-)
-EVAL_LIMIT=100000
+DEFAULT_TASKS="piqa hellaswag winogrande arc_easy arc_challenge mmlu gsm8k minerva_math500 mbpp humaneval"
+if [ -n "${TASKS:-}" ]; then
+  read -ra EVAL_TASKS <<< "$TASKS"
+else
+  read -ra EVAL_TASKS <<< "$DEFAULT_TASKS"
+fi
+EVAL_LIMIT="${EVAL_LIMIT:-100000}"
 GEN_KWARGS="max_gen_toks=1024"
 EVAL_OUTPUT_PATH="${EVAL_OUTPUT_PATH:-}"
 EVAL_OUTPUT_CONTENT="metrics"
@@ -67,7 +73,7 @@ PK="${PATCH_KWARGS:-$DEFAULT_PATCH_KWARGS}"
 MODE="${1:-}"
 if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
   echo "用法: bash run_skipping.sh calib | eval"
-  echo "  关键变量: METHOD, MODEL, CALIB_KWARGS, PATCH_KWARGS, ADAPTER_DIR, EVAL_ADAPTER_DIR"
+  echo "  关键变量: METHOD, MODEL, CALIB_KWARGS, PATCH_KWARGS, ADAPTER_DIR, EVAL_ADAPTER_DIR, TASKS, EVAL_LIMIT"
   echo "  示例1: METHOD=topk_skip PATCH_KWARGS='{\"k\":1}' bash run_skipping.sh eval"
   echo "  示例2: METHOD=topk_skip PATCH_KWARGS='{\"k\":1}' bash run_skipping.sh eval"
   echo "  示例3: METHOD=topp_skip PATCH_KWARGS='{\"threshold\":0.8}' bash run_skipping.sh eval"
@@ -100,11 +106,11 @@ elif [ "$MODE" = "eval" ]; then
   if [ -n "$EVAL_ADAPTER_DIR" ]; then
     accelerate launch run.py "$METHOD" eval "${BASE_ARGS[@]}" \
       --adapter_dir "$EVAL_ADAPTER_DIR" \
-      --tasks "${TASKS[@]}" --limit "$EVAL_LIMIT" --output_base "$OUTPUT_BASE" \
+      --tasks "${EVAL_TASKS[@]}" --limit "$EVAL_LIMIT" --output_base "$OUTPUT_BASE" \
       --patch_kwargs "$PK" "${EXTRA_ARGS[@]}"
   else
     accelerate launch run.py "$METHOD" eval "${BASE_ARGS[@]}" \
-      --tasks "${TASKS[@]}" --limit "$EVAL_LIMIT" --output_base "$OUTPUT_BASE" \
+      --tasks "${EVAL_TASKS[@]}" --limit "$EVAL_LIMIT" --output_base "$OUTPUT_BASE" \
       --patch_kwargs "$PK" "${EXTRA_ARGS[@]}"
   fi
 fi
