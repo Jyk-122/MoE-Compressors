@@ -14,6 +14,7 @@
 #   EVAL_RAW=1       eval 原模型（不加载 adapter，不传 patch_kwargs）
 #   TASKS            eval 时 lm_eval 任务名，空格分隔；未设置则用脚本内默认列表
 #   EVAL_LIMIT       eval 时每个任务的 --limit，默认 100000
+#   EVAL_BATCH_SIZE  eval 时传给 run.py --eval_batch_size（lm_eval batch），默认 auto；可设为数字如 4
 #
 # 示例:
 #   bash run_pruning.sh calib
@@ -23,6 +24,7 @@
 #   EVAL_RAW=1 bash run_pruning.sh eval
 #   TASKS="piqa gsm8k" bash run_pruning.sh eval
 #   EVAL_LIMIT=500 bash run_pruning.sh eval
+#   EVAL_BATCH_SIZE=4 bash run_pruning.sh eval
 
 export HF_ALLOW_CODE_EVAL=1
 
@@ -46,6 +48,7 @@ else
   read -ra EVAL_TASKS <<< "$DEFAULT_TASKS"
 fi
 EVAL_LIMIT="${EVAL_LIMIT:-100000}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-auto}"
 GEN_KWARGS="max_gen_toks=1024"
 EVAL_OUTPUT_PATH="${EVAL_OUTPUT_PATH:-}"
 EVAL_OUTPUT_CONTENT="metrics"
@@ -62,7 +65,7 @@ PK="${PATCH_KWARGS:-$DEFAULT_PATCH_KWARGS}"
 MODE="${1:-}"
 if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
   echo "用法: bash run_pruning.sh calib | eval"
-  echo "  关键变量: METHOD, MODEL, CALIB_KWARGS, PATCH_KWARGS, ADAPTER_DIR, EVAL_RAW, TASKS, EVAL_LIMIT"
+  echo "  关键变量: METHOD, MODEL, CALIB_KWARGS, PATCH_KWARGS, ADAPTER_DIR, EVAL_RAW, TASKS, EVAL_LIMIT, EVAL_BATCH_SIZE"
   echo "  示例1: METHOD=ean_pruning PATCH_KWARGS='{\"prune_ratio\":0.5}' bash run_pruning.sh eval"
   echo "  示例2: PATCH_KWARGS='{\"prune_ratio\":0.3}' bash run_pruning.sh eval"
   echo "  示例3: METHOD=camera_pruning CALIB_KWARGS='{\"prune_ratio\":0.5,\"alpha\":0.95}' bash run_pruning.sh calib"
@@ -82,7 +85,7 @@ if [ "$MODE" = "calib" ]; then
     --batch_size 1
 
 elif [ "$MODE" = "eval" ]; then
-  EXTRA_ARGS=(--eval_output_content "$EVAL_OUTPUT_CONTENT")
+  EXTRA_ARGS=(--eval_output_content "$EVAL_OUTPUT_CONTENT" --eval_batch_size "$EVAL_BATCH_SIZE")
   [ -n "$EVAL_OUTPUT_PATH" ] && EXTRA_ARGS+=(--eval_output_path "$EVAL_OUTPUT_PATH")
   [ -n "$GEN_KWARGS" ] && EXTRA_ARGS+=(--gen_kwargs "$GEN_KWARGS")
   if [ "${EVAL_RAW:-0}" = "1" ] || [ -z "$ADAPTER_DIR" ]; then

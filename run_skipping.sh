@@ -14,6 +14,7 @@
 #   EVAL_ADAPTER_DIR eval 时显式指定 adapter 目录（可选）
 #   TASKS            eval 时 lm_eval 任务名，空格分隔；未设置则用脚本内默认列表
 #   EVAL_LIMIT       eval 时每个任务的 --limit，默认 100000
+#   EVAL_BATCH_SIZE  eval 时传给 run.py --eval_batch_size（lm_eval batch），默认 auto；可设为数字如 4
 #
 # 示例:
 #   METHOD=topk_skip PATCH_KWARGS='{"k":1}' bash run_skipping.sh eval
@@ -24,6 +25,7 @@
 #   METHOD=modes_skip PATCH_KWARGS='{"tau":0.05}' bash run_skipping.sh eval
 #   TASKS="piqa gsm8k" METHOD=topk_skip bash run_skipping.sh eval
 #   EVAL_LIMIT=500 METHOD=topp_skip bash run_skipping.sh eval
+#   EVAL_BATCH_SIZE=4 METHOD=topk_skip bash run_skipping.sh eval
 
 export HF_ALLOW_CODE_EVAL=1
 export HF_DATASETS_OFFLINE=1
@@ -58,6 +60,7 @@ else
   read -ra EVAL_TASKS <<< "$DEFAULT_TASKS"
 fi
 EVAL_LIMIT="${EVAL_LIMIT:-100000}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-auto}"
 GEN_KWARGS="max_gen_toks=1024"
 EVAL_OUTPUT_PATH="${EVAL_OUTPUT_PATH:-}"
 EVAL_OUTPUT_CONTENT="metrics"
@@ -73,7 +76,7 @@ PK="${PATCH_KWARGS:-$DEFAULT_PATCH_KWARGS}"
 MODE="${1:-}"
 if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
   echo "用法: bash run_skipping.sh calib | eval"
-  echo "  关键变量: METHOD, MODEL, CALIB_KWARGS, PATCH_KWARGS, ADAPTER_DIR, EVAL_ADAPTER_DIR, TASKS, EVAL_LIMIT"
+  echo "  关键变量: METHOD, MODEL, CALIB_KWARGS, PATCH_KWARGS, ADAPTER_DIR, EVAL_ADAPTER_DIR, TASKS, EVAL_LIMIT, EVAL_BATCH_SIZE"
   echo "  示例1: METHOD=topk_skip PATCH_KWARGS='{\"k\":1}' bash run_skipping.sh eval"
   echo "  示例2: METHOD=topk_skip PATCH_KWARGS='{\"k\":1}' bash run_skipping.sh eval"
   echo "  示例3: METHOD=topp_skip PATCH_KWARGS='{\"threshold\":0.8}' bash run_skipping.sh eval"
@@ -99,7 +102,7 @@ if [ "$MODE" = "calib" ]; then
     --batch_size 1
 
 elif [ "$MODE" = "eval" ]; then
-  EXTRA_ARGS=(--eval_output_content "$EVAL_OUTPUT_CONTENT")
+  EXTRA_ARGS=(--eval_output_content "$EVAL_OUTPUT_CONTENT" --eval_batch_size "$EVAL_BATCH_SIZE")
   [ -n "$EVAL_OUTPUT_PATH" ] && EXTRA_ARGS+=(--eval_output_path "$EVAL_OUTPUT_PATH")
   [ -n "$GEN_KWARGS" ] && EXTRA_ARGS+=(--gen_kwargs "$GEN_KWARGS")
   EVAL_ADAPTER_DIR="${EVAL_ADAPTER_DIR:-}"
