@@ -25,7 +25,7 @@ CUDA_VISIBLE_DEVICES=1 METHOD=reap_pruning CALIBRATION_DATASET="/data1/jiangyiku
 CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 METHOD=reap_pruning PATCH_KWARGS='{"prune_ratio":0.5}' ADAPTER_DIR="./outputs/Qwen3-30B-A3B-Instruct-2507/reap_pruning/" TASKS="gsm8k" EVAL_BATCH_SIZE=1 MODEL=/data1/jiangyikun/models/Qwen3-30B-A3B-Instruct-2507 bash run_pruning.sh eval
 
 ## 同样的，在进行专家id记录时，还是建议使用单卡评测
-CUDA_VISIBLE_DEVICES=1 METHOD=reap_pruning PATCH_KWARGS='{"prune_ratio":0.5}' ADAPTER_DIR="./outputs/Qwen3-30B-A3B-Instruct-2507/reap_pruning/" TASKS="gsm8k" EVAL_BATCH_SIZE=1 MODEL=/data1/jiangyikun/models/Qwen3-30B-A3B-Instruct-2507 bash run_pruning.sh eval
+CUDA_VISIBLE_DEVICES=1 METHOD=reap_pruning PATCH_KWARGS='{"prune_ratio":0.5}' ADAPTER_DIR="./outputs/Qwen3-30B-A3B-Instruct-2507/reap_pruning/" TASKS="gsm8k" EVAL_LIMIT=100 EVAL_BATCH_SIZE=1 MODEL=/data1/jiangyikun/models/Qwen3-30B-A3B-Instruct-2507 bash run_pruning.sh eval
 
 # Notes
 ## 所有的eval会保存评测结果

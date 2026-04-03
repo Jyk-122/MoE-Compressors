@@ -1,7 +1,15 @@
-torch>=2.0.0
-transformers>=4.40.0
-safetensors>=0.4.0
-datasets>=2.0.0
-lm_eval[hf]>=0.4.0
-accelerate>=0.25.0
-tqdm>=4.60.0
+transformers5.2.0
+safetensors==0.7.0
+datasets==3.6.0
+accelerate==1.12.0
+tqdm==4.67.3
+jsonlines==4.0.0
+
+# 安装pytorch
+pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+
+# 安装lm_eval
+git clone --depth 1 https://github.com/EleutherAI/lm-evaluation-harness
+cd lm-evaluation-harness
+pip install -e .
+pip install "lm_eval[hf]"
