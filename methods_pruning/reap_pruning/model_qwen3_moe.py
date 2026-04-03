@@ -142,13 +142,13 @@ class PrunedQwen3MoeSparseMoeBlock(torch.nn.Module):
         pruned_mask = self.old_to_new == -1
         router_logits[:, pruned_mask] = float("-inf")
         router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32).to(router_logits.dtype)
-        if "expert_importance" in self.layer_stats:
-            importance = self.layer_stats["expert_importance"].to(router_probs.device, dtype=router_probs.dtype)
-            if importance.numel() == router_probs.shape[-1]:
-                importance = importance.clamp_min(0)
-                importance = importance / importance.max().clamp_min(1e-12)
-                router_probs = router_probs * importance.unsqueeze(0)
-                router_probs = router_probs / router_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        # if "expert_importance" in self.layer_stats:
+        #     importance = self.layer_stats["expert_importance"].to(router_probs.device, dtype=router_probs.dtype)
+        #     if importance.numel() == router_probs.shape[-1]:
+        #         importance = importance.clamp_min(0)
+        #         importance = importance / importance.max().clamp_min(1e-12)
+        #         router_probs = router_probs * importance.unsqueeze(0)
+        #         router_probs = router_probs / router_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
         router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
         if self.gate.norm_topk_prob:
