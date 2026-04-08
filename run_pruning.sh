@@ -15,6 +15,7 @@
 #   TASKS            eval 时 lm_eval 任务名，空格分隔；未设置则用脚本内默认列表
 #   EVAL_LIMIT       eval 时每个任务的 --limit，默认 100000
 #   EVAL_BATCH_SIZE  eval 时传给 run.py --eval_batch_size（lm_eval batch），默认 auto；可设为数字如 4
+#   EXPERT_TRACE_PATH  若设置则传给 run.py --expert_trace_path（建议单卡 + EVAL_BATCH_SIZE=1）
 #
 # 示例:
 #   bash run_pruning.sh calib
@@ -51,6 +52,7 @@ EVAL_LIMIT="${EVAL_LIMIT:-100000}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-auto}"
 GEN_KWARGS="max_gen_toks=1024"
 EVAL_OUTPUT_PATH="${EVAL_OUTPUT_PATH:-}"
+EXPERT_TRACE_PATH="${EXPERT_TRACE_PATH:-}"
 EVAL_OUTPUT_CONTENT="metrics"
 
 DEVICE="cuda"
@@ -88,6 +90,7 @@ elif [ "$MODE" = "eval" ]; then
   EXTRA_ARGS=(--eval_output_content "$EVAL_OUTPUT_CONTENT" --eval_batch_size "$EVAL_BATCH_SIZE")
   [ -n "$EVAL_OUTPUT_PATH" ] && EXTRA_ARGS+=(--eval_output_path "$EVAL_OUTPUT_PATH")
   [ -n "$GEN_KWARGS" ] && EXTRA_ARGS+=(--gen_kwargs "$GEN_KWARGS")
+  [ -n "$EXPERT_TRACE_PATH" ] && EXTRA_ARGS+=(--expert_trace_path "$EXPERT_TRACE_PATH")
   if [ "${EVAL_RAW:-0}" = "1" ] || [ -z "$ADAPTER_DIR" ]; then
     accelerate launch run.py "$METHOD" eval "${BASE_ARGS[@]}" \
       --tasks "${EVAL_TASKS[@]}" --limit "$EVAL_LIMIT" --output_base "$OUTPUT_BASE" \

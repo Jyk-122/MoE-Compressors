@@ -130,6 +130,7 @@ class MoECompressor(ABC):
         limit: float | None = None,
         gen_kwargs: str | dict | None = None,
         patch_kwargs: dict | None = None,
+        expert_trace_path: str | Path | None = None,
         **lm_eval_kwargs,
     ) -> dict[str, Any]:
         """
@@ -145,6 +146,7 @@ class MoECompressor(ABC):
             limit: 每任务样本上限，如 0.1 表示 10%
             gen_kwargs: 生成参数，如 "max_gen_toks=1024" 或 dict，对 generate_until 任务生效
             patch_kwargs: 传给 patch(**patch_kwargs) 的参数字典（如 skipping 的 k）；剪枝默认可为空
+            expert_trace_path: 若设置且已 patch 出 MoEStatsCollector，则在主进程将逐 forward 专家路由写入二进制轨迹
             **lm_eval_kwargs: 传给 simple_evaluate 的额外参数
 
         Returns:
@@ -155,6 +157,14 @@ class MoECompressor(ABC):
             from lm_eval.models.huggingface import HFLM
         except ImportError as e:
             raise ImportError("eval 需要 lm_eval: pip install lm_eval[hf]") from e
+
+        def _trace_writer_rank() -> bool:
+            try:
+                from accelerate.state import PartialState
+
+                return bool(PartialState().is_main_process)
+            except Exception:
+                return True
 
         logger.info("Starting evaluation, tasks: %s", tasks or ["wikitext"])
         logger.info("Loading model via HFLM (pretrained=%s) for distributed eval", self.model_name_or_path)
@@ -180,6 +190,12 @@ class MoECompressor(ABC):
             logger.info("[eval] Applying patch to lm._model")
             self.patch(lm._model, **(patch_kwargs or {}))
             collector = getattr(self, "_acceleration_stats_collector", None)
+            if expert_trace_path and collector is None:
+                logger.warning("[eval] expert_trace_path 已设置但未创建 stats collector（需 patch），已忽略")
+            if collector is not None and expert_trace_path:
+                _tw = _trace_writer_rank()
+                collector.enable_expert_trace(expert_trace_path, write=_tw)
+                logger.info("[eval] Expert trace -> %s (write=%s)", expert_trace_path, _tw)
             if collector is not None and hasattr(lm._model, "forward"):
                 raw_forward = lm._model.forward
 
@@ -201,6 +217,7 @@ class MoECompressor(ABC):
                     try:
                         return raw_forward(*args, **kwargs)
                     finally:
+                        collector.finalize_forward_step()
                         collector.set_active_attention_mask(None)
 
                 lm._model.forward = _forward_with_stats
@@ -218,7 +235,9 @@ class MoECompressor(ABC):
         )
         
         collector = getattr(self, "_acceleration_stats_collector", None)
-        
+        if collector is not None:
+            collector.close_expert_trace()
+
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         

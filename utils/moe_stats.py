@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
+
+from utils.expert_trace_io import (
+    write_forward_block,
+    write_sample_start,
+    write_trace_header,
+)
 
 
 class MoEStatsCollector:
@@ -17,7 +25,15 @@ class MoEStatsCollector:
         }
         self._active_attention_mask: torch.Tensor | None = None
 
+        self._expert_trace_path: Path | None = None
+        self._expert_trace_write: bool = False
+        self._expert_trace_fp: Any = None
+        self._trace_forward_buffer: dict[int, np.ndarray] = {}
+        self._trace_forward_seq_len: int | None = None
+        self._ordered_layer_indices: list[int] = []
+
     def initialize_layers(self, layer_indices: list[int]) -> None:
+        self._ordered_layer_indices = sorted(int(i) for i in layer_indices)
         for layer_idx in layer_indices:
             self._ensure_layer(self._layers, int(layer_idx))
 
@@ -101,6 +117,7 @@ class MoEStatsCollector:
             return
 
         selected_indices = self._apply_active_mask(selected_indices, sequence_length)
+        self._trace_maybe_buffer_layer(layer_idx, selected_indices, sequence_length)
         self._update_bucket(
             self._layers,
             layer_idx=layer_idx,
@@ -285,6 +302,75 @@ class MoEStatsCollector:
                 "decode": by_stage["decode"].get("layers", {}),
             },
         }
+
+    def enable_expert_trace(self, path: str | Path, *, write: bool = True) -> None:
+        """Append routing trace to ``path`` (binary). If write=False, skip recording (non-main ranks)."""
+        self._expert_trace_path = Path(path)
+        self._expert_trace_write = bool(write)
+        self._expert_trace_fp = None
+        self._trace_forward_buffer.clear()
+        self._trace_forward_seq_len = None
+        if self._expert_trace_write:
+            self._expert_trace_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def close_expert_trace(self) -> None:
+        if self._expert_trace_fp is not None:
+            try:
+                self._expert_trace_fp.close()
+            finally:
+                self._expert_trace_fp = None
+        self._expert_trace_path = None
+        self._expert_trace_write = False
+        self._trace_forward_buffer.clear()
+        self._trace_forward_seq_len = None
+
+    def _trace_ensure_file_open(self) -> None:
+        if not self._expert_trace_write or self._expert_trace_path is None:
+            return
+        if self._expert_trace_fp is not None:
+            return
+        path = self._expert_trace_path
+        new_file = not path.exists() or path.stat().st_size == 0
+        self._expert_trace_fp = path.open("ab" if not new_file else "wb")
+        if new_file:
+            num_layers = len(self._ordered_layer_indices) if self._ordered_layer_indices else len(self._layers)
+            write_trace_header(self._expert_trace_fp, num_experts=self.num_experts, num_layers=num_layers)
+
+    def _trace_maybe_buffer_layer(
+        self,
+        layer_idx: int,
+        selected_indices: torch.LongTensor,
+        sequence_length: int | None,
+    ) -> None:
+        if self._expert_trace_path is None or not self._expert_trace_write:
+            return
+        if selected_indices.numel() == 0:
+            return
+        arr = selected_indices.detach().cpu().numpy().astype(np.int16, copy=True)
+        self._trace_forward_buffer[int(layer_idx)] = arr
+        if sequence_length is not None:
+            self._trace_forward_seq_len = int(sequence_length)
+
+    def finalize_forward_step(self) -> None:
+        """Call once per model forward after all MoE layers have run (e.g. in forward wrapper finally)."""
+        if self._expert_trace_path is None or not self._expert_trace_write:
+            self._trace_forward_buffer.clear()
+            self._trace_forward_seq_len = None
+            return
+        if not self._trace_forward_buffer:
+            self._trace_forward_seq_len = None
+            return
+        self._trace_ensure_file_open()
+        assert self._expert_trace_fp is not None
+        seq_len = self._trace_forward_seq_len if self._trace_forward_seq_len is not None else 1
+        if seq_len > 1:
+            write_sample_start(self._expert_trace_fp)
+        layers_sorted = sorted(self._trace_forward_buffer.items(), key=lambda x: x[0])
+        layers_payload = [(idx, arr) for idx, arr in layers_sorted]
+        write_forward_block(self._expert_trace_fp, sequence_length=seq_len, layers=layers_payload)
+        self._expert_trace_fp.flush()
+        self._trace_forward_buffer.clear()
+        self._trace_forward_seq_len = None
 
 
 def build_router_prob_hist(router_probs: torch.Tensor, bins: int = 16) -> tuple[torch.Tensor, torch.Tensor]:

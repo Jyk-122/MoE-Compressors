@@ -217,6 +217,12 @@ def get_parser() -> argparse.ArgumentParser:
         default="metrics",
         choices=["metrics", "full"],
     )
+    parser.add_argument(
+        "--expert_trace_path",
+        type=str,
+        default=None,
+        help="eval 时写入 MoE 专家路由二进制轨迹（需 patch 且存在 stats collector）；建议单卡",
+    )
     return parser
 
 
@@ -293,6 +299,7 @@ def main() -> None:
             limit=args.limit,
             gen_kwargs=args.gen_kwargs,
             patch_kwargs=patch_kwargs if patch_kwargs else None,
+            expert_trace_path=args.expert_trace_path,
         )
 
         out = args.eval_output_path or default_eval_output_path(args)
