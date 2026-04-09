@@ -35,6 +35,7 @@ def _simulate_one_layer(
     *,
     policy: str,
     lookahead: int,
+    belady_next: _NextUseIndex | None = None,
 ) -> int:
     """Return total expert load (swap-in) count for one layer timeline."""
     if capacity <= 0:
@@ -44,7 +45,7 @@ def _simulate_one_layer(
         return 0
 
     if policy == "belady":
-        nxt = _NextUseIndex(seq_sets)
+        nxt = belady_next if belady_next is not None else _NextUseIndex(seq_sets)
         cache: set[int] = set()
         loads = 0
         for t, R in enumerate(seq_sets):
@@ -122,6 +123,78 @@ def timelines_per_layer_from_sample(
     return {lid: layer_timeline_from_sample(sample_steps, lid) for lid in sorted(layer_ids)}
 
 
+def parse_trace_samples(path: str, *, show_progress: bool = False) -> list[dict[int, list[frozenset[int]]]]:
+    """
+    Read binary trace once; each item maps layer_idx -> list of expert sets per token.
+    Used to avoid re-parsing the file for every capacity point.
+    """
+    gen = iter_samples(path)
+    if show_progress:
+        try:
+            from pathlib import Path
+            from tqdm import tqdm
+
+            gen = tqdm(gen, desc=f"Load trace {Path(path).name}", unit="sample")
+        except ImportError:
+            pass
+    parsed: list[dict[int, list[frozenset[int]]]] = []
+    for sample_steps in gen:
+        parsed.append(timelines_per_layer_from_sample(sample_steps))
+    return parsed
+
+
+def _belady_layer_caches_for_sample(
+    tls: dict[int, list[frozenset[int]]],
+) -> dict[int, tuple[list[set[int]], _NextUseIndex]]:
+    """Precompute seq_sets + NextUseIndex once per layer (Belady only; reusable across all C)."""
+    out: dict[int, tuple[list[set[int]], _NextUseIndex]] = {}
+    for lid, timeline in tls.items():
+        seq_sets = [set(s) for s in timeline]
+        out[lid] = (seq_sets, _NextUseIndex(seq_sets))
+    return out
+
+
+def simulate_parsed_samples(
+    parsed: Sequence[dict[int, list[frozenset[int]]]],
+    capacity: int,
+    *,
+    policy: str = "belady",
+    lookahead: int = 64,
+    belady_caches: list[dict[int, tuple[list[set[int]], _NextUseIndex]]] | None = None,
+) -> tuple[int, int, float]:
+    """
+    Same semantics as simulate_trace_file but on pre-parsed samples.
+
+    If policy is belady and ``belady_caches`` is provided (one entry per sample, from
+    :func:`_belady_layer_caches_for_sample`), skips rebuilding :class:`_NextUseIndex` each call.
+    """
+    total_loads = 0
+    total_tokens = 0
+    for si, tls in enumerate(parsed):
+        if not tls:
+            continue
+        lengths = [len(v) for v in tls.values()]
+        ntok = lengths[0]
+        if any(L != ntok for L in lengths):
+            raise ValueError(f"Layer timeline length mismatch: {lengths[:8]}...")
+        cache = belady_caches[si] if belady_caches is not None else None
+        for lid, timeline in tls.items():
+            seq_sets = [set(s) for s in timeline]
+            bn: _NextUseIndex | None = None
+            if policy == "belady" and cache is not None:
+                seq_sets, bn = cache[lid]
+            total_loads += _simulate_one_layer(
+                seq_sets,
+                capacity,
+                policy=policy,
+                lookahead=lookahead,
+                belady_next=bn,
+            )
+        total_tokens += ntok
+    avg = total_loads / max(total_tokens, 1)
+    return total_loads, total_tokens, avg
+
+
 def simulate_sample_loads(
     sample_steps: Sequence[dict[str, object]],
     capacity: int,
@@ -137,15 +210,7 @@ def simulate_sample_loads(
     tls = timelines_per_layer_from_sample(sample_steps)
     if not tls:
         return 0, 0
-    lengths = [len(v) for v in tls.values()]
-    ntok = lengths[0]
-    if any(L != ntok for L in lengths):
-        raise ValueError(f"Layer timeline length mismatch: {lengths[:8]}...")
-    loads = 0
-    for timeline in tls.values():
-        seq_sets = [set(s) for s in timeline]
-        loads += _simulate_one_layer(seq_sets, capacity, policy=policy, lookahead=lookahead)
-    return loads, ntok
+    return simulate_parsed_samples([tls], capacity, policy=policy, lookahead=lookahead)[:2]
 
 
 def simulate_trace_file(
@@ -154,20 +219,28 @@ def simulate_trace_file(
     *,
     policy: str = "belady",
     lookahead: int = 64,
+    parsed: Sequence[dict[int, list[frozenset[int]]]] | None = None,
+    belady_caches: list[dict[int, tuple[list[set[int]], _NextUseIndex]]] | None = None,
 ) -> tuple[int, int, float]:
     """
     Sum over all samples in trace file.
 
     Returns (total_loads, total_tokens, avg_loads_per_token).
+    Pass ``parsed`` / ``belady_caches`` from :func:`parse_trace_samples` to avoid re-reading disk.
     """
-    total_loads = 0
-    total_tokens = 0
-    for sample in iter_samples(path):
-        L, T = simulate_sample_loads(sample, capacity, policy=policy, lookahead=lookahead)
-        total_loads += L
-        total_tokens += T
-    avg = total_loads / max(total_tokens, 1)
-    return total_loads, total_tokens, avg
+    if parsed is None:
+        parsed = parse_trace_samples(path, show_progress=False)
+    if policy == "belady" and belady_caches is None:
+        belady_caches = [_belady_layer_caches_for_sample(tls) for tls in parsed]
+    elif policy != "belady":
+        belady_caches = None
+    return simulate_parsed_samples(
+        parsed,
+        capacity,
+        policy=policy,
+        lookahead=lookahead,
+        belady_caches=belady_caches,
+    )
 
 
 def capacity_curve(
@@ -176,10 +249,43 @@ def capacity_curve(
     *,
     policy: str = "belady",
     lookahead: int = 64,
+    show_progress: bool = True,
 ) -> list[tuple[int, float]]:
-    """List of (capacity, avg_loads_per_token)."""
+    """List of (capacity, avg_loads_per_token). Parses trace file once; scans capacities with tqdm."""
     caps = sorted({int(c) for c in capacities if int(c) > 0})
-    return [(c, simulate_trace_file(path, c, policy=policy, lookahead=lookahead)[2]) for c in caps]
+    parsed = parse_trace_samples(path, show_progress=show_progress)
+    belady_caches: list[dict[int, tuple[list[set[int]], _NextUseIndex]]] | None = None
+    if policy == "belady":
+        belady_caches = [_belady_layer_caches_for_sample(tls) for tls in parsed]
+
+    iterator: Iterable[int]
+    if show_progress:
+        try:
+            from pathlib import Path
+            from tqdm import tqdm
+
+            iterator = tqdm(
+                caps,
+                desc=f"I/O vs C [{Path(path).name}]",
+                unit="cap",
+                leave=True,
+            )
+        except ImportError:
+            iterator = caps
+    else:
+        iterator = caps
+
+    out: list[tuple[int, float]] = []
+    for c in iterator:
+        _, _, avg = simulate_parsed_samples(
+            parsed,
+            c,
+            policy=policy,
+            lookahead=lookahead,
+            belady_caches=belady_caches,
+        )
+        out.append((c, avg))
+    return out
 
 
 def default_capacity_range(path: str, *, step: int = 1, max_cap: int | None = None) -> list[int]:

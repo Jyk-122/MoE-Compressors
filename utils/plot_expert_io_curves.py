@@ -49,6 +49,11 @@ def main() -> None:
     p.add_argument("--lookahead", type=int, default=64, help="Token horizon for lookahead_lru")
     p.add_argument("--cap_step", type=int, default=1)
     p.add_argument("--max_cap", type=int, default=None)
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars (parse trace + capacity sweep)",
+    )
     args = p.parse_args()
 
     traces: list[str] = args.traces
@@ -72,14 +77,24 @@ def main() -> None:
     if not caps:
         raise SystemExit("Empty capacity list")
 
+    show_p = not args.no_progress
     markers = ("o", "s", "^", "v", "D", "P", "X", "*")
     plt.figure(figsize=(7, 4.5))
-    for i, (trace_path, label) in enumerate(zip(traces, labels, strict=True)):
+    trace_iter = zip(traces, labels, strict=True)
+    if show_p:
+        try:
+            from tqdm import tqdm
+
+            trace_iter = tqdm(list(trace_iter), desc="Traces", unit="curve")
+        except ImportError:
+            pass
+    for i, (trace_path, label) in enumerate(trace_iter):
         curve = capacity_curve(
             trace_path,
             caps,
             policy=args.policy,
             lookahead=int(args.lookahead),
+            show_progress=show_p,
         )
         xs = [c for c, _ in curve]
         ys = [y for _, y in curve]

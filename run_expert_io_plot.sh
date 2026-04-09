@@ -9,6 +9,7 @@
 #   LOOKAHEAD    lookahead_lru 的前瞻 token 数，默认 64
 #   CAP_STEP     容量扫描步长，默认 1
 #   MAX_CAP      最大容量（默认扫到 num_experts）
+#   NO_PROGRESS=1  关闭 tqdm 进度条
 #
 # 示例:
 #   TRACES="./traces/reap.bin ./traces/topp.bin" bash run_expert_io_plot.sh
@@ -32,6 +33,8 @@ LOOKAHEAD="${LOOKAHEAD:-64}"
 CAP_STEP="${CAP_STEP:-1}"
 MAX_CAP_ARG=()
 [ -n "${MAX_CAP:-}" ] && MAX_CAP_ARG=(--max_cap "$MAX_CAP")
+NO_PROGRESS_ARG=()
+[ "${NO_PROGRESS:-0}" = "1" ] && NO_PROGRESS_ARG=(--no-progress)
 
 read -ra TRACE_ARR <<< "$TRACES"
 TRACE_ARGS=()
@@ -58,4 +61,5 @@ python utils/plot_expert_io_curves.py \
   --policy "$POLICY" \
   --lookahead "$LOOKAHEAD" \
   --cap_step "$CAP_STEP" \
-  "${MAX_CAP_ARG[@]}"
+  "${MAX_CAP_ARG[@]}" \
+  "${NO_PROGRESS_ARG[@]}"
