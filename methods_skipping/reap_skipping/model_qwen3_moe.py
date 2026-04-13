@@ -347,7 +347,7 @@ class REAPSkippingQwen3Moe(MoECompressor):
             key = f"layer_{decoder_layer_idx}.expert_mean_norm"
             if key not in state:
                 raise KeyError(f"adapter 中缺少 {key}，请使用本方法的 calib 重新生成")
-            expert_mean_norm = state[key]
+            expert_mean_norm = state[key].type_as(layers[decoder_layer_idx].mlp.gate.weight)
             layers[decoder_layer_idx].mlp = REAPSkippedQwen3MoeSparseMoeBlock(
                 block,
                 expert_mean_norm=expert_mean_norm,
