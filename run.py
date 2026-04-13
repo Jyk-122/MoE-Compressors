@@ -16,6 +16,8 @@ run.py 仅做 JSON 解析与透传：
   accelerate launch run.py topp_skip eval --model ... --patch_kwargs '{"threshold":0.8}'
   accelerate launch run.py modes_skip eval --model ... --adapter_dir .../modes_skip --patch_kwargs '{"tau":0.05}'
   accelerate launch run.py lexi_skip eval --model ... --adapter_dir .../lexi_skip --patch_kwargs '{"compute_reduction":0.25}'
+  python run.py reap_skipping calib --model ... --adapter_dir .../reap_skipping
+  accelerate launch run.py reap_skipping eval --model ... --adapter_dir .../reap_skipping --patch_kwargs '{"threshold":0.8}'
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ from methods_skipping.sere_skip.model_qwen3_moe import SERESkipQwen3Moe
 from methods_skipping.topk_skip.model_qwen3_moe import TopKSkipQwen3Moe
 from methods_skipping.topp_skip.model_qwen3_moe import TopPSkipQwen3Moe
 from methods_skipping.lexi_skip.model_qwen3_moe import LexiSkipQwen3Moe
+from methods_skipping.reap_skipping.model_qwen3_moe import REAPSkippingQwen3Moe
 
 from transformers import AutoConfig
 from utils.method_kwargs import parse_json_object
@@ -63,6 +66,7 @@ METHOD_REGISTRY: dict[str, dict[str, type]] = {
     "sere_skip": {"qwen3_moe": SERESkipQwen3Moe},
     "modes_skip": {"qwen3_moe": MoDESSkipQwen3Moe},
     "lexi_skip": {"qwen3_moe": LexiSkipQwen3Moe},
+    "reap_skipping": {"qwen3_moe": REAPSkippingQwen3Moe},
 }
 
 

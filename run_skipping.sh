@@ -6,10 +6,10 @@
 #   bash run_skipping.sh eval    # 多卡评测（accelerate）
 #
 # 关键环境变量:
-#   METHOD           skipping 方法名（topk_skip | topp_skip | sere_skip | modes_skip | lexi_skip，必填）
+#   METHOD           skipping 方法名（topk_skip | topp_skip | sere_skip | modes_skip | lexi_skip | reap_skipping，必填）
 #   MODEL            模型路径或 HF 名称
 #   CALIB_KWARGS     calib 参数 JSON，默认 {}
-#   PATCH_KWARGS     eval 参数 JSON（topk_skip 默认 {"k":2}；topp_skip 默认 {"threshold":0.8}；sere_skip 默认 {"select_top_k":2,"threshold":0.3}；modes_skip 默认 {"tau":0.05}；lexi_skip 无默认，须显式如 {"compute_reduction":0.25} 或 {"target_budget":72}）
+#   PATCH_KWARGS     eval 参数 JSON（topk_skip 默认 {"k":2}；topp_skip / reap_skipping 默认 {"threshold":0.8}；sere_skip 默认 {"select_top_k":2,"threshold":0.3}；modes_skip 默认 {"tau":0.05}；lexi_skip 无默认，须显式如 {"compute_reduction":0.25} 或 {"target_budget":72}）
 #   ADAPTER_DIR      calib 输出目录，默认 ./outputs/{MODEL_NAME}/{METHOD}
 #   EVAL_ADAPTER_DIR eval 时指定 adapter 目录（lexi_skip 评测 Stage1 产物时必填，须含 adapter.safetensors）
 #   TASKS            eval 时 lm_eval 任务名，空格分隔；未设置则用脚本内默认列表
@@ -22,6 +22,8 @@
 #   METHOD=topp_skip PATCH_KWARGS='{"threshold":0.8}' bash run_skipping.sh eval
 #   METHOD=sere_skip CALIB_KWARGS='{"similarity_method":"frobenius"}' bash run_skipping.sh calib
 #   METHOD=sere_skip PATCH_KWARGS='{"select_top_k":2,"threshold":0.3}' bash run_skipping.sh eval
+#   METHOD=reap_skipping bash run_skipping.sh calib
+#   EVAL_ADAPTER_DIR=./outputs/.../reap_skipping METHOD=reap_skipping PATCH_KWARGS='{"threshold":0.8}' bash run_skipping.sh eval
 #   METHOD=modes_skip CALIB_KWARGS='{"loss_type":"kl"}' bash run_skipping.sh calib
 #   METHOD=modes_skip PATCH_KWARGS='{"tau":0.05}' bash run_skipping.sh eval
 #   TASKS="piqa gsm8k" METHOD=topk_skip bash run_skipping.sh eval
@@ -48,7 +50,7 @@ DEFAULT_CALIB_KWARGS='{}'
 DEFAULT_PATCH_KWARGS='{}'
 if [ "$METHOD" = "topk_skip" ]; then
   DEFAULT_PATCH_KWARGS='{"k":2}'
-elif [ "$METHOD" = "topp_skip" ]; then
+elif [ "$METHOD" = "topp_skip" ] || [ "$METHOD" = "reap_skipping" ]; then
   DEFAULT_PATCH_KWARGS='{"threshold":0.8}'
 elif [ "$METHOD" = "sere_skip" ]; then
   DEFAULT_PATCH_KWARGS='{"select_top_k":2,"threshold":0.3}'
@@ -93,7 +95,7 @@ if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
 fi
 
 if [ -z "$METHOD" ]; then
-  echo "错误: 必须显式设置 METHOD（topk_skip / topp_skip / sere_skip / modes_skip / lexi_skip）"
+  echo "错误: 必须显式设置 METHOD（topk_skip / topp_skip / sere_skip / modes_skip / lexi_skip / reap_skipping）"
   echo "示例: METHOD=topk_skip bash run_skipping.sh eval"
   exit 1
 fi
