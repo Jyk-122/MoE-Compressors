@@ -120,30 +120,42 @@ def _sgc_calib_mlp_forward(
     pair_weight_store: dict[int, torch.Tensor],
 ):
     """
-    calib 时替换层 forward：
-    - 输出保持原始 top_k 聚合；
-    - 同时基于 top-p(A,D) 收集组补偿与补偿后误差所需统计量。
+    向量化版本：
+    - expert forward: [T, k] → batched
+    - pair 统计: einsum + mask
+    - 聚合: index_add_
     """
 
     def _forward(self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        x = hidden_states.view(-1, hidden_dim)
-        experts = self.experts
-        num_experts = self.gate.num_experts
-        top_k = self.gate.top_k
+        x = hidden_states.reshape(-1, hidden_dim)   # [T, H]
+        T = x.shape[0]
 
+        experts = self.experts
+        top_k = self.gate.top_k
+        E = self.gate.num_experts
+
+        # -------------------------
+        # 1. router
+        # -------------------------
         router_logits = F.linear(x, self.gate.weight)
         router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32).to(router_logits.dtype)
+
         router_top_value, router_indices = torch.topk(router_probs, top_k, dim=-1)
+
         if self.gate.norm_topk_prob:
             router_top_value = (
                 router_top_value / router_top_value.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             ).to(router_probs.dtype)
-        routing_weights = router_top_value
 
-        # 1) 正常 top_k 输出（不改变校准模型行为）
+        routing_weights = router_top_value  # [T, k]
+
+        # -------------------------
+        # 2. 正常 top-k forward（保持原行为）
+        # -------------------------
         final_hidden_states = torch.zeros_like(x)
         active_experts = torch.unique(router_indices).tolist()
+
         for expert_idx in active_experts:
             token_idx, top_k_pos = torch.where(router_indices == int(expert_idx))
             if token_idx.numel() == 0:
@@ -152,51 +164,121 @@ def _sgc_calib_mlp_forward(
             cur = cur * routing_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, cur.to(final_hidden_states.dtype))
 
-        # 2) top-p 划分 A / D，收集补偿统计
-        active_mask = _top_p_mask(router_top_value, threshold=float(threshold))
-        p_for_lambda = router_top_value / router_top_value.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        # -------------------------
+        # 3. batched expert forward（核心优化）
+        # -------------------------
+        # expand x → [T, k, H]
+        x_expand = x.unsqueeze(1).expand(-1, top_k, -1)   # [T, k, H]
+        x_flat = x_expand.reshape(T * top_k, hidden_dim)  # [T*k, H]
 
+        expert_ids = router_indices.reshape(-1)           # [T*k]
+
+        # batched forward（按 expert 分组执行）
+        Z_flat = torch.zeros_like(x_flat)
+
+        unique_e = torch.unique(expert_ids)
+        for e in unique_e.tolist():
+            mask = (expert_ids == int(e))
+            if mask.sum() == 0:
+                continue
+            Z_flat[mask] = _expert_forward_from_experts(
+                experts, int(e), x_flat[mask]
+            )
+
+        Z = Z_flat.view(T, top_k, hidden_dim)   # [T, k, H]
+
+        # -------------------------
+        # 4. 分组
+        # -------------------------
+        if hidden_dim % num_groups != 0:
+            raise ValueError(f"hidden_dim={hidden_dim} 不能被 num_groups={num_groups} 整除")
+
+        group_size = hidden_dim // num_groups
+        Zg = Z.view(T, top_k, num_groups, group_size)   # [T, k, G, Dg]
+
+        # -------------------------
+        # 5. Gram 计算（pair 内积）
+        # -------------------------
+        # dot[t,i,j,g] = <z_i, z_j> (group-wise)
+        dot = torch.einsum("tigh,tjgh->tijg", Zg, Zg)   # [T, k, k, G]
+
+        norm = (Zg * Zg).sum(dim=-1)                    # [T, k, G]
+
+        # -------------------------
+        # 6. top-p mask
+        # -------------------------
+        active_mask = _top_p_mask(router_top_value, threshold=float(threshold))  # [T, k]
+        keep_mask = active_mask
+        drop_mask = ~active_mask
+
+        # pair mask: j ∈ drop, i ∈ keep
+        pair_mask = drop_mask.unsqueeze(2) & keep_mask.unsqueeze(1)  # [T, k, k]
+
+        if not pair_mask.any():
+            return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+
+        # -------------------------
+        # 7. λ 权重
+        # -------------------------
+        p_top = router_top_value / router_top_value.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        if lambda_use_router_prob:
+            lam = p_top  # [T, k]
+        else:
+            lam = torch.ones_like(p_top)
+
+        lam_j = lam.unsqueeze(2)   # [T, k, 1]
+
+        # -------------------------
+        # 8. 统计量计算
+        # -------------------------
+        # num: <zi, zj>
+        num_t = dot * lam_j.unsqueeze(-1) * pair_mask.unsqueeze(-1)   # [T,k,k,G]
+
+        # den: ||zi||^2
+        norm_i = norm.unsqueeze(2)   # [T,k,1,G]
+        den_t = norm_i * lam_j.unsqueeze(-1) * pair_mask.unsqueeze(-1)
+
+        # tgt: ||zj||^2
+        norm_j = norm.unsqueeze(1)   # [T,1,k,G]
+        tgt_t = norm_j * lam_j.unsqueeze(-1) * pair_mask.unsqueeze(-1)
+
+        # pair weight
+        pw_t = lam_j.squeeze(-1) * pair_mask   # [T,k,k]
+
+        # -------------------------
+        # 9. scatter-add 到 (E,E,G)
+        # -------------------------
         num = num_store[layer_idx]
         den = den_store[layer_idx]
         tgt = tgt_store[layer_idx]
         pair_w = pair_weight_store[layer_idx]
 
-        n_tokens = router_indices.shape[0]
-        for n in range(n_tokens):
-            idx_row = router_indices[n]
-            keep_row = active_mask[n]
-            if bool((~keep_row).sum().item()) is False:
-                continue
+        device = Z.device
 
-            keep_ids = idx_row[keep_row].tolist()
-            drop_pos = torch.nonzero(~keep_row, as_tuple=True)[0]
-            if len(keep_ids) == 0 or drop_pos.numel() == 0:
-                continue
+        idx_i = router_indices.unsqueeze(2).expand(-1, -1, top_k)  # [T,k,k]
+        idx_j = router_indices.unsqueeze(1).expand(-1, top_k, -1)
 
-            # 该 token 仅对 top_k 专家做一次输出缓存
-            x_tok = x[n : n + 1]
-            z_cache: dict[int, torch.Tensor] = {}
-            for e in torch.unique(idx_row).tolist():
-                z_cache[int(e)] = _expert_forward_from_experts(experts, int(e), x_tok).squeeze(0).float()
+        idx_i = idx_i.reshape(-1)
+        idx_j = idx_j.reshape(-1)
 
-            for pos in drop_pos.tolist():
-                j = int(idx_row[pos].item())
-                z_j = z_cache[j]
-                z_j_g = _split_groups(z_j, num_groups=num_groups)
-                lam = float(p_for_lambda[n, pos].item()) if lambda_use_router_prob else 1.0
+        flat_mask = pair_mask.reshape(-1)
 
-                for i in keep_ids:
-                    z_i = z_cache[int(i)]
-                    z_i_g = _split_groups(z_i, num_groups=num_groups)
+        idx_i = idx_i[flat_mask]
+        idx_j = idx_j[flat_mask]
 
-                    # 分组统计：num=<zi,zj>, den=||zi||^2, tgt=||zj||^2
-                    dot_ij = (z_i_g * z_j_g).sum(dim=-1).to(torch.float64) * lam
-                    norm_i = (z_i_g * z_i_g).sum(dim=-1).to(torch.float64) * lam
-                    norm_j = (z_j_g * z_j_g).sum(dim=-1).to(torch.float64) * lam
-                    num[int(i), j] += dot_ij
-                    den[int(i), j] += norm_i
-                    tgt[int(i), j] += norm_j
-                    pair_w[int(i), j] += lam
+        num_flat = num_t.reshape(-1, num_groups)[flat_mask]
+        den_flat = den_t.reshape(-1, num_groups)[flat_mask]
+        tgt_flat = tgt_t.reshape(-1, num_groups)[flat_mask]
+        pw_flat = pw_t.reshape(-1)[flat_mask]
+
+        # 关键：flatten index
+        linear_idx = idx_i * E + idx_j
+
+        num.view(-1, num_groups).index_add_(0, linear_idx, num_flat.to(num.dtype))
+        den.view(-1, num_groups).index_add_(0, linear_idx, den_flat.to(den.dtype))
+        tgt.view(-1, num_groups).index_add_(0, linear_idx, tgt_flat.to(tgt.dtype))
+        pair_w.view(-1).index_add_(0, linear_idx, pw_flat.to(pair_w.dtype))
 
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
