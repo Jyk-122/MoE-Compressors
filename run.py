@@ -18,6 +18,10 @@ run.py 仅做 JSON 解析与透传：
   accelerate launch run.py lexi_skip eval --model ... --adapter_dir .../lexi_skip --patch_kwargs '{"compute_reduction":0.25}'
   python run.py reap_skipping calib --model ... --adapter_dir .../reap_skipping
   accelerate launch run.py reap_skipping eval --model ... --adapter_dir .../reap_skipping --patch_kwargs '{"threshold":0.8}'
+  python run.py replace_graph_skip calib --model ... --adapter_dir .../replace_graph_skip --calib_kwargs '{"candidate_top_r":8}'
+  accelerate launch run.py replace_graph_skip eval --model ... --adapter_dir .../replace_graph_skip --patch_kwargs '{"coverage_threshold":0.9}'
+  python run.py sgc_skip calib --model ... --adapter_dir .../sgc_skip --calib_kwargs '{"threshold":0.8,"num_groups":16}'
+  accelerate launch run.py sgc_skip eval --model ... --adapter_dir .../sgc_skip --patch_kwargs '{"threshold":0.8,"replace_threshold":0.1}'
 """
 
 from __future__ import annotations
@@ -51,6 +55,8 @@ from methods_skipping.topk_skip.model_qwen3_moe import TopKSkipQwen3Moe
 from methods_skipping.topp_skip.model_qwen3_moe import TopPSkipQwen3Moe
 from methods_skipping.lexi_skip.model_qwen3_moe import LexiSkipQwen3Moe
 from methods_skipping.reap_skipping.model_qwen3_moe import REAPSkippingQwen3Moe
+from methods_skipping.replace_graph_skip.model_qwen3_moe import ReplaceGraphSkipQwen3Moe
+from methods_skipping.sgc_skip.model_qwen3_moe import SGCSkipQwen3Moe
 
 from transformers import AutoConfig
 from utils.method_kwargs import parse_json_object
@@ -67,6 +73,8 @@ METHOD_REGISTRY: dict[str, dict[str, type]] = {
     "modes_skip": {"qwen3_moe": MoDESSkipQwen3Moe},
     "lexi_skip": {"qwen3_moe": LexiSkipQwen3Moe},
     "reap_skipping": {"qwen3_moe": REAPSkippingQwen3Moe},
+    "replace_graph_skip": {"qwen3_moe": ReplaceGraphSkipQwen3Moe},
+    "sgc_skip": {"qwen3_moe": SGCSkipQwen3Moe},
 }
 
 
@@ -173,7 +181,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "method",
         choices=sorted(METHOD_REGISTRY.keys()),
-        help="方法名（剪枝 *_pruning 或 skipping: topk_skip/topp_skip/sere_skip/modes_skip）",
+        help="方法名（剪枝 *_pruning 或 skipping: topk_skip/topp_skip/sere_skip/modes_skip/lexi_skip/reap_skipping/replace_graph_skip/sgc_skip）",
     )
     parser.add_argument(
         "mode",
