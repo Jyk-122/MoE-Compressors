@@ -57,6 +57,7 @@ from methods_skipping.lexi_skip.model_qwen3_moe import LexiSkipQwen3Moe
 from methods_skipping.reap_skipping.model_qwen3_moe import REAPSkippingQwen3Moe
 from methods_skipping.replace_graph_skip.model_qwen3_moe import ReplaceGraphSkipQwen3Moe
 from methods_skipping.sgc_skip.model_qwen3_moe import SGCSkipQwen3Moe
+from methods_skipping.os_skip.model_qwen3_moe import OptimalScalingSkippingQwen3Moe
 
 from transformers import AutoConfig
 from utils.method_kwargs import parse_json_object
@@ -75,6 +76,7 @@ METHOD_REGISTRY: dict[str, dict[str, type]] = {
     "reap_skipping": {"qwen3_moe": REAPSkippingQwen3Moe},
     "replace_graph_skip": {"qwen3_moe": ReplaceGraphSkipQwen3Moe},
     "sgc_skip": {"qwen3_moe": SGCSkipQwen3Moe},
+    "os_skip": {"qwen3_moe": OptimalScalingSkippingQwen3Moe},
 }
 
 
