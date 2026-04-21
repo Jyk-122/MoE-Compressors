@@ -6,10 +6,10 @@
 #   bash run_skipping.sh eval    # 多卡评测（accelerate）
 #
 # 关键环境变量:
-#   METHOD           skipping 方法名（topk_skip | topp_skip | sere_skip | modes_skip | lexi_skip | reap_skipping | replace_graph_skip | sgc_skip，必填）
+#   METHOD           skipping 方法名（topk_skip | topp_skip | sere_skip | modes_skip | lexi_skip | reap_skipping | replace_graph_skip | sgc_skip | os_skip | os_lexi_skip，必填）
 #   MODEL            模型路径或 HF 名称
 #   CALIB_KWARGS     calib 参数 JSON，默认 {}
-#   PATCH_KWARGS     eval 参数 JSON（topk_skip 默认 {"k":2}；topp_skip / reap_skipping / sgc_skip 默认 {"threshold":0.8}；sere_skip 默认 {"select_top_k":2,"threshold":0.3}；modes_skip 默认 {"tau":0.05}；replace_graph_skip 默认 {"coverage_threshold":0.9}；lexi_skip 无默认，须显式如 {"compute_reduction":0.25} 或 {"target_budget":72}）
+#   PATCH_KWARGS     eval 参数 JSON（topk_skip 默认 {"k":2}；topp_skip / reap_skipping / sgc_skip / os_skip 默认 {"threshold":0.8}；sere_skip 默认 {"select_top_k":2,"threshold":0.3}；modes_skip 默认 {"tau":0.05}；replace_graph_skip 默认 {"coverage_threshold":0.9}；lexi_skip / os_lexi_skip 无默认，lexi_skip 须显式如 {"compute_reduction":0.25}；os_lexi_skip 须显式如 {"layer_topk": [3,4,3,4,...]}）
 #   ADAPTER_DIR      calib 输出目录，默认 ./outputs/{MODEL_NAME}/{METHOD}
 #   EVAL_ADAPTER_DIR eval 时指定 adapter 目录（lexi_skip 评测 Stage1 产物时必填，须含 adapter.safetensors）
 #   TASKS            eval 时 lm_eval 任务名，空格分隔；未设置则用脚本内默认列表
@@ -39,6 +39,10 @@
 #   CALIB_KWARGS='{"mc_iters":512,"profile_batch":1,"profile_seq_len":8}' METHOD=lexi_skip bash run_skipping.sh calib
 #   EVAL_ADAPTER_DIR=./outputs/.../lexi_skip PATCH_KWARGS='{"compute_reduction":0.25}' METHOD=lexi_skip bash run_skipping.sh eval
 #   （25% / 40% / 50%：同一 EVAL_ADAPTER_DIR，仅改 compute_reduction 为 0.25、0.4、0.5 各跑一次 eval）
+#
+#   Optimal Scaling LExI（os_lexi_skip）：在 lexi_skip 的 per-layer topK 基础上添加 optimal scaling 补偿。
+#     CALIB_KWARGS='{"layer_topk": [3,3,3,3,3,3]}' METHOD=os_lexi_skip bash run_skipping.sh calib
+#     EVAL_ADAPTER_DIR=./outputs/.../os_lexi_skip PATCH_KWARGS='{"layer_topk": [3,3,3,3,3,3]}' METHOD=os_lexi_skip bash run_skipping.sh eval
 
 export HF_ALLOW_CODE_EVAL=1
 export HF_DATASETS_OFFLINE=1
@@ -62,6 +66,8 @@ elif [ "$METHOD" = "modes_skip" ]; then
   DEFAULT_PATCH_KWARGS='{"tau":0.05}'
 elif [ "$METHOD" = "replace_graph_skip" ]; then
   DEFAULT_PATCH_KWARGS='{"coverage_threshold":0.9}'
+elif [ "$METHOD" = "os_skip" ]; then
+  DEFAULT_PATCH_KWARGS='{"threshold":0.8}'
 fi
 
 CALIBRATION_DATASET="${CALIBRATION_DATASET:-wikitext:wikitext-2-raw-v1}"
@@ -101,7 +107,7 @@ if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
 fi
 
 if [ -z "$METHOD" ]; then
-  echo "错误: 必须显式设置 METHOD（topk_skip / topp_skip / sere_skip / modes_skip / lexi_skip / reap_skipping / replace_graph_skip / sgc_skip）"
+  echo "错误: 必须显式设置 METHOD（topk_skip / topp_skip / sere_skip / modes_skip / lexi_skip / reap_skipping / replace_graph_skip / sgc_skip / os_skip / os_lexi_skip）"
   echo "示例: METHOD=topk_skip bash run_skipping.sh eval"
   exit 1
 fi
