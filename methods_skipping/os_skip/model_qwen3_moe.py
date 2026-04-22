@@ -89,10 +89,10 @@ class OptimalScaledQwen3MoeSparseMoeBlock(torch.nn.Module):
         self.act_fn = copy.deepcopy(experts.act_fn)
         
         # 注册 S 矩阵，形状为 (num_experts, hidden_dim)
-        if expert_S_matrix.shape != (self.num_experts, experts.down_proj[0].out_features):
+        if expert_S_matrix.shape != (self.num_experts, experts.down_proj.shape[1]):
             raise ValueError("expert_S_matrix 形状不匹配")
             
-        self.register_buffer("S", expert_S_matrix.to(dtype=experts.gate_up_proj[0].weight.dtype), persistent=False)
+        self.register_buffer("S", expert_S_matrix.type_as(experts.gate_up_proj), persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -284,7 +284,7 @@ class OptimalScalingSkippingQwen3Moe(MoECompressor):
             active_expert_mask = A.sum(dim=0).diagonal() > 1e-8
             S_matrix[~active_expert_mask, :] = 1.0
             
-            state[f"layer_{layer_idx}.expert_S_matrix"] = S_matrix.float()
+            state[f"layer_{layer_idx}.expert_S_matrix"] = S_matrix.float().contiguous()
 
         self.adapter_dir.mkdir(parents=True, exist_ok=True)
         save_file(state, str(self._get_adapter_path()))
