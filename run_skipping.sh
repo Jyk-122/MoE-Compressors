@@ -6,7 +6,7 @@
 #   bash run_skipping.sh eval    # 多卡评测（accelerate）
 #
 # 关键环境变量:
-#   METHOD           skipping 方法名（topk_skip | topp_skip | sere_skip | modes_skip | lexi_skip | reap_skipping | replace_graph_skip | sgc_skip | os_skip | os_lexi_skip，必填）
+#   METHOD           skipping 方法名（topk_skip | topp_skip | sere_skip | modes_skip | lexi_skip | reap_skipping | replace_graph_skip | sgc_skip | os_skip | os_lexi_skip | alloc_skip，必填）
 #   MODEL            模型路径或 HF 名称
 #   CALIB_KWARGS     calib 参数 JSON，默认 {}
 #   PATCH_KWARGS     eval 参数 JSON（topk_skip 默认 {"k":2}；topp_skip / reap_skipping / sgc_skip / os_skip 默认 {"threshold":0.8}；sere_skip 默认 {"select_top_k":2,"threshold":0.3}；modes_skip 默认 {"tau":0.05}；replace_graph_skip 默认 {"coverage_threshold":0.9}；lexi_skip / os_lexi_skip 无默认，lexi_skip 须显式如 {"compute_reduction":0.25}；os_lexi_skip 须显式如 {"layer_topk": [3,4,3,4,...]}）
@@ -43,6 +43,16 @@
 #   Optimal Scaling LExI（os_lexi_skip）：在 lexi_skip 的 per-layer topK 基础上添加 optimal scaling 补偿。
 #     CALIB_KWARGS='{"layer_topk": [3,3,3,3,3,3]}' METHOD=os_lexi_skip bash run_skipping.sh calib
 #     EVAL_ADAPTER_DIR=./outputs/.../os_lexi_skip PATCH_KWARGS='{"layer_topk": [3,3,3,3,3,3]}' METHOD=os_lexi_skip bash run_skipping.sh eval
+#
+#   Alloc-MoE（alloc_skip）：预算感知的层级别 + token级别专家激活分配（基于论文 "Budget-aware Expert Activation Allocation for Efficient Mixture-of-Experts Inference"）。
+#     # Stage1：层敏感度画像（只需运行一次）
+#     METHOD=alloc_skip bash run_skipping.sh calib
+#     # Stage2：使用 compute_reduction 或 target_budget 进行层分配 + 可选 Alloc-T（token级别再分配）
+#     #   enable_alloc_t=true：启用token级别自适应再分配
+#     #   enable_alloc_t=false：每层每个token固定 k 个专家（仅层分配）
+#     EVAL_ADAPTER_DIR=./outputs/.../alloc_skip PATCH_KWARGS='{"compute_reduction":0.5,"enable_alloc_t":true,"k_base":1}' METHOD=alloc_skip bash run_skipping.sh eval
+#     # 不同预算可复用同一个 adapter，只改 compute_reduction（0.25/0.4/0.5）各跑一次 eval
+#     # 也可直接指定 target_budget 或 layer_k 列表
 
 export HF_ALLOW_CODE_EVAL=1
 export HF_DATASETS_OFFLINE=1
@@ -107,7 +117,7 @@ if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
 fi
 
 if [ -z "$METHOD" ]; then
-  echo "错误: 必须显式设置 METHOD（topk_skip / topp_skip / sere_skip / modes_skip / lexi_skip / reap_skipping / replace_graph_skip / sgc_skip / os_skip / os_lexi_skip）"
+  echo "错误: 必须显式设置 METHOD（topk_skip / topp_skip / sere_skip / modes_skip / lexi_skip / reap_skipping / replace_graph_skip / sgc_skip / os_skip / os_lexi_skip / alloc_skip）"
   echo "示例: METHOD=topk_skip bash run_skipping.sh eval"
   exit 1
 fi
