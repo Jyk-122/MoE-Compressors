@@ -194,7 +194,7 @@ def plot_experiment_1(
     alpha_abs_mean,
     scaled_abs_mean,
     layer_idx,
-    prune_ratio,
+    config_name,
     out_dir,
 ):
     """
@@ -210,7 +210,7 @@ def plot_experiment_1(
     ax1.plot([x_min, x_max], [x_min, x_max], 'r--', linewidth=1)
     ax1.set_xlabel('Original Channel Abs Mean')
     ax1.set_ylabel('Alpha-Only Channel Abs Mean')
-    ax1.set_title(f'Layer {layer_idx} (Prune Ratio {prune_ratio:.0%}): Alpha Only')
+    ax1.set_title(f'Layer {layer_idx} ({config_name}): Alpha Only')
     ax1.grid(True, alpha=0.3)
     
     x_min = min(orig_abs_mean.min(), scaled_abs_mean.min())
@@ -219,11 +219,11 @@ def plot_experiment_1(
     ax2.plot([x_min, x_max], [x_min, x_max], 'r--', linewidth=1)
     ax2.set_xlabel('Original Channel Abs Mean')
     ax2.set_ylabel('OptimalScale Channel Abs Mean')
-    ax2.set_title(f'Layer {layer_idx} (Prune Ratio {prune_ratio:.0%}): OptimalScale')
+    ax2.set_title(f'Layer {layer_idx} ({config_name}): OptimalScale')
     ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    out_path = out_dir / f'exp1_layer{layer_idx}_prune{int(prune_ratio*100)}.png'
+    out_path = out_dir / f'exp1_layer{layer_idx}_{config_name}.png'
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=150)
     plt.close()
@@ -235,7 +235,7 @@ def plot_experiment_2(
     alpha_hidden,
     scaled_hidden,
     layer_idx,
-    prune_ratio,
+    config_name,
     out_dir,
     top_k=10,
 ):
@@ -259,14 +259,14 @@ def plot_experiment_2(
     
     ax.set_xlabel('Top Outlier Channel Index')
     ax.set_ylabel('MSE')
-    ax.set_title(f'Layer {layer_idx} (Prune Ratio {prune_ratio:.0%}): Outlier Channel MSE')
+    ax.set_title(f'Layer {layer_idx} ({config_name}): Outlier Channel MSE')
     ax.set_xticks(x)
     ax.set_xticklabels([f'Ch{idx}' for idx in top_indices])
     ax.legend()
     ax.grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
-    out_path = out_dir / f'exp2_layer{layer_idx}_prune{int(prune_ratio*100)}.png'
+    out_path = out_dir / f'exp2_layer{layer_idx}_{config_name}.png'
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=150)
     plt.close()
@@ -278,7 +278,7 @@ def plot_experiment_3(
     alpha_hidden,
     scaled_hidden,
     layer_idx,
-    prune_ratio,
+    config_name,
     out_dir,
 ):
     """
@@ -300,17 +300,35 @@ def plot_experiment_3(
     ax.plot(sim_scaled_sorted, cdf_scaled, label='OptimalScale', linewidth=2)
     ax.set_xlabel('Cosine Similarity')
     ax.set_ylabel('CDF')
-    ax.set_title(f'Layer {layer_idx} (Prune Ratio {prune_ratio:.0%}): Token-wise Cosine Similarity CDF')
+    ax.set_title(f'Layer {layer_idx} ({config_name}): Token-wise Cosine Similarity CDF')
     ax.legend()
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0.0, 1.0])
     
     plt.tight_layout()
-    out_path = out_dir / f'exp3_layer{layer_idx}_prune{int(prune_ratio*100)}.png'
+    out_path = out_dir / f'exp3_layer{layer_idx}_{config_name}.png'
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=150)
     plt.close()
     print(f'Saved Experiment 3 plot to {out_path}')
+
+
+def parse_layer_topk(layer_topk_str):
+    """解析 layer_topk 字符串，支持多种格式"""
+    # 尝试解析为 JSON
+    import json
+    try:
+        return json.loads(layer_topk_str)
+    except:
+        pass
+    
+    # 尝试解析为逗号分隔的整数
+    try:
+        return [int(x.strip()) for x in layer_topk_str.split(',')]
+    except:
+        pass
+    
+    raise ValueError(f"无法解析 layer_topk: {layer_topk_str}")
 
 
 def main():
@@ -327,14 +345,14 @@ def main():
         "--adapter_base_dir",
         type=str,
         required=True,
-        help="adapter 基目录，包含不同剪枝率的子目录",
+        help="adapter 基目录，包含不同配置的子目录",
     )
     p.add_argument(
-        "--prune_ratios",
-        type=float,
+        "--configs",
+        type=str,
         nargs="+",
-        default=[0.5, 0.6],
-        help="剪枝率列表 (默认: 0.5 0.6)",
+        required=True,
+        help="配置列表，格式为 'name:layer_topk_str'，例如 'config1:3,4,3,4' 或 'high_prune:[2,2,2,2]'",
     )
     p.add_argument(
         "--dataset",
@@ -373,6 +391,12 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
+    # 解析配置
+    configs = {}
+    for cfg in args.configs:
+        name, layer_topk_str = cfg.split(':', 1)
+        configs[name] = parse_layer_topk(layer_topk_str)
+    
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     
@@ -410,16 +434,17 @@ def main():
     if args.layers is None:
         args.layers = [idx for idx, _ in moe_layers]
     
-    for prune_ratio in args.prune_ratios:
-        print(f"\n=== Processing prune ratio: {prune_ratio:.0%} ===")
+    for config_name, layer_topk in configs.items():
+        print(f"\n=== Processing config: {config_name} ===")
+        print(f"Using layer_topk: {layer_topk}")
         
-        k_eff = max(1, int(top_k * (1 - prune_ratio)))
-        layer_topk = [k_eff] * num_moe_layers
-        print(f"Using k_eff = {k_eff} (top_k={top_k})")
+        # 验证 layer_topk 长度
+        if len(layer_topk) != num_moe_layers:
+            raise ValueError(f"layer_topk 长度 {len(layer_topk)} 与 MoE 层数 {num_moe_layers} 不匹配")
         
-        adapter_dir = Path(args.adapter_base_dir) / f"prune{int(prune_ratio*100)}"
+        adapter_dir = Path(args.adapter_base_dir) / config_name
         if not adapter_dir.exists():
-            print(f"Calibrating for prune ratio {prune_ratio:.0%}...")
+            print(f"Calibrating for config {config_name}...")
             calibrator = OptimalScalingLexiSkipQwen3Moe(args.model, adapter_dir=str(adapter_dir))
             calibrator.calib(
                 args.dataset,
@@ -469,9 +494,9 @@ def main():
             alpha_mean, alpha_abs_mean, alpha_var = compute_channel_stats(alpha_h)
             scaled_mean, scaled_abs_mean, scaled_var = compute_channel_stats(scaled_h)
             
-            plot_experiment_1(orig_abs_mean, alpha_abs_mean, scaled_abs_mean, layer_idx, prune_ratio, out_dir)
-            plot_experiment_2(orig_h, alpha_h, scaled_h, layer_idx, prune_ratio, out_dir)
-            plot_experiment_3(orig_h, alpha_h, scaled_h, layer_idx, prune_ratio, out_dir)
+            plot_experiment_1(orig_abs_mean, alpha_abs_mean, scaled_abs_mean, layer_idx, config_name, out_dir)
+            plot_experiment_2(orig_h, alpha_h, scaled_h, layer_idx, config_name, out_dir)
+            plot_experiment_3(orig_h, alpha_h, scaled_h, layer_idx, config_name, out_dir)
         
         del scaled_model
         torch.cuda.empty_cache()
