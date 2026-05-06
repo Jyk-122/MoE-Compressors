@@ -28,9 +28,22 @@ from safetensors.torch import save_file
 
 from methods_skipping.os_lexi_skip.model_qwen3_moe import (
     OptimalScalingLexiSkipQwen3Moe,
+    OptimalScaledLexiQwen3MoeSparseMoeBlock,
     _get_moe_layers,
     _resolve_layer_topk,
 )
+
+
+def _get_moe_layers_patched(model):
+    """获取 MoE 层，同时支持原始和 patch 后的 block"""
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
+    moe_layers = []
+    for i, layer in enumerate(model.model.layers):
+        if hasattr(layer, "mlp") and isinstance(
+            layer.mlp, (Qwen3MoeSparseMoeBlock, OptimalScaledLexiQwen3MoeSparseMoeBlock)
+        ):
+            moe_layers.append((i, layer.mlp))
+    return moe_layers
 
 
 def collect_hidden_states(
@@ -48,7 +61,7 @@ def collect_hidden_states(
     model.eval()
     collected = {}
     
-    moe_layers = _get_moe_layers(model)
+    moe_layers = _get_moe_layers_patched(model)
     moe_indices = [idx for idx, _ in moe_layers]
     
     if collect_layers is None:
@@ -99,7 +112,7 @@ def calib_with_model(
     logger = logging.getLogger("MoECompressor")
     
     model.eval()
-    moe_layers = _get_moe_layers(model)
+    moe_layers = _get_moe_layers_patched(model)
     num_experts = model.config.num_experts
     num_moe_layers = len(moe_layers)
     
@@ -230,7 +243,7 @@ def get_alpha_only_output_with_model(
     """
     model.eval()
     
-    moe_layers = _get_moe_layers(model)
+    moe_layers = _get_moe_layers_patched(model)
     num_moe_layers = len(moe_layers)
     assert len(layer_topk) == num_moe_layers
     
@@ -570,7 +583,7 @@ def main():
         max_context_len=args.max_context_len,
     )
     
-    moe_layers = _get_moe_layers(model)
+    moe_layers = _get_moe_layers_patched(model)
     num_moe_layers = len(moe_layers)
     
     if args.layers is None:
@@ -610,10 +623,10 @@ def main():
         
         print("Patching model with OptimalScale...")
         scaled_compressor = OptimalScalingLexiSkipQwen3Moe(args.model, adapter_dir=str(adapter_dir))
-        # 保存原始 forward 方法
-        original_forwards_patch = {}
+        # 保存原始 mlp block，因为 patch 会替换整个 mlp 对象
+        original_mlps = {}
         for layer_idx, block in moe_layers:
-            original_forwards_patch[layer_idx] = block.forward
+            original_mlps[layer_idx] = block
         
         scaled_model = scaled_compressor.patch(model, layer_topk=layer_topk)
         
@@ -627,10 +640,9 @@ def main():
             max_context_len=args.max_context_len,
         )
         
-        # 恢复原始 forward 方法，移除 patch
-        for layer_idx, block in moe_layers:
-            if layer_idx in original_forwards_patch:
-                block.forward = original_forwards_patch[layer_idx]
+        # 恢复原始 mlp block，移除 patch
+        for layer_idx, block in original_mlps.items():
+            model.model.layers[layer_idx].mlp = block
         
         for layer_idx in args.layers:
             print(f"\n--- Layer {layer_idx} ---")
