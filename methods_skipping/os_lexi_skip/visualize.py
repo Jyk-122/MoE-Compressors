@@ -331,6 +331,138 @@ def parse_layer_topk(layer_topk_str):
     raise ValueError(f"无法解析 layer_topk: {layer_topk_str}")
 
 
+def calib_with_existing_model(
+    model,
+    tokenizer,
+    texts,
+    layer_topk,
+    adapter_dir,
+    max_context_len=2048,
+    batch_size=1,
+    device="cuda",
+):
+    """使用已有的模型进行 calib，避免重复加载"""
+    import types
+    import logging
+    from safetensors.torch import save_file
+    from methods_skipping.os_lexi_skip.model_qwen3_moe import _resolve_layer_topk, _get_moe_layers
+    
+    logger = logging.getLogger("MoECompressor")
+    
+    model.eval()
+    moe_layers = _get_moe_layers(model)
+    num_experts = model.config.num_experts
+    num_moe_layers = len(moe_layers)
+    
+    layer_topk = _resolve_layer_topk({"layer_topk": layer_topk}, num_moe_layers)
+    logger.info(f"Using per-layer topK: {layer_topk}")
+
+    A_stats: dict[int, torch.Tensor] = {}
+    B_stats: dict[int, torch.Tensor] = {}
+
+    for (decoder_layer_idx, block), k_eff in zip(moe_layers, layer_topk):
+        def _forward(self_block, hidden_states: torch.Tensor, _layer=decoder_layer_idx, _k=k_eff):
+            bsz, seq_len, hidden_dim = hidden_states.shape
+            hidden_reshaped = hidden_states.view(-1, hidden_dim)
+            num_tokens = hidden_reshaped.shape[0]
+
+            import torch.nn.functional as F
+            router_logits = F.linear(hidden_reshaped, self_block.gate.weight)
+            router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+            router_top_value, router_indices = torch.topk(router_probs, self_block.gate.top_k, dim=-1)
+
+            orig_routing_weights = router_top_value.clone()
+            if self_block.gate.norm_topk_prob:
+                orig_routing_weights = orig_routing_weights / orig_routing_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+            router_top_value_kept, router_indices_kept = torch.topk(router_probs, _k, dim=-1)
+            if self_block.gate.norm_topk_prob:
+                kept_routing_weights = (
+                    router_top_value_kept / router_top_value_kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                ).to(router_probs.dtype)
+            else:
+                kept_routing_weights = router_top_value_kept
+
+            V = torch.zeros((num_tokens, num_experts, hidden_dim), dtype=torch.float32, device=hidden_states.device)
+            Y = torch.zeros((num_tokens, hidden_dim), dtype=torch.float32, device=hidden_states.device)
+            
+            final_output = torch.zeros_like(hidden_reshaped)
+
+            for expert_idx in range(num_experts):
+                token_idx_orig, top_k_pos_orig = torch.where(router_indices == expert_idx)
+                if token_idx_orig.numel() > 0:
+                    current_state = hidden_reshaped[token_idx_orig]
+                    gate, up = F.linear(current_state, self_block.experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                    expert_output = F.linear(self_block.experts.act_fn(gate) * up, self_block.experts.down_proj[expert_idx])
+                    alpha_orig = orig_routing_weights[token_idx_orig, top_k_pos_orig, None]
+                    Y.index_add_(0, token_idx_orig, expert_output * alpha_orig)
+                    final_output.index_add_(0, token_idx_orig, (expert_output * alpha_orig).to(final_output.dtype))
+                
+                token_idx_kept, top_k_pos_kept = torch.where(router_indices_kept == expert_idx)
+                if token_idx_kept.numel() > 0:
+                    current_state = hidden_reshaped[token_idx_kept]
+                    gate, up = F.linear(current_state, self_block.experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                    expert_output = F.linear(self_block.experts.act_fn(gate) * up, self_block.experts.down_proj[expert_idx])
+                    alpha_kept = kept_routing_weights[token_idx_kept, top_k_pos_kept, None]
+                    V[token_idx_kept, expert_idx, :] = expert_output * alpha_kept
+
+            if _layer not in A_stats:
+                A_stats[_layer] = torch.zeros((hidden_dim, num_experts, num_experts), dtype=torch.float64, device='cpu')
+                B_stats[_layer] = torch.zeros((hidden_dim, num_experts), dtype=torch.float64, device='cpu')
+
+            chunk_size = 1024
+            for start_d in range(0, hidden_dim, chunk_size):
+                end_d = min(hidden_dim, start_d + chunk_size)
+                V_chunk = V[:, :, start_d:end_d]
+                Y_chunk = Y[:, start_d:end_d]
+                
+                A_stats[_layer][start_d:end_d] += torch.einsum('ted,tfd->def', V_chunk, V_chunk).cpu()
+                B_stats[_layer][start_d:end_d] += torch.einsum('ted,td->de', V_chunk, Y_chunk).cpu()
+
+            return final_output.reshape(bsz, seq_len, hidden_dim)
+
+        block.forward = types.MethodType(_forward, block)
+
+    n_batches = (len(texts) + batch_size - 1) // batch_size
+    for start in tqdm(range(0, len(texts), batch_size), total=n_batches, desc="Calibration Forward (os_lexi_skip)"):
+        batch_texts = texts[start : start + batch_size]
+        inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=max_context_len)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            model(**inputs)
+
+    logger.info("Solving closed-form Normal Equations for S matrices (os_lexi_skip)...")
+    state: dict[str, torch.Tensor] = {"meta.adapter_version": torch.tensor(1, dtype=torch.int32)}
+    state["meta.layer_topk"] = torch.tensor(layer_topk, dtype=torch.int32)
+    
+    lambda_reg = 1e-4
+    
+    for layer_idx in A_stats.keys():
+        A = A_stats[layer_idx]
+        B = B_stats[layer_idx].unsqueeze(-1)
+        
+        eye = torch.eye(num_experts, dtype=torch.float64).unsqueeze(0)
+        A_reg = A + lambda_reg * eye
+        
+        S_raw = torch.linalg.solve(A_reg, B).squeeze(-1)
+        S_matrix = S_raw.transpose(0, 1)
+        
+        active_expert_mask = A.sum(dim=0).diagonal() > 1e-8
+        S_matrix[~active_expert_mask, :] = 1.0
+        
+        state[f"layer_{layer_idx}.expert_S_matrix"] = S_matrix.float().contiguous()
+
+    adapter_path = Path(adapter_dir)
+    adapter_path.mkdir(parents=True, exist_ok=True)
+    save_file(state, str(adapter_path / "adapter.safetensors"))
+    logger.info(f"Calibration completed. Adapters saved to {adapter_path / 'adapter.safetensors'}")
+    
+    # 恢复原始的 forward 方法，因为我们要复用这个模型
+    # 需要重新加载原始模型来恢复，或者保存原始的 forward 方法
+    # 这里我们选择重新加载模型，避免复杂的 hook 管理
+    return None
+
+
 def main():
     p = argparse.ArgumentParser(
         description="OptimalScale 可解释性可视化",
@@ -434,7 +566,7 @@ def main():
     if args.layers is None:
         args.layers = [idx for idx, _ in moe_layers]
     
-    for config_name, layer_topk in configs.items():
+    for config_idx, (config_name, layer_topk) in enumerate(configs.items()):
         print(f"\n=== Processing config: {config_name} ===")
         print(f"Using layer_topk: {layer_topk}")
         
@@ -445,13 +577,29 @@ def main():
         adapter_dir = Path(args.adapter_base_dir) / config_name
         if not adapter_dir.exists():
             print(f"Calibrating for config {config_name}...")
-            calibrator = OptimalScalingLexiSkipQwen3Moe(args.model, adapter_dir=str(adapter_dir))
-            calibrator.calib(
-                args.dataset,
-                max_calib_samples=args.max_samples,
+            # 使用已有的模型进行 calib，避免重复加载
+            calib_with_existing_model(
+                orig_model,
+                tokenizer,
+                texts,
+                layer_topk,
+                str(adapter_dir),
                 max_context_len=args.max_context_len,
-                layer_topk=layer_topk,
+                batch_size=1,
+                device=device,
             )
+            # calib 之后重新加载原始模型，因为我们修改了它的 forward 方法
+            del orig_model
+            torch.cuda.empty_cache()
+            print("Reloading original model after calibration...")
+            orig_model = AutoModelForCausalLM.from_pretrained(
+                args.model,
+                torch_dtype=torch.bfloat16,
+                device_map=device,
+                trust_remote_code=True,
+            )
+            # 重新收集原始 hidden states（虽然可能不需要，但为了安全）
+            # 实际上我们已经保存了 orig_hiddens，所以可以跳过
         
         print("Collecting alpha-only outputs...")
         alpha_hiddens = get_alpha_only_output(
