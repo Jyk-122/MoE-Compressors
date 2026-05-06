@@ -153,10 +153,10 @@ def _compute_perplexity_with_config(
     Returns:
         perplexity: float
     """
-    # Create temporary patched model for evaluation
+    # Save original blocks (reference only, no copy)
     original_blocks = {}
     for j, layer_idx in enumerate(moe_indices):
-        original_blocks[layer_idx] = copy.deepcopy(model.model.layers[layer_idx].mlp)
+        original_blocks[layer_idx] = model.model.layers[layer_idx].mlp
     
     # Patch layers with config
     class TempTopKBlock(torch.nn.Module):
