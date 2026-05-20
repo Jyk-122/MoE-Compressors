@@ -60,6 +60,8 @@ from methods_skipping.sgc_skip.model_qwen3_moe import SGCSkipQwen3Moe
 from methods_skipping.os_skip.model_qwen3_moe import OptimalScalingSkippingQwen3Moe
 from methods_skipping.os_lexi_skip.model_qwen3_moe import OptimalScalingLexiSkipQwen3Moe
 from methods_skipping.alloc_skip.model_qwen3_moe import AllocSkipQwen3Moe
+from methods_skipping.ot_scalar_skip.model_qwen3_moe import OTScalarSkipQwen3Moe
+from methods_skipping.ot_vector_skip.model_qwen3_moe import OTVectorSkipQwen3Moe
 
 from transformers import AutoConfig
 from utils.method_kwargs import parse_json_object
@@ -81,6 +83,8 @@ METHOD_REGISTRY: dict[str, dict[str, type]] = {
     "os_skip": {"qwen3_moe": OptimalScalingSkippingQwen3Moe},
     "os_lexi_skip": {"qwen3_moe": OptimalScalingLexiSkipQwen3Moe},
     "alloc_skip": {"qwen3_moe": AllocSkipQwen3Moe},
+    "ot_scalar_skip": {"qwen3_moe": OTScalarSkipQwen3Moe},
+    "ot_vector_skip": {"qwen3_moe": OTVectorSkipQwen3Moe},
 }
 
 

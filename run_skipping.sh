@@ -6,7 +6,7 @@
 #   bash run_skipping.sh eval    # 多卡评测（accelerate）
 #
 # 关键环境变量:
-#   METHOD           skipping 方法名（topk_skip | topp_skip | sere_skip | modes_skip | lexi_skip | reap_skipping | replace_graph_skip | sgc_skip | os_skip | os_lexi_skip | alloc_skip，必填）
+#   METHOD           skipping 方法名（topk_skip | topp_skip | sere_skip | modes_skip | lexi_skip | reap_skipping | replace_graph_skip | sgc_skip | os_skip | os_lexi_skip | alloc_skip | ot_scalar_skip | ot_vector_skip，必填）
 #   MODEL            模型路径或 HF 名称
 #   CALIB_KWARGS     calib 参数 JSON，默认 {}
 #   PATCH_KWARGS     eval 参数 JSON（topk_skip 默认 {"k":2}；topp_skip / reap_skipping / sgc_skip / os_skip 默认 {"threshold":0.8}；sere_skip 默认 {"select_top_k":2,"threshold":0.3}；modes_skip 默认 {"tau":0.05}；replace_graph_skip 默认 {"coverage_threshold":0.9}；lexi_skip / os_lexi_skip 无默认，lexi_skip 须显式如 {"compute_reduction":0.25}；os_lexi_skip 须显式如 {"layer_topk": [3,4,3,4,...]}）
@@ -53,6 +53,43 @@
 #     EVAL_ADAPTER_DIR=./outputs/.../alloc_skip PATCH_KWARGS='{"compute_reduction":0.5,"enable_alloc_t":true,"k_base":1}' METHOD=alloc_skip bash run_skipping.sh eval
 #     # 不同预算可复用同一个 adapter，只改 compute_reduction（0.25/0.4/0.5）各跑一次 eval
 #     # 也可直接指定 target_budget 或 layer_k 列表
+#
+#   OT Scalar Skip（ot_scalar_skip）：仅对 router 概率分布 alpha 做标准最优传输（Sinkhorn）重分配，无向量级补偿。
+#     核心：基于专家在真实输入上的输出构建代价矩阵 C，用 Sinkhorn 迭代求解标准 OT 将跳过专家的概率质量重分配给保留专家。
+#     参数：
+#       layer_topk: 每层保留专家数列表，如 [3,3,3,3,3,3]（与 budget 二选一）
+#       budget: 全局平均 k_eff，如 3.0，自动根据代价矩阵分配每层最优 k_eff（与 layer_topk 二选一）
+#       ot_reg: OT 熵正则化温度（可选，默认 0.1），越小越接近硬分配，越大越均匀
+#       sinkhorn_iters: Sinkhorn 迭代次数（可选，默认 50）
+#       max_cost_samples: 计算代价矩阵时采样的 hidden states 数量（可选，默认 128）
+#     # calib（layer_topk 模式）：计算代价矩阵 C 并保存 adapter
+#     CALIB_KWARGS='{"layer_topk": [3,3,3,3,3,3]}' METHOD=ot_scalar_skip bash run_skipping.sh calib
+#     # calib（budget 模式）：给定全局 budget，自动分配每层 k_eff
+#     CALIB_KWARGS='{"budget": 3.0}' METHOD=ot_scalar_skip bash run_skipping.sh calib
+#     # eval（layer_topk 模式）：加载 C，推理时 Sinkhorn OT 重分配 router 权重
+#     EVAL_ADAPTER_DIR=./outputs/.../ot_scalar_skip PATCH_KWARGS='{"layer_topk": [3,3,3,3,3,3]}' METHOD=ot_scalar_skip bash run_skipping.sh eval
+#     # eval（budget 模式）：patch 时也可重新指定 budget
+#     EVAL_ADAPTER_DIR=./outputs/.../ot_scalar_skip PATCH_KWARGS='{"budget": 3.0}' METHOD=ot_scalar_skip bash run_skipping.sh eval
+#     # 调 ot_reg / sinkhorn_iters
+#     EVAL_ADAPTER_DIR=./outputs/.../ot_scalar_skip PATCH_KWARGS='{"layer_topk": [3,3,3,3,3,3],"ot_reg":0.05,"sinkhorn_iters":100}' METHOD=ot_scalar_skip bash run_skipping.sh eval
+#
+#   OT Vector Skip（ot_vector_skip）：向量级 OT，tau[i,j,d] = T[i,j] * S[i,d]。
+#     T：Sinkhorn OT 标量传输重分配 router 权重（同 ot_scalar_skip）
+#     S：逐专家逐维度缩放向量，由闭式解（线性回归）在校准集上计算，补偿向量级特征不匹配
+#     参数：
+#       layer_topk: 每层保留专家数列表（与 budget 二选一）
+#       budget: 全局平均 k_eff（与 layer_topk 二选一）
+#       ot_reg: OT 熵正则化温度（可选，默认 0.1）
+#       sinkhorn_iters: Sinkhorn 迭代次数（可选，默认 50）
+#       max_cost_samples: 计算代价矩阵时采样的 hidden states 数量（可选，默认 128）
+#     # calib（layer_topk 模式）：计算 C + 跑校准前向收集 A/B 统计量 → 闭式解求 S
+#     CALIB_KWARGS='{"layer_topk": [3,3,3,3,3,3]}' METHOD=ot_vector_skip bash run_skipping.sh calib
+#     # calib（budget 模式）：Pass1 收集 hidden states → 计算 C → 分配 k_eff → Pass2 收集 A/B → 求 S
+#     CALIB_KWARGS='{"budget": 3.0}' METHOD=ot_vector_skip bash run_skipping.sh calib
+#     # eval：加载 C + S，推理时 Sinkhorn OT 重分配 + S 逐点缩放
+#     EVAL_ADAPTER_DIR=./outputs/.../ot_vector_skip PATCH_KWARGS='{"layer_topk": [3,3,3,3,3,3]}' METHOD=ot_vector_skip bash run_skipping.sh eval
+#     # 消融对比：ot_scalar_skip（纯 OT，无 S） vs ot_vector_skip（OT + S） vs os_lexi_skip（纯 S，无 OT）
+#     # 三者用相同的 layer_topk 或 budget，对比 S 矩阵和 OT 各自的增益
 
 export HF_ALLOW_CODE_EVAL=1
 export HF_DATASETS_OFFLINE=1
@@ -117,7 +154,7 @@ if [ -z "$MODE" ] || { [ "$MODE" != "calib" ] && [ "$MODE" != "eval" ]; }; then
 fi
 
 if [ -z "$METHOD" ]; then
-  echo "错误: 必须显式设置 METHOD（topk_skip / topp_skip / sere_skip / modes_skip / lexi_skip / reap_skipping / replace_graph_skip / sgc_skip / os_skip / os_lexi_skip / alloc_skip）"
+  echo "错误: 必须显式设置 METHOD（topk_skip / topp_skip / sere_skip / modes_skip / lexi_skip / reap_skipping / replace_graph_skip / sgc_skip / os_skip / os_lexi_skip / alloc_skip / ot_scalar_skip / ot_vector_skip）"
   echo "示例: METHOD=topk_skip bash run_skipping.sh eval"
   exit 1
 fi

@@ -404,8 +404,10 @@ def plot_experiment_2(
     orig_norm = orig_hidden.norm(dim=0).numpy()
     top_indices = np.argsort(orig_norm)[::-1][:top_k]
     
-    mse_alpha = ((alpha_hidden[:, top_indices] - orig_hidden[:, top_indices]) ** 2).mean(dim=0).numpy()
-    mse_scaled = ((scaled_hidden[:, top_indices] - orig_hidden[:, top_indices]) ** 2).mean(dim=0).numpy()
+    top_indices_t = torch.from_numpy(top_indices)
+    
+    mse_alpha = ((alpha_hidden[:, top_indices_t] - orig_hidden[:, top_indices_t]) ** 2).mean(dim=0).numpy()
+    mse_scaled = ((scaled_hidden[:, top_indices_t] - orig_hidden[:, top_indices_t]) ** 2).mean(dim=0).numpy()
     
     x = np.arange(top_k)
     width = 0.35
