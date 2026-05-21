@@ -286,7 +286,7 @@ def get_alpha_only_output_with_model(
                 )
                 selected_indices[:, :_k] = router_indices_kept
                 
-                num_experts = self_block.num_experts
+                num_experts = self_block.experts.num_experts
                 for expert_idx in range(num_experts):
                     token_idx, top_k_pos = torch.where(selected_indices == expert_idx)
                     if token_idx.numel() == 0:
@@ -330,6 +330,7 @@ def get_alpha_only_output_with_model(
 
 def compute_channel_stats(hidden_states):
     """计算每个通道的均值和方差"""
+    hidden_states = hidden_states.float()
     mean = hidden_states.mean(dim=0).numpy()
     abs_mean = hidden_states.abs().mean(dim=0).numpy()
     var = hidden_states.var(dim=0).numpy()
@@ -401,10 +402,13 @@ def plot_experiment_2(
     """
     import matplotlib.pyplot as plt
     
+    orig_hidden = orig_hidden.float()
+    alpha_hidden = alpha_hidden.float()
+    scaled_hidden = scaled_hidden.float()
+    
     orig_norm = orig_hidden.norm(dim=0).numpy()
     top_indices = np.argsort(orig_norm)[::-1][:top_k]
-    
-    top_indices_t = torch.from_numpy(top_indices)
+    top_indices_t = torch.from_numpy(top_indices.copy())
     
     mse_alpha = ((alpha_hidden[:, top_indices_t] - orig_hidden[:, top_indices_t]) ** 2).mean(dim=0).numpy()
     mse_scaled = ((scaled_hidden[:, top_indices_t] - orig_hidden[:, top_indices_t]) ** 2).mean(dim=0).numpy()
@@ -444,6 +448,10 @@ def plot_experiment_3(
     实验3：Token级余弦相似度CDF曲线
     """
     import matplotlib.pyplot as plt
+    
+    orig_hidden = orig_hidden.float()
+    alpha_hidden = alpha_hidden.float()
+    scaled_hidden = scaled_hidden.float()
     
     sim_alpha = compute_cosine_similarity(orig_hidden, alpha_hidden)
     sim_scaled = compute_cosine_similarity(orig_hidden, scaled_hidden)
