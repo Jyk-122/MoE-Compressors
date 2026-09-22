@@ -84,19 +84,27 @@ def _load_one(config, device):
     from transformers import AutoModelForCausalLM, AutoProcessor
     from prefetch.backbone.quantization import quantize_experts
     base = config["model"]
-    kwargs = dict(trust_remote_code=True, torch_dtype=torch.bfloat16,
-                  device_map={"": "cpu"}, key_mapping=KEY_MAPPING)
-    if base.get("attn_implementation"):
-        kwargs["attn_implementation"] = base["attn_implementation"]
-    model = AutoModelForCausalLM.from_pretrained(base["path"], **kwargs)
-    model.requires_grad_(False)
     quantization = base.get("quantization", "none")
+    checkpoint = base.get("nf4_checkpoint")
+    blocksize = base.get("nf4_blocksize", 64)
     source_parameters = 0
-    if quantization == "experts_nf4":
-        source_parameters = quantize_experts(model, device)
-    elif quantization != "none":
+    if quantization not in {"none", "experts_nf4"}:
         raise ValueError("quantization must be none or experts_nf4")
-    model.to(device)
+    if checkpoint:
+        if quantization != "experts_nf4":
+            raise ValueError("nf4_checkpoint requires model.quantization=experts_nf4")
+        from prefetch.backbone.nf4_checkpoint import load_nf4_checkpoint
+        model, source_parameters = load_nf4_checkpoint(base, device)
+    else:
+        kwargs = dict(trust_remote_code=True, torch_dtype=torch.bfloat16,
+                      device_map={"": "cpu"}, key_mapping=KEY_MAPPING)
+        if base.get("attn_implementation"):
+            kwargs["attn_implementation"] = base["attn_implementation"]
+        model = AutoModelForCausalLM.from_pretrained(base["path"], **kwargs)
+        model.requires_grad_(False)
+        if quantization == "experts_nf4":
+            source_parameters = quantize_experts(model, device, blocksize)
+        model.to(device)
     gc.collect()
     processor = AutoProcessor.from_pretrained(base["path"], trust_remote_code=True)
     lora = config.get("lora", {})
@@ -117,6 +125,8 @@ def _load_one(config, device):
         raise ValueError("stage=lora requires lora.enabled=true")
     model.eval()
     report = dict(quantization=quantization, quantized_source_parameters=source_parameters,
+                  nf4_blocksize=blocksize if quantization == "experts_nf4" else None,
+                  nf4_checkpoint=checkpoint,
                   allocated_gib=torch.cuda.memory_allocated(device) / 2**30,
                   peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30)
     print(json.dumps({"loading": report}), flush=True)
@@ -124,8 +134,9 @@ def _load_one(config, device):
 
 
 def load_model(config, device):
-    """Serial startup across ranks bounds aggregate host RAM during CPU loading."""
-    if dist.is_initialized() and config["model"].get("serial_load", True):
+    """BF16 loading can be serial; packed NF4 checkpoints load independently per rank."""
+    base = config["model"]
+    if dist.is_initialized() and base.get("serial_load", True) and not base.get("nf4_checkpoint"):
         result = None
         for rank in range(dist.get_world_size()):
             if dist.get_rank() == rank:

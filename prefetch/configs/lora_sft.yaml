@@ -4,7 +4,9 @@ output_dir: prefetch/outputs/attention_lora
 model:
   path: /path/to/full/BF16/checkpoint
   quantization: experts_nf4
-  serial_load: true
+  nf4_blocksize: 64
+  nf4_checkpoint: null
+  serial_load: true         # Applies only when loading from the BF16 source.
 lora:
   enabled: true
   checkpoint: null

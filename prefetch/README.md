@@ -105,12 +105,6 @@ python -m prefetch.datasets.prepare tulu --dataset /data1/jiangyikun/datasets/tu
 
 Tulu 默认使用 allenai/tulu-3-sft-mixture，按稳定 ID 留出 1% 验证集。Cog 和 Tulu 均支持 --limit N，限制划分 train/validation 之前的样本总数；省略时处理全量，设为 0 时输出空数据集。Cog 的每条 caption 或完整 conversation 各算一条样本，中英文分别计数。按子数据集、图片文件名排序，同图先处理英文再处理中文；达到 limit 即停止，因此最后一张图可能只保留部分标注。新的数据实验建议使用新输出目录。
 
-例如，只准备前 1000 条 Cog 样本用于调试：
-
-~~~bash
-python -m prefetch.datasets.prepare cog \
-  --root /datasets/CogVLM-SFT-311K --output prefetch/data/cog_debug --limit 1000
-~~~
 
 接着用真实 processor 校验 assistant span，并过滤超长样本；长度/图像设置须与训练 YAML 相同：
 
@@ -134,7 +128,7 @@ done
 
 ## 3. 单卡检查
 
-先将 model.quantization 设为 none，分别检查文本和图像：
+先将 model.quantization 设为 none、model.nf4_checkpoint 设为 null，分别检查文本和图像：
 
 ~~~bash
 CUDA_VISIBLE_DEVICES=0 python -m prefetch.examples.smoke_test \
@@ -168,7 +162,7 @@ NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.
   --resume prefetch/outputs/same_token_m1/checkpoint-100
 ~~~
 
-每卡一份基模，DDP 仅管理可训练参数。8 卡×微批 1×累积 8 的有效训练 batch 为 64，与端侧 batch=1 的推理设定分别定义。默认按 rank 串行加载，CPU 仍需容纳一份 BF16 基模及缓冲，启动耗时需实测。
+每卡一份基模，DDP 仅管理可训练参数。8 卡×微批 1×累积 8 的有效训练 batch 为 64，与端侧 batch=1 的推理设定分别定义。从 BF16 源加载时，serial_load 默认按 rank 串行执行，CPU 需容纳一份 BF16 基模及缓冲。配置 nf4_checkpoint 后，各 rank 并行读取已量化权重，serial_load 不再参与；用法见下节。
 
 router 阶段基模与 LoRA 冻结，基模处于 eval/no_grad。patch 在独立梯度作用域内执行 prerouter 和预测对齐，source 特征、teacher 标签均 detach；模型前向结束后，training/train.py 计算各目标层平均 KL，再反向。验证损失与覆盖率按有效 token 汇总。LoRA 阶段可启用 non-reentrant gradient checkpointing。
 
@@ -184,9 +178,87 @@ adapter 仅适配语言 decoder 的 self_attn.qkv_proj/o_proj。采用本工程�
 
 model.quantization 可选 none / experts_nf4。后者将三维 routed-expert Parameter 显式适配为每专家两组 bitsandbytes Linear4bit；gate、shared experts、attention 和视觉模块沿用原精度。通用 HF load_in_4bit 不会自动覆盖这些三维专家参数。
 
+### 分组大小
+
+`model.nf4_blocksize` 默认 64，即每个专家矩阵展平后，每 64 个连续权重共享一组缩放信息。这不是按输出通道单独分组。可设置 64、128、256、512、1024、2048、4096；范围依据 [bitsandbytes 0.48.2 quantize_4bit](https://github.com/bitsandbytes-foundation/bitsandbytes/blob/0.48.2/bitsandbytes/functional.py)。双重量化 compress_statistics 保持开启，其中缩放系数的二级分组为 256，与权重的 blocksize 独立。
+
+较小分组通常降低量化误差，同时增加缩放元数据；任务精度仍需实测。建议先比较 64 与 128。加载报告和 smoke_test 会输出并检查实际 blocksize。
+
 当前配置量化覆盖 26,424,115,200 个源参数，其 BF16 载荷约 49.2 GiB、4-bit 原始载荷约 12.3 GiB，另加量化状态、其余权重、激活与训练状态。实际转换数和 CUDA allocator 统计记录在 loading_report.json。
 
 NF4 路径以显存和语义对齐为目标，逐专家实现的吞吐需实测。bitsandbytes 0.48.2 / H20 / Torch 2.9 的组合及 LoRA 所需的输入反向能力必须通过 smoke test。每种量化配置以自身实际路由为真值，评测会核对 checkpoint 的基模和 adapter。
+
+### 一次量化，重复加载
+
+先编辑 YAML 中的 model.path，在单卡上导出纯基模。这个入口会关闭 LoRA，并从 BF16 源创建新的 NF4 权重：
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0 python -m prefetch.backbone.export_nf4 \
+  --config prefetch/configs/same_token.yaml \
+  --blocksize 64 --output prefetch/outputs/base_nf4_b64
+~~~
+
+输出目录必须是新目录。产物包括每个 MoE 的 packed uint8 权重、完整量化状态、其余原精度权重分片，以及 nf4_config.json。它是本工程的基模 checkpoint，不包含 prerouter 或 LoRA；LoRA 仍由 lora.checkpoint 单独加载。manifest 最后写入，导出中断时请使用新目录重试。
+
+随后在训练、评测或 demo 使用的 YAML 中设置：
+
+~~~yaml
+model:
+  path: /path/to/full/BF16/checkpoint
+  quantization: experts_nf4
+  nf4_blocksize: 64
+  nf4_checkpoint: prefetch/outputs/base_nf4_b64
+  serial_load: true
+  router_forward_kwargs: {logits_to_keep: 1}
+~~~
+
+将字段合入原配置，其余设置保留。加载时从 model.path 读取配置、remote code 和 processor，创建空参数骨架，然后直接恢复已量化权重；不读取 BF16 模型权重，也不重新量化。请保留原目录及不可变版本，model.path 须与导出时一致。nf4_blocksize 必须与 checkpoint 一致；要比较 128，请另行导出并使用独立目录。
+
+NF4 checkpoint 由本工程加载，不直接传给通用 AutoModel.from_pretrained。加载时按 MoE/原精度分片读取，CPU 不再需要完整 BF16 权重；每卡仍保存完整 NF4 基模，多卡并发读盘吞吐需实测。首次导出仍需 BF16 源权重所需的 CPU 内存。
+
+服务器上先验证真实 bitsandbytes 保存/恢复和输入反向，再运行完整模型 smoke_test：
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0 python -m pytest \
+  prefetch/tests/test_quantization.py prefetch/tests/test_nf4_checkpoint.py -q
+
+CUDA_VISIBLE_DEVICES=0 python -m prefetch.examples.smoke_test \
+  --config prefetch/configs/same_token.yaml \
+  --sample-file prefetch/data/cog/train.filtered.jsonl
+~~~
+
+CUDA roundtrip 测试覆盖 blocksize=64/128，检查 packed 权重、量化状态和输出一致，并检查恢复后的输入梯度。本地 CPU 测试只验证序列化流程与加载分支，不能替代真实 NF4 CUDA 验证。
+
+### 验证基模输出与量化精度
+
+单 prompt demo 直接运行基模，不安装 prerouter 或 LoRA。默认按 YAML 选择量化及 checkpoint；可用 --quantization 覆盖。纯文本省略 --image：
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0 python -m prefetch.examples.infer_base_demo \
+  --config prefetch/configs/same_token.yaml --quantization none \
+  --prompt '请描述这张图片，并说明判断依据。' --image /datasets/example.jpg \
+  --output prefetch/outputs/base_check/bf16.json
+
+CUDA_VISIBLE_DEVICES=0 python -m prefetch.examples.infer_base_demo \
+  --config prefetch/configs/same_token.yaml --quantization experts_nf4 \
+  --prompt '请描述这张图片，并说明判断依据。' --image /datasets/example.jpg \
+  --output prefetch/outputs/base_check/nf4.json
+~~~
+
+两个进程顺序执行，避免同时驻留两份模型。none 会忽略 YAML 中的 nf4_checkpoint；experts_nf4 在配置了 checkpoint 时直接加载，否则现场量化。两次使用同一预处理与 greedy decoding，但合理回答可能不同；单条回答用于检查可用性，不代表任务精度保持。
+
+定量比较使用固定验证集，按 assistant 的有效 next-token 数加权计算 NLL 和 perplexity；越低越好。以下命令分别运行 BF16/NF4，默认评估前 128 条，也可以换成 Cog 的验证集：
+
+~~~bash
+for quant in none experts_nf4; do
+  CUDA_VISIBLE_DEVICES=0 python -m prefetch.evaluation.evaluate_base \
+    --config prefetch/configs/same_token.yaml --quantization "$quant" \
+    --sample-file prefetch/data/tulu/validation.filtered.jsonl --limit 128 \
+    --output "prefetch/outputs/base_check/$quant-nll.json"
+done
+~~~
+
+比较 assistant_nll 的 NF4−BF16 差值和 assistant_perplexity 的相对变化，并确认 examples/tokens 一致。这里的 PPL 是给定指令/图像、只统计 assistant 标签（含结束 token）的条件 PPL，不等同于通用语料 PPL 或任务准确率。正式精度结论仍需固定任务集上的正确率/生成质量指标；prefetch Recall/FullCoverage 衡量预测路由的覆盖率，不能替代基模精度评测。
 
 ## 6. 评测与单 prompt demo
 
@@ -232,9 +304,11 @@ Recall@E 与 FullCoverage@E 对有效样本必须为 1，空计数输出 null。
 | evaluation/routing.py / evaluation/metrics.py | 覆盖率计数、trace 与汇总报告 |
 | prerouter/configuration.py / prerouter/checkpoint.py | 预测配置、head 保存加载 |
 | backbone/loading.py / backbone/quantization.py / backbone/structure.py | 原模型、attention adapter、NF4、MoE 结构与路由评分 |
+| backbone/export_nf4.py / backbone/nf4_checkpoint.py | NF4 基模导出、分片权重与量化状态恢复 |
 | datasets/prepare.py / datasets/dataset.py | 规范化、过滤、processor、mask |
 | training/train.py / training/runtime.py | KL 损失、两阶段训练、DDP、保存恢复、周期验证 |
 | evaluation/evaluate.py / evaluation/plot.py | 独立评测与曲线 |
+| examples/infer_base_demo.py / evaluation/evaluate_base.py | 纯基模 prompt 推理、固定验证集 NLL/PPL |
 | examples/infer_prefetch_demo.py / examples/smoke_test.py | 单 prompt 演示、真实模型检查 |
 
-checkpoint 保存 head 或 LoRA、运行配置、optimizer/scheduler、各 rank RNG、epoch 和下个 batch 位置。head 模块归 source block 所有，predictor.safetensors 仍采用目标 MoE 序号作为键；已有 target-keyed head checkpoint 可加载，optimizer 参数顺序保持配置中的 pair 顺序。基模仍从 model.path 加载，请保留不可变的基模与 adapter 版本。当前支持 n_group=1、常规 attention；换模型结构前检查层映射和执行语义。
+训练 checkpoint 保存 head 或 LoRA、运行配置、optimizer/scheduler、各 rank RNG、epoch 和下个 batch 位置。head 模块归 source block 所有，predictor.safetensors 仍采用目标 MoE 序号作为键；已有 target-keyed head checkpoint 可加载，optimizer 参数顺序保持配置中的 pair 顺序。基模权重由 model.path 或独立的 model.nf4_checkpoint 提供，请保留不可变的基模、NF4 checkpoint 与 adapter 版本。当前支持 n_group=1、常规 attention；换模型结构前检查层映射和执行语义。

@@ -7,10 +7,13 @@ import pytest
 
 @pytest.mark.parametrize("name", [
     "prefetch.datasets.prepare",
+    "prefetch.backbone.export_nf4",
     "prefetch.training.train",
     "prefetch.evaluation.evaluate",
+    "prefetch.evaluation.evaluate_base",
     "prefetch.evaluation.plot",
     "prefetch.examples.infer_prefetch_demo",
+    "prefetch.examples.infer_base_demo",
     "prefetch.examples.smoke_test",
 ])
 def test_cli_help(name, monkeypatch, capsys):

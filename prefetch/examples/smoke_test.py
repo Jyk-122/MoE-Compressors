@@ -62,10 +62,11 @@ def main():
     if nf4 is not None:
         linear = nf4.gate_up[0]
         assert linear.weight.dtype == torch.uint8 and linear.weight.quant_state is not None
+        assert linear.weight.quant_state.blocksize == config["model"].get("nf4_blocksize", 64)
         values = torch.randn(2, linear.in_features, device=device, dtype=torch.bfloat16, requires_grad=True)
         linear(values).float().square().mean().backward()
         assert values.grad is not None and torch.isfinite(values.grad).all() and values.grad.abs().sum() > 0
-        print("NF4 packed weight and input gradient checked")
+        print(f"NF4 packed weight and input gradient checked; blocksize={linear.weight.quant_state.blocksize}")
     print(json.dumps(dict(loss=float(loss.detach()), trainable_tensors=len(gradients), loading=loading,
                           peak_gpu_gib=torch.cuda.max_memory_allocated(device) / 2**30), indent=2))
     if state:

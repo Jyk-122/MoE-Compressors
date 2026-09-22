@@ -26,9 +26,12 @@ def experiment_config(config_path, checkpoint):
     if config is None:
         raise ValueError("Provide --config or a checkpoint containing run_config.json")
     if saved:
-        for key in ("path", "quantization"):
+        for key in ("path", "quantization", "nf4_checkpoint"):
             if config["model"].get(key) != saved["model"].get(key):
                 raise ValueError(f"Checkpoint base model.{key} differs from evaluation config")
+        if (config["model"].get("quantization") == "experts_nf4"
+                and config["model"].get("nf4_blocksize", 64) != saved["model"].get("nf4_blocksize", 64)):
+            raise ValueError("Checkpoint base model.nf4_blocksize differs from evaluation config")
         if config.get("lora") != saved.get("lora"):
             raise ValueError("Use the same attention adapter as the predictor's training run")
     config["stage"] = "router"
