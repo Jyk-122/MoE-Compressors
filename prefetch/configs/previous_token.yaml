@@ -1,0 +1,46 @@
+seed: 42
+stage: router
+output_dir: prefetch/outputs/previous_token_m1
+model:
+  path: /path/to/full/BF16/checkpoint
+  quantization: experts_nf4
+  serial_load: true
+  router_forward_kwargs: {logits_to_keep: 1}
+lora:
+  enabled: false
+  checkpoint: null
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+prefetch:
+  mode: previous_token
+  distance: 1
+  targets: null
+  head: mlp
+  hidden_dim: 512
+  loss: score_kl
+  temperature: 0.1
+  ks: [8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384]
+data:
+  seed: 42
+  max_length: 2048
+  max_image_side: 672
+  router_tokens: assistant
+  num_workers: 0
+  train:
+    - {path: prefetch/data/cog/train.filtered.jsonl, weight: 0.5}
+    - {path: prefetch/data/tulu/train.filtered.jsonl, weight: 0.5}
+  validation:
+    vl: {path: prefetch/data/cog/validation.filtered.jsonl, limit: 128}
+    text: {path: prefetch/data/tulu/validation.filtered.jsonl, limit: 128}
+training:
+  max_steps: 2000
+  gradient_accumulation: 8
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  warmup_steps: 50
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  log_every: 10
+  eval_every: 100
+  save_every: 100
