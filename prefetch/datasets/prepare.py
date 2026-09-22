@@ -6,17 +6,28 @@ import hashlib
 import json
 from pathlib import Path
 
+from tqdm import tqdm
+
 
 def validation_group(key, fraction, seed):
     value = int(hashlib.sha256(f"{seed}:{key}".encode()).hexdigest()[:16], 16) / 2**64
     return value < fraction
 
 
-def cog_records(root, caption_prompt):
+def cog_records(root, caption_prompt, limit=None, caption_prompt_zh="请详细描述这张图片。"):
+    """Yield English and Chinese examples, counting each caption separately toward limit."""
+    if limit is not None and limit <= 0:
+        return
+    count = 0
     root = Path(root)
-    labels = sorted(root.glob("**/labels/*.json"))
+    labels = [label for directory in ("labels_en", "labels_zh")
+              for label in root.glob(f"**/{directory}/*.json")]
     if not labels:
-        raise ValueError("Expected extracted CogVLM folders containing images/ and labels/*.json")
+        labels = list(root.glob("**/labels/*.json"))
+    # Keep both languages of each image together before applying the sample limit.
+    labels.sort(key=lambda label: (label.parent.parent, label.stem, label.parent.name))
+    if not labels:
+        raise ValueError("Expected CogVLM folders containing images/ and labels_en/labels_zh (or labels/)")
     for label in labels:
         image_files = sorted((label.parent.parent / "images").glob(label.stem + ".*"))
         if len(image_files) != 1:
@@ -27,7 +38,8 @@ def cog_records(root, caption_prompt):
         if "conversations" in payload:
             variants = [payload["conversations"]]
         else:
-            variants = [[{"role": "user", "content": caption_prompt},
+            prompt = caption_prompt_zh if label.parent.name == "labels_zh" else caption_prompt
+            variants = [[{"role": "user", "content": prompt},
                          {"role": "assistant", "content": caption["content"]}]
                         for caption in payload["captions"]]
         for index, messages in enumerate(variants):
@@ -38,6 +50,9 @@ def cog_records(root, caption_prompt):
                 cleaned.append({"role": message["role"], "content": message["content"].replace("<image>", "").strip()})
             yield dict(id=f"cog/{label.relative_to(root).as_posix()}/{index}", source="cogvlm",
                        group_id=digest, messages=cleaned, images=[str(image)])
+            count += 1
+            if limit is not None and count >= limit:
+                return
 
 
 def tulu_records(dataset_name, limit):
@@ -50,14 +65,15 @@ def tulu_records(dataset_name, limit):
                    source=f"tulu/{example['source']}", messages=example["messages"], images=[])
 
 
-def write_splits(records, directory, fraction, seed):
+def write_splits(records, directory, fraction, seed, total=None, desc="Prepare"):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     counts = {"train": 0, "validation": 0}
     # Exclusive creation prevents accidentally replacing an experiment's manifest.
-    with (directory / "train.jsonl").open("x", encoding="utf-8") as train, \
-            (directory / "validation.jsonl").open("x", encoding="utf-8") as validation:
-        for record in records:
+    with (directory / "train.jsonl").open("w", encoding="utf-8") as train, \
+            (directory / "validation.jsonl").open("w", encoding="utf-8") as validation:
+        # records is lazy: this bar covers dataset reading, normalization and writing.
+        for record in tqdm(records, total=total, desc=desc, unit="sample", dynamic_ncols=True):
             split = "validation" if validation_group(record["group_id"], fraction, seed) else "train"
             file = validation if split == "validation" else train
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -73,8 +89,8 @@ def filter_records(args):
     kept = rejected = 0
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    with Path(args.input).open(encoding="utf-8") as source, output.open("x", encoding="utf-8") as target:
-        for line in source:
+    with Path(args.input).open(encoding="utf-8") as source, output.open("w", encoding="utf-8") as target:
+        for line in tqdm(source, desc=f"Filter {Path(args.input).name}", unit="sample", dynamic_ncols=True):
             record = json.loads(line)
             try:
                 batch = collate([record])
@@ -97,12 +113,13 @@ def main():
         command.add_argument("--output", required=True)
         command.add_argument("--validation-fraction", type=float, default=0.01)
         command.add_argument("--seed", type=int, default=42)
+        command.add_argument("--limit", type=int, help="Maximum examples before splitting (default: all)")
         if name == "cog":
             command.add_argument("--root", required=True)
             command.add_argument("--caption-prompt", default="Describe this image in detail.")
+            command.add_argument("--caption-prompt-zh", default="请详细描述这张图片。")
         else:
             command.add_argument("--dataset", default="allenai/tulu-3-sft-mixture")
-            command.add_argument("--limit", type=int)
     command = commands.add_parser("filter")
     command.add_argument("--input", required=True)
     command.add_argument("--output", required=True)
@@ -116,8 +133,14 @@ def main():
     else:
         if not 0 < args.validation_fraction < 1:
             parser.error("validation-fraction must lie strictly between 0 and 1")
-        records = cog_records(args.root, args.caption_prompt) if args.command == "cog" else tulu_records(args.dataset, args.limit)
-        report = write_splits(records, args.output, args.validation_fraction, args.seed)
+        if args.limit is not None and args.limit < 0:
+            parser.error("limit must be non-negative")
+        if args.command == "cog":
+            records = cog_records(args.root, args.caption_prompt, args.limit, args.caption_prompt_zh)
+        else:
+            records = tulu_records(args.dataset, args.limit)
+        report = write_splits(records, args.output, args.validation_fraction, args.seed,
+                              total=args.limit, desc=f"Prepare {args.command}")
         report.update(vars(args))
         metadata_path = Path(args.output) / "metadata.json"
     metadata_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")

@@ -15,6 +15,10 @@ from prefetch.evaluation.routing import RoutingMetrics, capture_generation
 from prefetch.training.train import TrainingTask, compute_prerouter_loss, router_loss
 
 
+ROUTING_CASES = [("same_token", 1), ("previous_token", 0),
+                 ("previous_token", 1), ("previous_token", 2)]
+
+
 class ToyRouter(nn.Linear):
     def forward(self, x):
         return super().forward(x).reshape(-1, self.out_features)
@@ -102,16 +106,16 @@ def test_prerouter_is_an_independent_module(head):
     assert all(p.grad is not None for p in head.parameters())
 
 
-@pytest.mark.parametrize("mode", ["same_token", "previous_token"])
-def test_original_output_preserved_and_patch_removable(model, mode):
+@pytest.mark.parametrize("mode,distance", ROUTING_CASES)
+def test_original_output_preserved_and_patch_removable(model, mode, distance):
     ids = torch.tensor([[1, 3, 5, 7]])
     original = model(ids).logits
     signature = inspect.signature(model.forward)
-    state = patch(model, config(mode=mode))
+    state = patch(model, config(mode=mode, distance=distance))
     assert model.prerouter_state is state
     assert inspect.signature(model.forward) == signature
     torch.testing.assert_close(model(ids).logits, original, rtol=0, atol=0)
-    assert set(state.router_logits) == set(state.predictions) == {1, 2, 3}
+    assert set(state.router_logits) == set(state.predictions) == set(range(distance, 4))
     assert all(layer.mlp.prerouter_state is state for layer in model.layers)
     unpatch(model)
     assert "forward" not in model.__dict__
@@ -121,8 +125,8 @@ def test_original_output_preserved_and_patch_removable(model, mode):
     torch.testing.assert_close(model(ids).logits, original, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("mode", ["same_token", "previous_token"])
-def test_reference_model_moe_forward_and_routes(model, mode):
+@pytest.mark.parametrize("mode,distance", ROUTING_CASES)
+def test_reference_model_moe_forward_and_routes(model, mode, distance):
     # Execute the four self-contained reference classes at a small dimension.
     import ast
     from pathlib import Path
@@ -144,7 +148,7 @@ def test_reference_model_moe_forward_and_routes(model, mode):
             nn.init.normal_(parameter, std=0.1)
     values = batch()
     original = model(values["input_ids"]).logits
-    state = patch(model, config(mode=mode))
+    state = patch(model, config(mode=mode, distance=distance))
     task = TrainingTask(model, state, "router")
     task(values, record_metrics=True).backward()
     torch.testing.assert_close(model(values["input_ids"]).logits, original, rtol=0, atol=0)
@@ -205,10 +209,10 @@ def test_publish_before_experts_and_target_routing(model, distance, monkeypatch)
         handle.remove()
 
 
-@pytest.mark.parametrize("mode", ["same_token", "previous_token"])
-def test_full_sequence_equals_prefill_then_incremental(model, mode):
+@pytest.mark.parametrize("mode,distance", ROUTING_CASES)
+def test_full_sequence_equals_prefill_then_incremental(model, mode, distance):
     ids = torch.tensor([[1, 3, 5, 7, 9]])
-    state = patch(model, config(mode=mode, trace_limit=20))
+    state = patch(model, config(mode=mode, distance=distance, trace_limit=20))
     meter = RoutingMetrics(state)
     model(input_ids=ids)
     meter.update(state)
@@ -223,11 +227,13 @@ def test_full_sequence_equals_prefill_then_incremental(model, mode):
         first = next(row for row in meter.trace if row["phase"] == "decode")
         assert first["source_token"] == 1 and first["target_token"] == 2
         assert first["forward_index"] == 1
+        assert first["target_moe"] - first["source_moe"] == distance
     assert not model._forward_hooks
 
 
-def test_cross_token_handoff_keeps_current_and_next_predictions(model):
-    state = patch(model, config(mode="previous_token"))
+@pytest.mark.parametrize("distance", [0, 1, 2])
+def test_cross_token_handoff_keeps_current_and_next_predictions(model, distance):
+    state = patch(model, config(mode="previous_token", distance=distance))
     state.reset(generation=True)
     model(input_ids=torch.tensor([[1, 3]]))
     prior = dict(state.next_predictions)
@@ -239,8 +245,9 @@ def test_cross_token_handoff_keeps_current_and_next_predictions(model):
         assert not state.next_predictions[target].requires_grad
 
 
-def test_reset_prevents_cross_request_pairing(model):
-    state = patch(model, config(mode="previous_token"))
+@pytest.mark.parametrize("distance", [0, 1, 2])
+def test_reset_prevents_cross_request_pairing(model, distance):
+    state = patch(model, config(mode="previous_token", distance=distance))
     meter = RoutingMetrics(state)
     for _ in range(2):
         with capture_generation(model, state, meter):
@@ -249,24 +256,26 @@ def test_reset_prevents_cross_request_pairing(model):
     with capture_generation(model, state, meter):
         model(input_ids=torch.tensor([[1]]))
         model(input_ids=torch.tensor([[2]]))
-    assert int(meter.counts[2, :, 1].sum()) == 3
+    assert int(meter.counts[2, :, 1].sum()) == len(state.pairs)
 
 
-def test_padding_exclusions_and_target_mask(model):
-    state = patch(model, config(mode="previous_token", excluded_token_ids=[3]))
+@pytest.mark.parametrize("distance", [0, 1, 2])
+def test_padding_exclusions_and_target_mask(model, distance):
+    state = patch(model, config(mode="previous_token", distance=distance, excluded_token_ids=[3]))
     task = TrainingTask(model, state, "router")
     values = batch((0, 1, 2, 3, 4, 0))
     values["router_mask"] = torch.tensor([[0, 0, 1, 1, 1, 0]], dtype=torch.bool)
     task(values, record_metrics=True).backward()
     rows = task.meter.report()["phases"]["teacher_forcing"]["global"]
-    assert rows[-1]["token_layer_pairs"] == 6
+    assert rows[-1]["token_layer_pairs"] == 2 * len(state.pairs)
     assert rows[-1]["recall"] == rows[-1]["full_coverage"] == 1
     for name, param in model.named_parameters():
         assert (param.grad is not None) == (".prerouter." in name)
 
 
-def test_zero_valid_tokens_produce_connected_zero_loss(model):
-    state = patch(model, config(mode="previous_token"))
+@pytest.mark.parametrize("distance", [0, 1, 2])
+def test_zero_valid_tokens_produce_connected_zero_loss(model, distance):
+    state = patch(model, config(mode="previous_token", distance=distance))
     task = TrainingTask(model, state, "router")
     loss = task(batch((1,)), record_metrics=True)
     loss.backward()
@@ -298,11 +307,11 @@ def test_kl_teacher_detached(model, kind):
     assert pred.grad is not None and torch.isfinite(pred.grad).all()
 
 
-@pytest.mark.parametrize("mode", ["same_token", "previous_token"])
+@pytest.mark.parametrize("mode,distance", ROUTING_CASES)
 @pytest.mark.parametrize("head", ["linear", "mlp"])
 @pytest.mark.parametrize("loss_kind", ["score_kl", "logit_kl"])
-def test_loss_and_gradients_match_independent_reference(model, mode, head, loss_kind):
-    cfg = PrefetchConfig(mode=mode, head=head, hidden_dim=5, loss=loss_kind, ks=[2, 8])
+def test_loss_and_gradients_match_independent_reference(model, mode, distance, head, loss_kind):
+    cfg = PrefetchConfig(mode=mode, distance=distance, head=head, hidden_dim=5, loss=loss_kind, ks=[2, 8])
     values = batch((0, 1, 3, 5, 0))
     values["router_mask"] = torch.tensor([[0, 0, 1, 1, 0]], dtype=torch.bool)
     captured, handles = {}, []
@@ -380,13 +389,16 @@ def test_trainable_parameter_order_and_source_ownership(model):
 
 
 @pytest.mark.parametrize("head", ["linear", "mlp"])
-def test_checkpoint_roundtrip_and_target_keys(model, tmp_path, head):
+@pytest.mark.parametrize("mode,distance", ROUTING_CASES)
+def test_checkpoint_roundtrip_and_target_keys(model, tmp_path, head, mode, distance):
     pytest.importorskip("safetensors")
-    state = patch(model, PrefetchConfig(head=head, hidden_dim=5, targets=[3, 1], ks=[2, 8]))
+    targets = [3, distance]
+    state = patch(model, PrefetchConfig(mode=mode, distance=distance, head=head, hidden_dim=5,
+                                       targets=targets, ks=[2, 8]))
     with torch.no_grad():
         next(state.parameters()).add_(0.5)
     weights = {k: v.clone() for k, v in predictor_state_dict(state).items()}
-    assert all(key.split(".")[0] in {"3", "1"} and ".net." not in key for key in weights)
+    assert all(int(key.split(".")[0]) in targets and ".net." not in key for key in weights)
     save_predictor(state, tmp_path)
     unpatch(model)
     restored = patch(model, checkpoint=tmp_path)
@@ -424,7 +436,7 @@ def test_attention_lora_zero_init_and_save(model, tmp_path):
     load_lora(model, tmp_path)
 
 
-def _ddp_worker(process_rank, init_url, mode):
+def _ddp_worker(process_rank, init_url, mode, distance):
     from contextlib import nullcontext
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
@@ -432,7 +444,7 @@ def _ddp_worker(process_rank, init_url, mode):
     dist.init_process_group("gloo", init_method=init_url, rank=process_rank, world_size=2)
     torch.manual_seed(19)
     model = ToyModel().eval().requires_grad_(False)
-    state = patch(model, config(mode=mode))
+    state = patch(model, config(mode=mode, distance=distance))
     task = TrainingTask(model, state, "router")
     ddp = DistributedDataParallel(task, broadcast_buffers=False)
     optimizer = torch.optim.SGD(task.parameters(), lr=0.01)
@@ -448,13 +460,13 @@ def _ddp_worker(process_rank, init_url, mode):
     torch.testing.assert_close(replicas[0], replicas[1], rtol=0, atol=0)
     assert list(EvalShard(range(3))) == ([0, 2] if process_rank == 0 else [1])
     report = task.meter.report(distributed=True)
-    expected = 18 if mode == "same_token" else 12
+    expected = 2 * (3 if mode == "same_token" else 2) * len(state.pairs)
     assert report["phases"]["teacher_forcing"]["global"][-1]["token_layer_pairs"] == expected
     dist.destroy_process_group()
 
 
 @pytest.mark.skipif(os.environ.get("RUN_DDP_TESTS") != "1", reason="Set RUN_DDP_TESTS=1 for the two-process test")
-@pytest.mark.parametrize("mode", ["same_token", "previous_token"])
-def test_two_process_trainable_ddp_and_count_reduction(tmp_path, mode):
-    torch.multiprocessing.spawn(_ddp_worker, args=((tmp_path / "gloo_init").resolve().as_uri(), mode),
+@pytest.mark.parametrize("mode,distance", ROUTING_CASES)
+def test_two_process_trainable_ddp_and_count_reduction(tmp_path, mode, distance):
+    torch.multiprocessing.spawn(_ddp_worker, args=((tmp_path / "gloo_init").resolve().as_uri(), mode, distance),
                                 nprocs=2, join=True)

@@ -38,6 +38,8 @@ def multimodal_messages(messages, image_paths):
 
 def processor_call(processor, messages, images, generation=False):
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=generation)
+    if not generation:
+        text = text.removesuffix("<|message_start|>助手：</think>")
     kwargs = dict(text=[text], padding=False, return_tensors="pt")
     if images:
         kwargs["images"] = images

@@ -14,7 +14,7 @@ lora:
   dropout: 0.0
 prefetch:
   mode: previous_token
-  distance: 1
+  distance: 1              # 0: same MoE; M>=1: M preceding MoEs, always from the previous token.
   targets: null
   head: mlp
   hidden_dim: 512

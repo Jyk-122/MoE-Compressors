@@ -27,9 +27,9 @@ MoE 序号从 0 开始，checkpoint 同时保存真实模块路径：
 | mode | source | target | 有效目标 |
 |---|---|---|---|
 | same_token | token t，MoE i−M 输入 | token t，MoE i router | i≥M |
-| previous_token | token t−1，MoE i−1 输入 | token t，MoE i router | i≥1 |
+| previous_token | token t−1，MoE i−M 输入 | token t，MoE i router | i≥M |
 
-M 按 MoE 数计算，prefetch.targets 可固定共同目标层，默认使用全部有效目标。
+M=distance 按 MoE 数计算：same_token 要求 M≥1；previous_token 允许 M≥0。M=0 时，source 和 target 属于同一 MoE，token 相差 1，所有层 i≥0 均可作为目标；序列首 token 仍无跨 token 标签。prefetch.targets 可固定共同目标层，默认使用全部有效目标。
 
 训练和推理的 batch size 均为 1，MoE 输入为 [1,S,H]，state 中的路由信息为 [S,E] 或 [S,K]。每卡训练一条样本，可用 DDP 和梯度累积增加有效训练 batch；样本间独立，不做 packing。
 
@@ -45,7 +45,7 @@ M 按 MoE 数计算，prefetch.targets 可固定共同目标层，默认使用�
 传递规则集中在 prerouter/state.py：
 
 1. same_token：source i 的输出直接放入 predictions[i+M]。
-2. previous_token 完整序列：source[:-1] 对齐 target[1:]，首位置无效；检查 source/target attention mask。
+2. previous_token 完整序列：source i 的 source[:-1] 对齐 target i+M 的 target[1:]，首位置无效；检查 source/target attention mask。M=0 时在同一层完成对齐。
 3. previous_token decode：forward 开始时把 next_predictions 交给 predictions，再建立新的 next_predictions。当前 forward 的 head 输出保存到下一轮。
 
 state.valid_mask 标记对齐后有效的位置，并排除配置中的特殊 token。训练函数再与数据的 router_mask 取交集；router mask 对应当前输入 token，LM loss 才做下一 token shift。

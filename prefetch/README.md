@@ -2,7 +2,7 @@
 
 在较早的 MoE 输入处预测目标层路由，训练一次即可评估多个候选数 k′。原 router 决定实际执行专家；真值来自当前基模（包含所选量化和 attention LoRA）的实际前向。
 
-支持同 token 提前 M 个 MoE、上一 token 提前 1 个 MoE、可选 attention LoRA SFT、routed-expert NF4、多卡训练、恢复、覆盖率曲线和单 prompt 推理。语义见 [DESIGN.md](DESIGN.md)。本阶段测量预测能力；Flash→DRAM 调度和端侧时延模拟可在后续实验中接入。
+支持同 token 提前 M≥1 个 MoE、上一 token 同层或提前 M≥1 个 MoE、可选 attention LoRA SFT、routed-expert NF4、多卡训练、恢复、覆盖率曲线和单 prompt 推理。语义见 [DESIGN.md](DESIGN.md)。本阶段测量预测能力；Flash→DRAM 调度和端侧时延模拟可在后续实验中接入。
 
 ## 目录结构
 
@@ -36,6 +36,18 @@ RUN_DDP_TESTS=1 python -m pytest prefetch/tests/test_patch.py -q
 所有命令从仓库根目录运行，以文中的 python -m 完整模块路径启动。例如训练入口为 `python -m prefetch.training.train`，推理示例为 `python -m prefetch.examples.infer_prefetch_demo`。完整 checkpoint 必须包含原模型 remote code、processor 和配套依赖；[assets/modeling.py](assets/modeling.py) 用于结构参考。加载沿用原 demo 的 key_mapping。
 
 先编辑 [same_token.yaml](configs/same_token.yaml) 中 model.path 和数据路径。另有 [previous_token.yaml](configs/previous_token.yaml) 与 [lora_sft.yaml](configs/lora_sft.yaml)。
+
+`distance` 表示 source 到 target 的 MoE 层距离：same_token 要求 ≥1，previous_token 允许 ≥0。在 previous_token.yaml 中设为 0，即用 token t−1 的 MoE i 输入预测 token t 的同一 MoE i；默认覆盖全部 MoE，包括第 0 层。配置示例保留 distance=1，同层实验可修改为：
+
+~~~yaml
+output_dir: prefetch/outputs/previous_token_m0
+prefetch:
+  mode: previous_token
+  distance: 0
+  targets: null
+~~~
+
+将这些字段合入完整配置，其余配置保留。每种距离使用独立 output_dir 和对应训练的 head；跨距离比较覆盖率时固定共同 targets。
 
 本地 torch 1.12 CPU 环境已通过小模型 patch、数据 mask、保存恢复、两进程 Gloo/DDP 测试。目标服务器的 torch 2.9 / transformers 5.0、完整 VL 模型、H20/NF4 CUDA 仍需按下文检查。
 
@@ -81,16 +93,24 @@ head 注册为 source_moe.prerouter，输入是归一化后的 MoE 输入；调�
 {"id":"sample-1","source":"example","group_id":"dialogue-id","images":[],"messages":[{"role":"user","content":"你好"},{"role":"assistant","content":"你好！"}]}
 ~~~
 
-CogVLM 先下载并解压官方数据，保留 images/ 和 labels/ 结构。脚本支持 captions/conversations，使用图像内容 hash 做 split，同图多条标注和跨目录副本属于同一 split。
+CogVLM 先下载并解压官方数据，每个子数据集保留 images/、labels_en/、labels_zh/ 结构。脚本同时读取中英文标注，按同名文件匹配图片；两种语言分别生成独立样本，共用图片路径和图像内容 hash（group_id），因此同图的中英文、多条标注和跨目录副本属于同一 train/validation 分区。样本 ID 包含标注目录，区分两种语言。若根目录下没有中英文标注，则兼容读取 labels/。
+
+脚本支持 captions/conversations。caption 样本默认使用英文提问 “Describe this image in detail.” 或中文提问“请详细描述这张图片。”，分别通过 --caption-prompt / --caption-prompt-zh 修改；conversation 保留标注中的提问和回答。
+
+~~~bash
+python -m prefetch.datasets.prepare cog  --root data1/jiangyikun/datasets/CogVLM-SFT-311K/CogVLM-SFT-311K/llava_instruction_single_conversation_formate/ --output prefetch/data/cog --limit 1000
+
+python -m prefetch.datasets.prepare tulu --dataset /data1/jiangyikun/datasets/tulu-3-sft-mixture --output prefetch/data/tulu --limit 1000
+~~~
+
+Tulu 默认使用 allenai/tulu-3-sft-mixture，按稳定 ID 留出 1% 验证集。Cog 和 Tulu 均支持 --limit N，限制划分 train/validation 之前的样本总数；省略时处理全量，设为 0 时输出空数据集。Cog 的每条 caption 或完整 conversation 各算一条样本，中英文分别计数。按子数据集、图片文件名排序，同图先处理英文再处理中文；达到 limit 即停止，因此最后一张图可能只保留部分标注。新的数据实验建议使用新输出目录。
+
+例如，只准备前 1000 条 Cog 样本用于调试：
 
 ~~~bash
 python -m prefetch.datasets.prepare cog \
-  --root /datasets/CogVLM-SFT-311K --output prefetch/data/cog
-
-python -m prefetch.datasets.prepare tulu --output prefetch/data/tulu
+  --root /datasets/CogVLM-SFT-311K --output prefetch/data/cog_debug --limit 1000
 ~~~
-
-Tulu 默认使用 allenai/tulu-3-sft-mixture，按稳定 ID 留出 1% 验证集。调试可加 --limit 1000。数据文件采用独占创建；新的数据实验使用新输出目录。
 
 接着用真实 processor 校验 assistant span，并过滤超长样本；长度/图像设置须与训练 YAML 相同：
 
