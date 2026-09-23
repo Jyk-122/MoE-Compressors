@@ -1,6 +1,6 @@
 seed: 42
 stage: lora
-output_dir: prefetch/outputs/attention_lora
+output_dir: prefetch/outputs  # Parent directory; each run creates lora_<startup time>.
 model:
   path: /path/to/full/BF16/checkpoint
   quantization: experts_nf4

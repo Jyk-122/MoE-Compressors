@@ -461,7 +461,14 @@ def _ddp_worker(process_rank, init_url, mode, distance):
     assert list(EvalShard(range(3))) == ([0, 2] if process_rank == 0 else [1])
     report = task.meter.report(distributed=True)
     expected = 2 * (3 if mode == "same_token" else 2) * len(state.pairs)
-    assert report["phases"]["teacher_forcing"]["global"][-1]["token_layer_pairs"] == expected
+    metrics = report["phases"]["teacher_forcing"]
+    assert metrics["global"][-1]["token_layer_pairs"] == expected
+    required = metrics["required_k"]["global"]
+    assert required["token_layer_pairs"] == expected
+    assert sum(row["count"] for row in required["distribution"]) == expected
+    assert required["distribution"][-1]["cdf"] == 1
+    for row in metrics["global"]:
+        assert row["full_coverage"] == required["distribution"][row["k"] - 1]["cdf"]
     dist.destroy_process_group()
 
 

@@ -23,7 +23,8 @@ from prefetch.backbone.loading import load_lora, load_model, save_lora
 from prefetch.prerouter.patch import patch
 from prefetch.backbone.structure import choice_scores
 from prefetch.evaluation.routing import RoutingMetrics
-from prefetch.training.runtime import evaluate_task, make_collator, rank, read_config, seed_all, setup, world_size
+from prefetch.training.runtime import (evaluate_task, make_collator, prepare_run_directory,
+                                       rank, read_config, seed_all, setup, world_size)
 
 
 def router_loss(prediction, teacher, block, temperature, loss_kind):
@@ -131,16 +132,13 @@ def main():
     parser.add_argument("--resume", help="Trusted local checkpoint directory, including optimizer/RNG state")
     args = parser.parse_args()
     config = read_config(args.config)
-    if not args.resume and (Path(config["output_dir"]) / "run_config.json").exists():
-        raise ValueError("output_dir already contains a run; choose a new directory or use --resume")
     device = setup(config.get("seed", 42))
     stage = config.get("stage", "router")
     if stage not in {"router", "lora"}:
         raise ValueError("stage must be router or lora")
-    if args.resume:
-        saved_config = json.loads((Path(args.resume) / "run_config.json").read_text(encoding="utf-8"))
-        if config != saved_config:
-            raise ValueError("Resume requires the same run config; use a fresh run for changed experiments")
+    output = prepare_run_directory(config, args.resume)
+    if rank() == 0:
+        print(f"Output directory: {output}", flush=True)
     model, processor, loading_report = load_model(config, device)
     state = None
     if stage == "router":
@@ -188,7 +186,6 @@ def main():
         scheduler.load_state_dict(trainer_state["scheduler"])
         step, start_epoch, start_batch = trainer_state["step"], trainer_state["epoch"], trainer_state["next_batch"]
         restore_rng(trainer_state["rng"][rank()], device)
-    output = Path(config["output_dir"])
     if rank() == 0:
         output.mkdir(parents=True, exist_ok=True)
         (output / "run_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")

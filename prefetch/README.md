@@ -40,14 +40,14 @@ RUN_DDP_TESTS=1 python -m pytest prefetch/tests/test_patch.py -q
 `distance` 表示 source 到 target 的 MoE 层距离：same_token 要求 ≥1，previous_token 允许 ≥0。在 previous_token.yaml 中设为 0，即用 token t−1 的 MoE i 输入预测 token t 的同一 MoE i；默认覆盖全部 MoE，包括第 0 层。配置示例保留 distance=1，同层实验可修改为：
 
 ~~~yaml
-output_dir: prefetch/outputs/previous_token_m0
+output_dir: prefetch/outputs
 prefetch:
   mode: previous_token
   distance: 0
   targets: null
 ~~~
 
-将这些字段合入完整配置，其余配置保留。每种距离使用独立 output_dir 和对应训练的 head；跨距离比较覆盖率时固定共同 targets。
+将这些字段合入完整配置，其余配置保留。每次训练自动创建带启动时间的独立目录，使用对应距离训练的 head；跨距离比较覆盖率时固定共同 targets。
 
 本地 torch 1.12 CPU 环境已通过小模型 patch、数据 mask、保存恢复、两进程 Gloo/DDP 测试。目标服务器的 torch 2.9 / transformers 5.0、完整 VL 模型、H20/NF4 CUDA 仍需按下文检查。
 
@@ -148,19 +148,23 @@ model.router_forward_kwargs 默认传 logits_to_keep: 1，减少 router 阶段�
 
 ## 4. 训练与恢复
 
+YAML 的 `output_dir` 指定保存父目录，默认 `prefetch/outputs`。新训练自动创建 `<mode>_YYYYMMDD_HHMMSS` 子目录，例如 `same_token_20260923_140530`；router 阶段的 mode 来自 `prefetch.mode`，LoRA 阶段使用 `lora`。时间取 rank 0 的服务器本地时间，精确到秒，由 rank 0 统一生成并广播给所有卡。启动时会打印实际 `Output directory`，日志、评测和 checkpoint 均保存于该目录。同一父目录、同一模式在同一秒重复启动时会报目录冲突，以保护已有结果。
+
 ~~~bash
 # 两卡短训前，将 max_steps 设为 2，log/eval/save_every 设为 1。
 CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.yaml
 
-# 完整配置与独立 output_dir 就绪后运行八卡。
+# 完整配置就绪后运行八卡；每次启动自动创建独立保存目录。
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.yaml
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/previous_token.yaml
 
-# 同配置、同 world size 续训，只加载可信本地 trainer_state.pt。
+# 同配置、同 world size 续训；将时间戳替换为实际运行目录。
 NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.yaml \
-  --resume prefetch/outputs/same_token_m1/checkpoint-100
+  --resume prefetch/outputs/same_token_20260923_140530/checkpoint-100
 ~~~
+
+`--resume` 使用 checkpoint 的 run_config.json 中保存的原运行目录，YAML 中的 output_dir 可以继续填写父目录；其余配置必须与保存时一致。恢复入口同样支持已有固定目录名的 checkpoint。只加载可信本地 trainer_state.pt。
 
 每卡一份基模，DDP 仅管理可训练参数。8 卡×微批 1×累积 8 的有效训练 batch 为 64，与端侧 batch=1 的推理设定分别定义。从 BF16 源加载时，serial_load 默认按 rank 串行执行，CPU 需容纳一份 BF16 基模及缓冲。配置 nf4_checkpoint 后，各 rank 并行读取已量化权重，serial_load 不再参与；用法见下节。
 
@@ -168,7 +172,7 @@ router 阶段基模与 LoRA 冻结，基模处于 eval/no_grad。patch 在独立
 
 可选 LoRA 流程：
 
-1. 运行 lora_sft.yaml，得到 attention_lora/checkpoint-N。
+1. 运行 lora_sft.yaml，得到 `prefetch/outputs/lora_<启动时间>/checkpoint-N`。
 2. 在 router 配置设置 lora.enabled: true、lora.checkpoint: 对应目录。
 3. 训练 predictor，此时 adapter 冻结，原 router 继续执行。
 
@@ -262,19 +266,50 @@ done
 
 ## 6. 评测与单 prompt demo
 
-周期验证自动生成 JSON、CSV、Recall PNG、FullCoverage PNG，包含 global/per-layer、有效 token-layer pair 数和完整 rank histogram。LoRA 阶段报告 SFT 验证损失；router 阶段报告覆盖率。
+router 阶段的周期验证、独立评测和单 prompt demo 自动报告 Recall、平均命中数和 RequiredK 分布，包含 global/per-layer 统计。训练验证日志也打印 RequiredK 摘要。LoRA 阶段报告 SFT 验证损失。
+
+### 路由指标
+
+统计单位是一个有效输入 token 在一个目标 MoE 层的调用（token-layer pair）。令原 router 实际选出的专家集合为 $R$，大小为 $K$（当前模型为 8）；prerouter 排序前 $k'$ 个专家为 $P_{k'}$。真值来自当前基模的实际路由，预测按 `sigmoid(logits) + 目标层 correction bias` 排序。$k'$ 控制预测候选数，实际执行专家仍由原 router 决定。
+
+- **平均命中数（mean_hits）**：$\mathbb E[|R\cap P_{k'}|]$，表示每次调用平均找到了几个真值专家。
+- **Recall@$k'$**：$\mathbb E[|R\cap P_{k'}|/K]$，分母为真值专家数。当前 $K=8$ 时，`mean_hits = 8 * recall`；分母若取 $k'$ 则是 Precision。
+- **RequiredK**：$K_{\mathrm{req}}=\min\{k':R\subseteq P_{k'}\}=\max_{e\in R}\operatorname{rank}_{P}(e)$，表示沿预测排序取前缀时，覆盖全部真值专家需要的最小候选数。rank 从 1 开始。例如真值专家在预测中的名次为 `[1, 2, 4, 5, 7, 9, 12, 23]`，此次 RequiredK 为 23。
+
+RequiredK 报告 `mean`、`median`、`min`、`max`、`p90`、`p95`、`p99`。中位数在样本数为偶数时取中间两项的平均；P90/P95/P99 使用经验 CDF 首次达到对应比例的整数候选数，不做插值。分布保存从 1 到专家总数 $E$ 的每个整数桶：`count` 是调用次数，`probability` 是频率，`cdf` 是累计频率。当前模型有效观测的 RequiredK 在 8 到 384 之间。
+
+`full_coverage` 字段保留，其含义正是 RequiredK 的累积分布：$\mathrm{FullCoverage@}k'=\Pr(K_{\mathrm{req}}\le k')$。例如 CDF 在 $k'=32$ 时为 0.8，表示选前 32 个候选足以覆盖 80% 的调用。它不要求同一 token 的所有 MoE 层同时覆盖。
+
+global 按有效 token-layer pair 汇总，per-layer 只汇总对应目标层；长回答贡献更多统计量。训练验证采用 teacher forcing，默认只统计 assistant 文本输入位置并排除 special tokens。generation 的 prefill/decode 分别统计。空集合的统计值为 `null`、计数为 0。RequiredK 是利用真值计算的事后评测量，不是运行时可直接获得的预取预算，也不包含 DRAM 缓存命中和 Flash 搬运时延。
+
+以报告前缀 `vl-step300` 为例，产物为：
+
+| 文件 | 内容 |
+|---|---|
+| `vl-step300.json` | 各 phase 的原始直方图、曲线，以及 `required_k.global` / `required_k.per_layer` 的摘要和完整分布 |
+| `vl-step300.csv` | global/per-layer 的 Recall、mean_hits、full_coverage 和计数 |
+| `vl-step300-required_k.csv` | global/per-layer 的 RequiredK 均值、中位数、范围和分位数 |
+| `vl-step300-required_k_distribution.csv` | global/per-layer 的完整 RequiredK 频率和 CDF |
+| `vl-step300-recall.png` / `vl-step300-mean_hits.png` | 候选数与 Recall / 平均命中数的关系 |
+| `vl-step300-required_k_distribution.png` / `vl-step300-required_k_cdf.png` | RequiredK 频率分布 / 累积分布，各 phase 分别绘线 |
+
+Recall 和 mean_hits 曲线使用 `prefetch.ks` 中的候选数；RequiredK 的统计和分布使用全部整数桶，不受该列表稀疏程度影响。
+
+### 运行评测
+
+以下 checkpoint 路径中的时间戳请替换为训练启动时打印的实际目录。
 
 ~~~bash
 NPROC_PER_NODE=8 bash prefetch/scripts/evaluate.sh \
-  prefetch/outputs/same_token_m1/checkpoint-2000 \
+  prefetch/outputs/same_token_20260923_140530/checkpoint-2000 \
   prefetch/outputs/eval_teacher
 
 NPROC_PER_NODE=8 bash prefetch/scripts/evaluate.sh \
-  prefetch/outputs/previous_token_m1/checkpoint-2000 \
+  prefetch/outputs/previous_token_20260923_150530/checkpoint-2000 \
   prefetch/outputs/eval_generation --mode generation --max-new-tokens 128
 
 CUDA_VISIBLE_DEVICES=0 python -m prefetch.examples.infer_prefetch_demo \
-  --checkpoint prefetch/outputs/previous_token_m1/checkpoint-2000 \
+  --checkpoint prefetch/outputs/previous_token_20260923_150530/checkpoint-2000 \
   --prompt '请描述一下这张图。' --image /datasets/example.jpg \
   --output prefetch/outputs/demo/metrics.json
 ~~~
@@ -285,6 +320,18 @@ generation 评测只使用验证对话的第一个 assistant 回答前的上下�
 
 demo 使用 with capture_generation(model, state, meter) 包住每次 generate：进入时重置请求状态，每个 forward 完成后统计，退出时释放观察器和请求张量。上一 token 模式用 prefill 尾部预测首个 decode。手动逐 token 推理可先调用 state.reset(generation=True)，再在每次 forward 后调用 meter.update(state)。trace 包含 source/target MoE 序号、输入 token 位置、预测集和真值；trace_limit 分阶段限额。demo 时间包含预测及统计开销，不代表 Flash 预取收益。
 
+### 从已有 JSON 生成统计与图表
+
+完整评测 JSON 已保存 RequiredK 所需的最大 rank 直方图，可以在 CPU 上直接生成上述报告，不加载模型、不重新评测。输入应为 `vl-step300.json` / `text-step300.json` 等含 `histograms` 的完整报告；控制台日志或 `summary-step300.json` 只有稀疏曲线，不能精确还原均值和完整分布。
+
+~~~bash
+python -m prefetch.evaluation.plot \
+  prefetch/outputs/same_token_20260923_140530/metrics/vl-step300.json \
+  --output-prefix prefetch/outputs/analysis/vl-step300
+~~~
+
+命令生成 JSON、三份 CSV、四张 PNG，并打印 RequiredK 摘要。省略 `--output-prefix` 时，输出前缀为输入文件同目录下的 `<原文件名去扩展名>-report`，源 JSON 保持原样。
+
 比较层距离时，在 prefetch.targets 固定共同目标 MoE 序号，或从直方图重新汇总共同层：
 
 ~~~bash
@@ -292,7 +339,7 @@ python -m prefetch.evaluation.plot prefetch/outputs/eval_teacher/text-stepfinal.
   --layers 2 3 4 --output-prefix prefetch/outputs/common_layers/text
 ~~~
 
-Recall@E 与 FullCoverage@E 对有效样本必须为 1，空计数输出 null。最大真实专家 rank 的分位数可估计覆盖 95%/99% 调用所需的经验 k′；它不构成未见数据的覆盖保证。
+`--layers 2` 可生成单层统计和图表；指定多层时生成这些层合并后的 global 曲线，同时保存各层统计。Recall@E 与 RequiredK CDF(E) 对有效样本必须为 1。RequiredK 分位数用于估计覆盖 95%/99% 调用所需的经验候选数，不构成未见数据的覆盖保证。
 
 ## 7. 代码导航与产物
 

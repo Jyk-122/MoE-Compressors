@@ -1,7 +1,7 @@
 """Distributed setup and validation shared by the CLIs."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -52,6 +52,27 @@ def world_size():
     return dist.get_world_size() if dist.is_initialized() else 1
 
 
+def prepare_run_directory(config, resume=None):
+    """Use output_dir as the parent for new runs; resume keeps the saved run directory."""
+    if resume:
+        saved = json.loads((Path(resume) / "run_config.json").read_text(encoding="utf-8"))
+        config["output_dir"] = saved["output_dir"]
+        if config != saved:
+            raise ValueError("Resume requires the same run config; use a fresh run for changed experiments")
+    else:
+        directory = [None]
+        if rank() == 0:
+            mode = config["prefetch"].get("mode", "same_token") if config.get("stage", "router") == "router" else "lora"
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output = Path(config["output_dir"]) / f"{mode}_{stamp}"
+            output.mkdir(parents=True, exist_ok=False)
+            directory[0] = str(output)
+        if dist.is_initialized():
+            dist.broadcast_object_list(directory, src=0)
+        config["output_dir"] = directory[0]
+    return Path(config["output_dir"])
+
+
 def make_collator(processor, config):
     return SFTCollator(processor, config.get("max_length", 2048),
                        config.get("router_tokens", "assistant"), config.get("max_image_side", 672))
@@ -98,7 +119,10 @@ def evaluate_task(task, processor, config, device, output_dir, step):
                 save_report(report, path)
                 from prefetch.evaluation.plot import plot_report
                 plot_report(report, path.with_suffix(""))
-            summary["curve"] = report["phases"]["teacher_forcing"]["global"]
+            metrics = report["phases"]["teacher_forcing"]
+            summary["curve"] = metrics["global"]
+            summary["required_k"] = {k: v for k, v in metrics["required_k"]["global"].items()
+                                     if k != "distribution"}
         summaries[name] = summary
     if rank() == 0:
         print(json.dumps({"evaluation": summaries, "step": step}), flush=True)

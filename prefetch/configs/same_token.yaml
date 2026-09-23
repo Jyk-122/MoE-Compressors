@@ -1,6 +1,6 @@
 seed: 42
 stage: router
-output_dir: prefetch/outputs/same_token_m1
+output_dir: prefetch/outputs  # Parent directory; each run creates <mode>_<startup time>.
 model:
   path: /path/to/full/BF16/checkpoint
   quantization: experts_nf4  # none | experts_nf4
