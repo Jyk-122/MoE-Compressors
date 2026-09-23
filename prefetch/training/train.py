@@ -24,8 +24,9 @@ from prefetch.backbone.loading import load_lora, load_model, save_lora
 from prefetch.prerouter.patch import patch
 from prefetch.backbone.structure import choice_scores
 from prefetch.evaluation.routing import RoutingMetrics
-from prefetch.training.runtime import (estimate_eta, evaluate_task, make_collator, prepare_run_directory,
-                                       rank, read_config, seed_all, setup, world_size)
+from prefetch.training.runtime import (estimate_eta, evaluate_task, format_duration, format_training_log,
+                                       make_collator, prepare_run_directory, rank, read_config,
+                                       seed_all, setup, world_size)
 from prefetch.utils.logging import configure_logging
 
 
@@ -246,9 +247,10 @@ def main():
                              examples=int(totals[1].item()), text_tokens=int(totals[2].item()),
                              learning_rate=scheduler.get_last_lr()[0], elapsed_seconds=time.monotonic() - started,
                              peak_gpu_gib=torch.cuda.max_memory_allocated(device) / 2**30)
+                entry["elapsed_time"] = format_duration(entry["elapsed_seconds"])
                 entry.update(estimate_eta(entry["elapsed_seconds"], step - initial_step, max_steps - step))
                 if rank() == 0:
-                    logger.info("%s", json.dumps(entry))
+                    logger.info("%s", format_training_log(entry))
                     with (output / "train.jsonl").open("a", encoding="utf-8") as file:
                         file.write(json.dumps(entry) + "\n")
                 totals.zero_()

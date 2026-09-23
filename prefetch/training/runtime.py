@@ -22,13 +22,28 @@ from prefetch.evaluation.metrics import save_report
 logger = logging.getLogger(__name__)
 
 
+def format_duration(seconds):
+    """Format whole elapsed seconds as HHH:MM:SS, with accumulated hours."""
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:03d}:{minutes:02d}:{seconds:02d}"
+
+
 def estimate_eta(elapsed_seconds, completed_steps, remaining_steps):
     """Estimate time to the last optimizer step using this launch's mean step time."""
     if completed_steps <= 0:
-        return dict(eta_seconds=None, eta=None)
+        return dict(eta_seconds=None, eta_time=None)
     seconds = elapsed_seconds / completed_steps * max(remaining_steps, 0)
-    hours, minutes = divmod(math.ceil(seconds / 60), 60)
-    return dict(eta_seconds=seconds, eta=f"{hours:02d}:{minutes:02d}")
+    return dict(eta_seconds=seconds, eta_time=format_duration(math.ceil(seconds)))
+
+
+def format_training_log(entry):
+    """Format console fields while preserving numeric values in the JSONL entry."""
+    display = {key: value for key, value in entry.items()
+               if key not in {"elapsed_seconds", "eta_seconds"}}
+    display["peak_gpu_gib"] = f"{entry['peak_gpu_gib']:.2f}"
+    display["learning_rate"] = f"{entry['learning_rate']:.2e}"
+    return json.dumps(display)
 
 
 def read_config(path):
