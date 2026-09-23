@@ -1,3 +1,4 @@
+export HF_UPDATE_DOWNLOAD_COUNTS=0 
 #!/usr/bin/env bash
 set -euo pipefail
 # Run from the repository root. Extra arguments go to prefetch.training.train.

@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import random
@@ -19,6 +20,15 @@ from prefetch.evaluation.metrics import save_report
 
 
 logger = logging.getLogger(__name__)
+
+
+def estimate_eta(elapsed_seconds, completed_steps, remaining_steps):
+    """Estimate time to the last optimizer step using this launch's mean step time."""
+    if completed_steps <= 0:
+        return dict(eta_seconds=None, eta=None)
+    seconds = elapsed_seconds / completed_steps * max(remaining_steps, 0)
+    hours, minutes = divmod(math.ceil(seconds / 60), 60)
+    return dict(eta_seconds=seconds, eta=f"{hours:02d}:{minutes:02d}")
 
 
 def read_config(path):

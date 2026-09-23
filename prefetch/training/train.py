@@ -24,7 +24,7 @@ from prefetch.backbone.loading import load_lora, load_model, save_lora
 from prefetch.prerouter.patch import patch
 from prefetch.backbone.structure import choice_scores
 from prefetch.evaluation.routing import RoutingMetrics
-from prefetch.training.runtime import (evaluate_task, make_collator, prepare_run_directory,
+from prefetch.training.runtime import (estimate_eta, evaluate_task, make_collator, prepare_run_directory,
                                        rank, read_config, seed_all, setup, world_size)
 from prefetch.utils.logging import configure_logging
 
@@ -210,6 +210,7 @@ def main():
     optimizer.zero_grad(set_to_none=True)
     totals = torch.zeros(3, device=device, dtype=torch.float64)
     started = time.monotonic()
+    initial_step = step  # Resume estimates use only optimizer steps completed in this launch.
     last_saved = step if args.resume else -1
     last_position = (start_epoch, start_batch)
     for epoch in range(start_epoch, epochs):
@@ -245,6 +246,7 @@ def main():
                              examples=int(totals[1].item()), text_tokens=int(totals[2].item()),
                              learning_rate=scheduler.get_last_lr()[0], elapsed_seconds=time.monotonic() - started,
                              peak_gpu_gib=torch.cuda.max_memory_allocated(device) / 2**30)
+                entry.update(estimate_eta(entry["elapsed_seconds"], step - initial_step, max_steps - step))
                 if rank() == 0:
                     logger.info("%s", json.dumps(entry))
                     with (output / "train.jsonl").open("a", encoding="utf-8") as file:

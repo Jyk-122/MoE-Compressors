@@ -150,6 +150,8 @@ model.router_forward_kwargs 默认传 logits_to_keep: 1，减少 router 阶段�
 
 ## 4. 训练与恢复
 
+训练进度日志与 `train.jsonl` 包含 `eta`（`HH:MM` 小时:分钟，例如 `"02:15"`；超过 24 小时继续累计）和 `eta_seconds`，随 `log_every` 刷新。估算为“本次启动进入训练循环后的耗时 / 本次已完成的 optimizer step 数 × 剩余 step 数”，梯度累积按 optimizer step 计，续训只使用恢复后新完成的步数。平均耗时包含已发生的数据处理、周期验证及保存开销，不含启动阶段的模型加载；ETA 估算到 `max_steps`，末尾评测和保存不单独预测。分钟向上取整，初期及样本长度变化较大时估计可能波动。
+
 命令行入口使用 Python 标准库 logging 输出运行日志，格式为 `时间 级别 [rank=N] 模块: 内容`，默认级别 INFO，写入 stderr。可通过 `PREFETCH_LOG_LEVEL=WARNING` 只显示 warning 及更高级别日志，或用 `DEBUG` 增加调试输出。训练进度、模型加载、量化、checkpoint 保存和评测诊断使用 logger；模型生成的回答以及数据准备、独立基模评测、NF4 导出和离线统计命令的最终 JSON 结果保留在 stdout，便于重定向。训练 `train.jsonl` 和评测 JSON/CSV 的结构保持不变。需要保存完整控制台输出时，可在命令末尾追加 `> run.log 2>&1`。
 
 YAML 的 `output_dir` 指定保存父目录，默认 `prefetch/outputs`。新训练自动创建 `<mode>_YYYYMMDD_HHMMSS` 子目录，例如 `same_token_20260923_140530`；router 阶段的 mode 来自 `prefetch.mode`，LoRA 阶段使用 `lora`。时间取 rank 0 的服务器本地时间，精确到秒，由 rank 0 统一生成并广播给所有卡。启动时会打印实际 `Output directory`，日志、评测和 checkpoint 均保存于该目录。同一父目录、同一模式在同一秒重复启动时会报目录冲突，以保护已有结果。
