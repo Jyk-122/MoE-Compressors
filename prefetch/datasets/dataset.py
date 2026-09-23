@@ -93,10 +93,14 @@ class SFTCollator:
 
 
 def load_records(paths, limit=None):
-    from datasets import load_dataset
+    from datasets import Sequence, Value, load_dataset
     if isinstance(paths, str):
         paths = [paths]
     dataset = load_dataset("json", data_files=paths, split="train")
+    # Text-only files contain [] throughout; Arrow infers list<null> without this cast.
+    image_feature = Sequence(Value("string"))
+    if dataset.features["images"] != image_feature:
+        dataset = dataset.cast_column("images", image_feature)
     return dataset.select(range(min(limit, len(dataset)))) if limit else dataset
 
 

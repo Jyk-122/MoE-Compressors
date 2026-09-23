@@ -1,10 +1,11 @@
 from types import SimpleNamespace
+import json
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from prefetch.datasets.dataset import OverlengthSample, SFTCollator
+from prefetch.datasets.dataset import OverlengthSample, SFTCollator, load_records, training_records
 
 
 class ToyProcessor:
@@ -53,3 +54,32 @@ def test_visual_expansion_is_preserved(tmp_path):
 def test_overlength_is_explicit():
     with pytest.raises(OverlengthSample):
         SFTCollator(ToyProcessor(), max_length=2)([example()])
+
+
+@pytest.mark.parametrize("images", [[], ["image.jpg"]])
+def test_image_paths_have_string_type(tmp_path, monkeypatch, images):
+    datasets = pytest.importorskip("datasets")
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", tmp_path / "cache")
+    record = dict(example(images), num_tokens=20, assistant_text_tokens=5)
+    path = tmp_path / "records.jsonl"
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    loaded = load_records(str(path), limit=1)
+    assert loaded.features["images"] == datasets.Sequence(datasets.Value("string"))
+    assert loaded[0] == record
+
+
+def test_mix_text_and_vision_records(tmp_path, monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", tmp_path / "cache")
+    sources, expected = [], {}
+    for source, images in (("cog", ["image.jpg"]), ("tulu", [])):
+        record = dict(example(images), id=source, source=source, group_id=source,
+                      num_tokens=20, assistant_text_tokens=5)
+        path = tmp_path / f"{source}.jsonl"
+        path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        sources.append(dict(path=str(path), weight=0.5))
+        expected[source] = record
+    mixed = training_records(dict(train=sources, seed=42))
+    assert mixed.features["images"] == datasets.Sequence(datasets.Value("string"))
+    assert {row["source"] for row in mixed} == {"cog", "tulu"}
+    assert all(row == expected[row["source"]] for row in mixed)

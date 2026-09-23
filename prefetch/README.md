@@ -150,12 +150,12 @@ model.router_forward_kwargs 默认传 logits_to_keep: 1，减少 router 阶段�
 
 ~~~bash
 # 两卡短训前，将 max_steps 设为 2，log/eval/save_every 设为 1。
-NPROC_PER_NODE=2 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.yaml
+CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.yaml
 
 # 完整配置与独立 output_dir 就绪后运行八卡。
-NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.yaml
 
-NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/previous_token.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/previous_token.yaml
 
 # 同配置、同 world size 续训，只加载可信本地 trainer_state.pt。
 NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.yaml \
