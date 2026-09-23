@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import math
 from pathlib import Path
 
@@ -10,6 +11,9 @@ import torch.distributed as dist
 from torch import nn
 
 from prefetch.backbone.structure import find_moe_blocks
+
+
+logger = logging.getLogger(__name__)
 
 
 KEY_MAPPING = {
@@ -129,7 +133,7 @@ def _load_one(config, device):
                   nf4_checkpoint=checkpoint,
                   allocated_gib=torch.cuda.memory_allocated(device) / 2**30,
                   peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30)
-    print(json.dumps({"loading": report}), flush=True)
+    logger.info("%s", json.dumps({"loading": report}))
     return model, processor, report
 
 

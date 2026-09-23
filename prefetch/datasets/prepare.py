@@ -4,9 +4,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
+
+from prefetch.utils.logging import configure_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def validation_group(key, fraction, seed):
@@ -31,7 +38,9 @@ def cog_records(root, caption_prompt, limit=None, caption_prompt_zh="请详细�
     for label in labels:
         image_files = sorted((label.parent.parent / "images").glob(label.stem + ".*"))
         if len(image_files) != 1:
-            raise ValueError(f"Expected one image for {label}, found {image_files}")
+            logger.warning("Skipping %s: expected one matching image, found %d (%s)",
+                           label, len(image_files), image_files)
+            continue
         image = image_files[0].resolve()
         digest = hashlib.sha256(image.read_bytes()).hexdigest()
         payload = json.loads(label.read_text(encoding="utf-8"))
@@ -69,8 +78,7 @@ def write_splits(records, directory, fraction, seed, total=None, desc="Prepare")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     counts = {"train": 0, "validation": 0}
-    # Exclusive creation prevents accidentally replacing an experiment's manifest.
-    with (directory / "train.jsonl").open("w", encoding="utf-8") as train, \
+    with logging_redirect_tqdm(), (directory / "train.jsonl").open("w", encoding="utf-8") as train, \
             (directory / "validation.jsonl").open("w", encoding="utf-8") as validation:
         # records is lazy: this bar covers dataset reading, normalization and writing.
         for record in tqdm(records, total=total, desc=desc, unit="sample", dynamic_ncols=True):
@@ -127,6 +135,7 @@ def main():
     command.add_argument("--max-length", type=int, default=2048)
     command.add_argument("--max-image-side", type=int, default=672)
     args = parser.parse_args()
+    configure_logging()
     if args.command == "filter":
         report = filter_records(args)
         metadata_path = Path(args.output).with_suffix(".meta.json")

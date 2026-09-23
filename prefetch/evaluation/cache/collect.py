@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import logging
 from pathlib import Path
 
 import torch
@@ -17,6 +18,10 @@ from prefetch.evaluation.evaluate import experiment_config, generation_inputs
 from prefetch.prerouter.checkpoint import read_metadata
 from prefetch.prerouter.patch import patch
 from prefetch.training.runtime import rank, seed_all, setup, world_size
+from prefetch.utils.logging import configure_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 @torch.inference_mode()
@@ -27,6 +32,7 @@ def main():
     parser.add_argument("--output", required=True, help="Directory for one JSONL per validation source and rank")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     args = parser.parse_args()
+    configure_logging()
     if args.max_new_tokens < 1:
         parser.error("max-new-tokens must be positive")
     if read_metadata(args.checkpoint)["config"]["mode"] != "same_token":
@@ -67,7 +73,7 @@ def main():
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
                 file.flush()
             file.write(json.dumps(dict(type="complete", requests=len(indices))) + "\n")
-        print(f"Saved cache trace: {path}", flush=True)
+        logger.info("Saved cache trace: %s", path)
     if dist.is_initialized():
         dist.destroy_process_group()
 

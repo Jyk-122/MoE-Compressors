@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import gc
+import logging
 
 import torch
 from torch import nn
 
 from prefetch.backbone.structure import find_moe_blocks
+
+
+logger = logging.getLogger(__name__)
 
 
 class NF4Experts(nn.Module):
@@ -52,5 +56,5 @@ def quantize_experts(model, device, blocksize=64):
         block.experts = NF4Experts(original, device, blocksize)
         del original
         gc.collect()
-        print(f"NF4 {name}: cumulative source parameters={converted:,}", flush=True)
+        logger.info("NF4 %s: cumulative source parameters=%s", name, f"{converted:,}")
     return converted

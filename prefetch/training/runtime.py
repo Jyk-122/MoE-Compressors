@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import json
+import logging
 import os
 from pathlib import Path
 import random
@@ -15,6 +16,9 @@ import yaml
 
 from prefetch.datasets.dataset import SFTCollator, load_records, to_device
 from prefetch.evaluation.metrics import save_report
+
+
+logger = logging.getLogger(__name__)
 
 
 def read_config(path):
@@ -125,7 +129,7 @@ def evaluate_task(task, processor, config, device, output_dir, step):
                                      if k != "distribution"}
         summaries[name] = summary
     if rank() == 0:
-        print(json.dumps({"evaluation": summaries, "step": step}), flush=True)
+        logger.info("%s", json.dumps({"evaluation": summaries, "step": step}))
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         (Path(output_dir) / f"summary-step{step}.json").write_text(json.dumps(summaries, indent=2), encoding="utf-8")
     task.set_training(True)

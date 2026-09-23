@@ -10,6 +10,7 @@ import torch
 from prefetch.backbone.loading import load_model
 from prefetch.backbone.nf4_checkpoint import save_nf4_checkpoint
 from prefetch.training.runtime import read_config
+from prefetch.utils.logging import configure_logging
 
 
 def main():
@@ -18,6 +19,7 @@ def main():
     parser.add_argument("--output", required=True, help="New checkpoint directory")
     parser.add_argument("--blocksize", type=int, choices=[64, 128, 256, 512, 1024, 2048, 4096])
     args = parser.parse_args()
+    configure_logging()
     if Path(args.output).exists():
         parser.error("output already exists; choose a new checkpoint directory")
     config = read_config(args.config)

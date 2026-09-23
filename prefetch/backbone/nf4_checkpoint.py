@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import torch
@@ -9,6 +10,9 @@ from torch import nn
 
 from prefetch.backbone.quantization import NF4Experts
 from prefetch.backbone.structure import find_moe_blocks
+
+
+logger = logging.getLogger(__name__)
 
 
 def cpu_tensors(values):
@@ -43,7 +47,7 @@ def save_nf4_checkpoint(model, directory, source_model, blocksize=64, shard_byte
         filename = f"experts-{index:03d}.safetensors"
         save_file(cpu_tensors(block.experts.state_dict()), str(directory / filename))
         metadata["experts"].append(dict(name=name, file=filename))
-        print(f"Saved NF4 {name}", flush=True)
+        logger.info("Saved NF4 %s", name)
 
     prefixes = tuple(f"{name}.experts." for name, _ in blocks)
     shard, size = {}, 0

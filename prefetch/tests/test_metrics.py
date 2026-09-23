@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 
@@ -96,6 +97,55 @@ def test_cog_record_limit(cog_root, limit):
 def test_cog_limit_stops_before_reading_next_image(cog_root):
     (cog_root / "dialogue/images/1.jpg").unlink()
     assert len(list(cog_records(cog_root, "Describe.", limit=4))) == 4
+
+
+@pytest.mark.parametrize("image_names", [[], ["1.jpg", "1.png"]])
+@pytest.mark.parametrize("limit", [None, 5])
+def test_cog_skips_unmatched_images_and_keeps_reading(cog_root, caplog, image_names, limit):
+    expected = list(cog_records(cog_root, "Describe.", limit=limit))
+    # This subset sorts after valid caption records and before valid dialogue records.
+    subset = cog_root / "caption_missing"
+    (subset / "images").mkdir(parents=True)
+    for name in image_names:
+        (subset / "images" / name).write_bytes(b"image")
+    for language in ("en", "zh"):
+        directory = subset / f"labels_{language}"
+        directory.mkdir()
+        (directory / "1.json").write_text(json.dumps({"captions": [{"content": "A cat."}]}))
+
+    with caplog.at_level(logging.WARNING, logger="prefetch.datasets.prepare"):
+        actual = list(cog_records(cog_root, "Describe.", limit=limit))
+    assert actual == expected
+    assert len(caplog.records) == 2
+    for record, language in zip(caplog.records, ("en", "zh")):
+        assert record.levelno == logging.WARNING
+        assert str(subset / f"labels_{language}" / "1.json") in record.getMessage()
+        assert f"found {len(image_names)}" in record.getMessage()
+
+
+def test_cog_cli_warning_preserves_json_and_progress(cog_root, tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    (cog_root / "caption/images/1.jpg").unlink()
+    output = tmp_path / "prepared"
+    result = subprocess.run(
+        [sys.executable, "-m", "prefetch.datasets.prepare", "cog", "--root", str(cog_root),
+         "--output", str(output), "--limit", "2"],
+        capture_output=True, text=True, encoding="utf-8",
+        env=dict(os.environ, PYTHONIOENCODING="utf-8", PREFETCH_LOG_LEVEL="INFO", RANK="0"),
+        check=True,
+    )
+    report = json.loads(result.stdout)
+    assert report["train"] + report["validation"] == 2
+    assert "WARNING [rank=0]" in result.stderr
+    assert "Skipping" in result.stderr
+    assert "2/2" in result.stderr and "Prepare cog" in result.stderr
+    records = [json.loads(line) for split in ("train", "validation")
+               for line in (output / f"{split}.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 2
+    assert all("dialogue/" in record["id"] for record in records)
 
 
 def test_cog_languages_are_grouped_by_image(cog_root):

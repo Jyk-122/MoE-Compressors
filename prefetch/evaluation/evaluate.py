@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 import torch
@@ -16,6 +17,10 @@ from prefetch.evaluation.plot import plot_report
 from prefetch.evaluation.routing import RoutingMetrics, capture_generation
 from prefetch.training.runtime import evaluate_task, rank, read_config, setup, world_size
 from prefetch.training.train import TrainingTask
+from prefetch.utils.logging import configure_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def experiment_config(config_path, checkpoint):
@@ -68,7 +73,7 @@ def evaluate_generation(model, state, processor, config, device, output, max_new
             path = Path(output) / f"{name}-generation.json"
             save_report(report, path)
             plot_report(report, path.with_suffix(""))
-            print(json.dumps({name: {p: v["global"] for p, v in report["phases"].items()}}), flush=True)
+            logger.info("%s", json.dumps({name: {p: v["global"] for p, v in report["phases"].items()}}))
 
 
 def main():
@@ -79,6 +84,7 @@ def main():
     parser.add_argument("--mode", choices=["teacher_forcing", "generation"], default="teacher_forcing")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     args = parser.parse_args()
+    configure_logging()
     config = experiment_config(args.config, args.checkpoint)
     device = setup(config.get("seed", 42))
     model, processor, _ = load_model(config, device)

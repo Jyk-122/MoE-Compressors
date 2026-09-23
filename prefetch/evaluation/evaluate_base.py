@@ -13,6 +13,7 @@ from tqdm import tqdm
 from prefetch.backbone.loading import load_model
 from prefetch.datasets.dataset import to_device
 from prefetch.training.runtime import make_collator, read_config
+from prefetch.utils.logging import configure_logging
 
 
 @torch.inference_mode()
@@ -45,6 +46,7 @@ def main():
     parser.add_argument("--limit", type=int, default=128)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    configure_logging()
     if args.limit <= 0:
         parser.error("limit must be positive")
     config = read_config(args.config)

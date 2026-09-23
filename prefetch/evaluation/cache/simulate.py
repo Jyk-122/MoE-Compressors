@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 from prefetch.evaluation.cache.oracle import simulate_layer
+from prefetch.utils.logging import configure_logging
 
 
 COSTS = ("baseline_loads", "prefetch_loads", "demand_loads",
@@ -146,6 +147,7 @@ def main():
     parser.add_argument("--output", required=True, help="Directory for report.json, summary.csv and per-layer figures")
     parser.add_argument("--no-plots", action="store_true")
     args = parser.parse_args()
+    configure_logging()
     paths = []
     for pattern in args.traces:
         matched = sorted(glob(pattern))

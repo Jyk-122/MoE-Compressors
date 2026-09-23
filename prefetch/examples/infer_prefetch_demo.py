@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 import time
 
@@ -15,6 +16,10 @@ from prefetch.evaluation.metrics import save_report
 from prefetch.prerouter.patch import patch
 from prefetch.evaluation.plot import plot_report
 from prefetch.evaluation.routing import RoutingMetrics, capture_generation
+from prefetch.utils.logging import configure_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -28,6 +33,7 @@ def main():
     parser.add_argument("--trace-k", type=int, default=16)
     parser.add_argument("--output", default="prefetch/outputs/demo/metrics.json")
     args = parser.parse_args()
+    configure_logging()
     config = experiment_config(args.config, args.checkpoint)
     torch.manual_seed(config.get("seed", 42))
     device = torch.device("cuda", 0)
@@ -62,8 +68,8 @@ def main():
     plot_report(report, Path(args.output).with_suffix(""))
     print(answer)
     for phase in ("prefill", "decode"):
-        print(phase, json.dumps(report["phases"][phase]["global"], ensure_ascii=False))
-    print(f"Metrics: {args.output}; instrumented generation: {elapsed:.3f}s")
+        logger.info("%s %s", phase, json.dumps(report["phases"][phase]["global"], ensure_ascii=False))
+    logger.info("Metrics: %s; instrumented generation: %.3fs", args.output, elapsed)
 
 
 if __name__ == "__main__":

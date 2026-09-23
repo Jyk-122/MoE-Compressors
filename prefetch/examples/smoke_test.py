@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 import torch
@@ -13,6 +14,10 @@ from prefetch.prerouter.patch import patch
 from prefetch.training.runtime import make_collator, read_config, setup
 from prefetch.training.train import TrainingTask
 from prefetch.backbone.quantization import NF4Experts
+from prefetch.utils.logging import configure_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -20,6 +25,7 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--sample-file", required=True, help="Normalized JSONL; reads its first record")
     args = parser.parse_args()
+    configure_logging()
     config = read_config(args.config)
     device = setup(config.get("seed", 42))
     with Path(args.sample_file).open(encoding="utf-8") as file:
@@ -27,8 +33,8 @@ def main():
     model, processor, loading = load_model(config, device)
     batch = to_device(make_collator(processor, config["data"])([sample]), device)
     ids, mask = batch["input_ids"][0], batch["router_mask"][0]
-    print(json.dumps(dict(id=sample["id"], tokens=ids.numel(), router_tokens=int(mask.sum()),
-                          supervised_text=processor.tokenizer.decode(ids[mask].tolist())[:1000]), ensure_ascii=False))
+    logger.info("%s", json.dumps(dict(id=sample["id"], tokens=ids.numel(), router_tokens=int(mask.sum()),
+                                    supervised_text=processor.tokenizer.decode(ids[mask].tolist())[:1000]), ensure_ascii=False))
     state = None
     if config["stage"] == "router":
         inputs = {k: v for k, v in batch.items() if k not in {"router_mask", "labels"}}
@@ -39,7 +45,7 @@ def main():
         with torch.no_grad():
             patched = model(**inputs, use_cache=False, **kwargs).logits.detach()
         torch.testing.assert_close(original, patched, rtol=0, atol=0)
-        print(f"Native logits preserved; output shape={tuple(patched.shape)}")
+        logger.info("Native logits preserved; output shape=%s", tuple(patched.shape))
         del original, patched
     elif config["training"].get("gradient_checkpointing", True):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -66,11 +72,11 @@ def main():
         values = torch.randn(2, linear.in_features, device=device, dtype=torch.bfloat16, requires_grad=True)
         linear(values).float().square().mean().backward()
         assert values.grad is not None and torch.isfinite(values.grad).all() and values.grad.abs().sum() > 0
-        print(f"NF4 packed weight and input gradient checked; blocksize={linear.weight.quant_state.blocksize}")
-    print(json.dumps(dict(loss=float(loss.detach()), trainable_tensors=len(gradients), loading=loading,
-                          peak_gpu_gib=torch.cuda.max_memory_allocated(device) / 2**30), indent=2))
+        logger.info("NF4 packed weight and input gradient checked; blocksize=%d", linear.weight.quant_state.blocksize)
+    logger.info("%s", json.dumps(dict(loss=float(loss.detach()), trainable_tensors=len(gradients), loading=loading,
+                                    peak_gpu_gib=torch.cuda.max_memory_allocated(device) / 2**30), indent=2))
     if state:
-        print(json.dumps(task.meter.report()["phases"]["teacher_forcing"]["global"], indent=2))
+        logger.info("%s", json.dumps(task.meter.report()["phases"]["teacher_forcing"]["global"], indent=2))
 
 
 if __name__ == "__main__":

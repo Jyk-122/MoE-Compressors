@@ -105,15 +105,21 @@ def load_records(paths, limit=None):
 
 
 def training_records(config):
+    """Mix training sources, then cap the shared dataset before DDP sharding."""
+    limit = config.get("train_limit")
+    if limit is not None and limit < 1:
+        raise ValueError("data.train_limit must be positive")
     from datasets import interleave_datasets
     sources = config["train"]
     parts = [load_records(source["path"], source.get("limit")) for source in sources]
     if len(parts) == 1:
-        return parts[0]
-    probabilities = [source.get("weight", 1.0) for source in sources]
-    total = sum(probabilities)
-    return interleave_datasets(parts, probabilities=[x / total for x in probabilities],
-                               seed=config.get("seed", 42), stopping_strategy="all_exhausted")
+        dataset = parts[0]
+    else:
+        probabilities = [source.get("weight", 1.0) for source in sources]
+        total = sum(probabilities)
+        dataset = interleave_datasets(parts, probabilities=[x / total for x in probabilities],
+                                      seed=config.get("seed", 42), stopping_strategy="all_exhausted")
+    return dataset.select(range(min(limit, len(dataset)))) if limit is not None else dataset
 
 
 def to_device(batch, device):

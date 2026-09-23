@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 import json
+import logging
 import math
 from pathlib import Path
 import random
@@ -25,6 +26,10 @@ from prefetch.backbone.structure import choice_scores
 from prefetch.evaluation.routing import RoutingMetrics
 from prefetch.training.runtime import (evaluate_task, make_collator, prepare_run_directory,
                                        rank, read_config, seed_all, setup, world_size)
+from prefetch.utils.logging import configure_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def router_loss(prediction, teacher, block, temperature, loss_kind):
@@ -121,7 +126,7 @@ def save_checkpoint(task, config, optimizer, scheduler, step, epoch, next_batch,
         torch.save(dict(optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(),
                         step=step, epoch=epoch, next_batch=next_batch, rng=states,
                         world_size=world_size()), directory / "trainer_state.pt")
-        print(f"Saved {directory}", flush=True)
+        logger.info("Saved %s", directory)
     if dist.is_initialized():
         dist.barrier()
 
@@ -130,15 +135,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", help="Trusted local checkpoint directory, including optimizer/RNG state")
+    parser.add_argument("--limit", type=int, help="Maximum training examples after mixing, shared across ranks; overrides data.train_limit")
     args = parser.parse_args()
+    configure_logging()
     config = read_config(args.config)
+    if args.limit is not None:
+        config["data"]["train_limit"] = args.limit
+    limit = config["data"].get("train_limit")
+    if limit is not None and limit < 1:
+        parser.error("Training limit must be positive")
     device = setup(config.get("seed", 42))
+    if limit is not None and limit < world_size():
+        parser.error("Training limit must be at least the number of ranks; each rank needs one sample")
     stage = config.get("stage", "router")
     if stage not in {"router", "lora"}:
         raise ValueError("stage must be router or lora")
     output = prepare_run_directory(config, args.resume)
     if rank() == 0:
-        print(f"Output directory: {output}", flush=True)
+        logger.info("Output directory: %s", output)
     model, processor, loading_report = load_model(config, device)
     state = None
     if stage == "router":
@@ -190,8 +204,9 @@ def main():
         output.mkdir(parents=True, exist_ok=True)
         (output / "run_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
         (output / "loading_report.json").write_text(json.dumps(loading_report, indent=2), encoding="utf-8")
-        print(f"stage={stage}; trainable={sum(p.numel() for p in task.trainables):,}; "
-              f"samples={len(dataset)}; world={world_size()}; max_steps={max_steps}", flush=True)
+        logger.info("stage=%s; trainable=%s; samples=%d; world=%d; max_steps=%d",
+                    stage, f"{sum(p.numel() for p in task.trainables):,}",
+                    len(dataset), world_size(), max_steps)
     optimizer.zero_grad(set_to_none=True)
     totals = torch.zeros(3, device=device, dtype=torch.float64)
     started = time.monotonic()
@@ -231,7 +246,7 @@ def main():
                              learning_rate=scheduler.get_last_lr()[0], elapsed_seconds=time.monotonic() - started,
                              peak_gpu_gib=torch.cuda.max_memory_allocated(device) / 2**30)
                 if rank() == 0:
-                    print(json.dumps(entry), flush=True)
+                    logger.info("%s", json.dumps(entry))
                     with (output / "train.jsonl").open("a", encoding="utf-8") as file:
                         file.write(json.dumps(entry) + "\n")
                 totals.zero_()

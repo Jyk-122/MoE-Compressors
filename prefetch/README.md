@@ -95,6 +95,8 @@ head 注册为 source_moe.prerouter，输入是归一化后的 MoE 输入；调�
 
 CogVLM 先下载并解压官方数据，每个子数据集保留 images/、labels_en/、labels_zh/ 结构。脚本同时读取中英文标注，按同名文件匹配图片；两种语言分别生成独立样本，共用图片路径和图像内容 hash（group_id），因此同图的中英文、多条标注和跨目录副本属于同一 train/validation 分区。样本 ID 包含标注目录，区分两种语言。若根目录下没有中英文标注，则兼容读取 labels/。
 
+标注未找到对应图片，或匹配到多张图片时，记录包含标注路径的 WARNING 并跳过该标注，继续处理后续数据；跳过的记录不占用 `--limit`。warning 与 tqdm 进度条兼容，最终样本数以输出报告为准。
+
 脚本支持 captions/conversations。caption 样本默认使用英文提问 “Describe this image in detail.” 或中文提问“请详细描述这张图片。”，分别通过 --caption-prompt / --caption-prompt-zh 修改；conversation 保留标注中的提问和回答。
 
 ~~~bash
@@ -148,11 +150,13 @@ model.router_forward_kwargs 默认传 logits_to_keep: 1，减少 router 阶段�
 
 ## 4. 训练与恢复
 
+命令行入口使用 Python 标准库 logging 输出运行日志，格式为 `时间 级别 [rank=N] 模块: 内容`，默认级别 INFO，写入 stderr。可通过 `PREFETCH_LOG_LEVEL=WARNING` 只显示 warning 及更高级别日志，或用 `DEBUG` 增加调试输出。训练进度、模型加载、量化、checkpoint 保存和评测诊断使用 logger；模型生成的回答以及数据准备、独立基模评测、NF4 导出和离线统计命令的最终 JSON 结果保留在 stdout，便于重定向。训练 `train.jsonl` 和评测 JSON/CSV 的结构保持不变。需要保存完整控制台输出时，可在命令末尾追加 `> run.log 2>&1`。
+
 YAML 的 `output_dir` 指定保存父目录，默认 `prefetch/outputs`。新训练自动创建 `<mode>_YYYYMMDD_HHMMSS` 子目录，例如 `same_token_20260923_140530`；router 阶段的 mode 来自 `prefetch.mode`，LoRA 阶段使用 `lora`。时间取 rank 0 的服务器本地时间，精确到秒，由 rank 0 统一生成并广播给所有卡。启动时会打印实际 `Output directory`，日志、评测和 checkpoint 均保存于该目录。同一父目录、同一模式在同一秒重复启动时会报目录冲突，以保护已有结果。
 
 ~~~bash
 # 两卡短训前，将 max_steps 设为 2，log/eval/save_every 设为 1。
-CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.yaml
+CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.yaml --limit 32
 
 # 完整配置就绪后运行八卡；每次启动自动创建独立保存目录。
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.yaml
@@ -165,6 +169,10 @@ NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.
 ~~~
 
 `--resume` 使用 checkpoint 的 run_config.json 中保存的原运行目录，YAML 中的 output_dir 可以继续填写父目录；其余配置必须与保存时一致。恢复入口同样支持已有固定目录名的 checkpoint。只加载可信本地 trainer_state.pt。
+
+训练入口支持 `--limit N`，也可在 YAML 中设置 `data.train_limit: N`；命令行优先，省略或 YAML 设为 null 表示不限制。它取混合后训练序列的前 N 条（不足 N 时使用全部），在每轮 shuffle 和多卡分片之前生效，是所有卡共享的训练集总上限；`all_exhausted` 混合产生的重复样本也计入条数。现有 `data.train[].limit` 仍限制对应数据源，先应用各源 limit，再混合并应用总 limit。router 和 LoRA 训练阶段均支持。
+
+N 必须为正数，且多卡训练至少要有每卡一条样本；当前 sampler 使用 `drop_last=True`，每轮实际使用条数会向下取整到卡数的倍数，debug 时建议 N 能被卡数整除。这个参数限制进入训练的数据集大小，HF 对 JSON 的初始读取/缓存流程保持原样。`training.max_steps` 和验证集 `data.validation.*.limit` 独立控制：只缩小训练集仍会循环训练到 max_steps，短测时请一起调小。生效的 `data.train_limit` 会写入 run_config.json，续训时保留相同设置（若原来通过命令行设置，续训也传相同 `--limit`）。
 
 每卡一份基模，DDP 仅管理可训练参数。8 卡×微批 1×累积 8 的有效训练 batch 为 64，与端侧 batch=1 的推理设定分别定义。从 BF16 源加载时，serial_load 默认按 rank 串行执行，CPU 需容纳一份 BF16 基模及缓冲。配置 nf4_checkpoint 后，各 rank 并行读取已量化权重，serial_load 不再参与；用法见下节。
 
@@ -407,6 +415,7 @@ python -m prefetch.evaluation.cache.simulate \
 | evaluation/evaluate.py / evaluation/plot.py | 独立评测与曲线 |
 | evaluation/cache/trace.py / collect.py | 完整 decode 路由观测与多卡 JSONL 采集 |
 | evaluation/cache/oracle.py / simulate.py / report.py | 每层 oracle 缓存模拟、I/O 汇总与容量曲线 |
+| utils/logging.py | 命令行日志格式、级别与 rank 标识 |
 | examples/infer_base_demo.py / evaluation/evaluate_base.py | 纯基模 prompt 推理、固定验证集 NLL/PPL |
 | examples/infer_prefetch_demo.py / examples/smoke_test.py | 单 prompt 演示、真实模型检查 |
 

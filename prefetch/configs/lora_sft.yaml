@@ -19,6 +19,7 @@ data:
   max_image_side: 672
   router_tokens: assistant
   num_workers: 0
+  # train_limit: 128       # Optional total after mixing; CLI --limit overrides this.
   train:
     - {path: prefetch/data/cog/train.filtered.jsonl, weight: 0.5}
     - {path: prefetch/data/tulu/train.filtered.jsonl, weight: 0.5}

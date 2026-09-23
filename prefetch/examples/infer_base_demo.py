@@ -11,6 +11,7 @@ import torch
 from prefetch.backbone.loading import load_model
 from prefetch.datasets.dataset import multimodal_messages, open_images, processor_call, to_device
 from prefetch.training.runtime import read_config
+from prefetch.utils.logging import configure_logging
 
 
 def main():
@@ -22,6 +23,7 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--output", help="Optional JSON report")
     args = parser.parse_args()
+    configure_logging()
     config = read_config(args.config)
     config["stage"], config["lora"] = "base", {"enabled": False}
     if args.quantization:

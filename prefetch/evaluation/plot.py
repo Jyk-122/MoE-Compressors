@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from prefetch.evaluation.metrics import rebuild_report, save_report
+from prefetch.utils.logging import configure_logging
 
 
 def plot_report(report, output_prefix, layers=None):
@@ -53,6 +54,7 @@ def main():
     parser.add_argument("--output-prefix", help="Output file prefix; default: <input stem>-report")
     parser.add_argument("--layers", type=int, nargs="+", help="Common target MoE ordinals for distance comparisons")
     args = parser.parse_args()
+    configure_logging()
     path = Path(args.metrics)
     prefix = args.output_prefix or path.with_name(path.stem + "-report")
     report = plot_report(json.loads(path.read_text(encoding="utf-8")), prefix, args.layers)
