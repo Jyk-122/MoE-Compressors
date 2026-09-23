@@ -341,6 +341,56 @@ python -m prefetch.evaluation.plot prefetch/outputs/eval_teacher/text-stepfinal.
 
 `--layers 2` 可生成单层统计和图表；指定多层时生成这些层合并后的 global 曲线，同时保存各层统计。Recall@E 与 RequiredK CDF(E) 对有效样本必须为 1。RequiredK 分位数用于估计覆盖 95%/99% 调用所需的经验候选数，不构成未见数据的覆盖保证。
 
+### 专家缓存 I/O 模拟
+
+缓存评测分为 GPU 采集路由轨迹和 CPU 离线模拟。第一版使用 same-token checkpoint，固定预测 top-8；每层各有容量为 N 个等大小专家的独立缓存。原 router 仍决定实际执行的专家，模型权重、路由和训练 loss mask 均保持原样。
+
+**采集轨迹。** 对每条验证对话，用第一个 assistant 回答之前的上下文进行真实生成，记录每个 decode 输入 token、每个 MoE 的真值专家 ID 和对应预测 ID。包含所有实际执行的位置，独立于 Recall 的文本掩码、excluded_token_ids 和 trace_limit；没有 prerouter 的层记录 `prediction: null`。prefill 不进入这份 decode 轨迹。最终输出 token 尚未再次输入模型时，不会产生对应路由调用，因此 decode_tokens 通常比 generated_tokens 少 1。
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 bash prefetch/scripts/collect_cache_trace.sh \
+  prefetch/outputs/same_token_20260923_140530/checkpoint-1000 \
+  prefetch/outputs/cache_trace_step1000 \
+  --max-new-tokens 128
+~~~
+
+单卡也可运行 `python -m prefetch.evaluation.cache.collect --checkpoint ... --output ...`。采集默认使用 checkpoint 保存的验证集配置，可用 `--config` 指定相同基模/LoRA 配置下的验证数据及 limit。多卡按样本分片，输出 `vl-rank0.jsonl`、`text-rank0.jsonl` 等文件；文件独占创建，请为新一轮采集使用新的目录。
+
+每个 JSONL 首行为模型、预测器、生成设置与各层信息；随后每行是一条完整生成请求，包含各层按时间排列的 `truth` / `prediction` 集合；末行是完成标记。请等采集完成，再将需要统计的所有 rank 文件一起传给模拟器。同一请求内部保留顺序，不同请求之间各自重置缓存。
+
+**扫描缓存容量。** 同一份轨迹可反复扫描 N，不加载模型，也不需要重新训练：
+
+~~~bash
+python -m prefetch.evaluation.cache.simulate \
+  --traces 'prefetch/outputs/cache_trace_step1000/*.jsonl' \
+  --capacities 8 16 32 64 128 384 \
+  --output prefetch/outputs/cache_io_step1000
+~~~
+
+默认模拟所有 MoE，序号从 0 开始；`--layers 2 3 4` 可限定共同目标层，`--no-plots` 只生成 JSON/CSV。每个缓存容量至少要容纳完整的预测集合与完整的真值集合（当前模型均为 8 个），而不是要求两个集合的并集同时驻留。
+
+**缓存和置换规则。** 每条请求从第一个 decode 调用开始，两种策略各自使用空缓存，并在后续 token 间保留各自状态。这个受控冷启动条件不模拟 prefill 留下的热缓存，也不包含 prefill I/O。无 prerouter 的基线只加载当前缺失的真值专家；预取策略先将预测的 8 个专家准备好，再补齐真值。已有缓存命中不产生读取。
+
+每个阶段都保护本阶段完整请求集合中的专家；空间不足时，从其余缓存项中逐出下一次真实需求最远的专家，后续不再使用视为无穷远，同名次时逐出 ID 较大的专家。预取阶段的未来真实需求包含当前 token 即将到来的真值路由。oracle 只决定置换，不过滤错误预测；错误预测即使以后不使用，也照常加载。无预测器的层在两种策略下都按需加载。权重只读，逐出不产生写回 I/O。
+
+| 字段 | 含义 |
+|---|---|
+| `baseline_loads_per_token` | 无 prerouter、理想按需置换的专家加载量 |
+| `prefetch_loads_per_token` | 预取阶段加载量，仅计算缓存缺失项 |
+| `demand_loads_per_token` | 预取完成后，按真值仍需补读的加载量 |
+| `total_loads_per_token` | 预取加载量 + 真值补读量 |
+| `extra_loads_per_token` | 总加载量 − 基线加载量 |
+| `io_amplification` | 总加载量 / 基线加载量 |
+| `demand_load_reduction` | 1 − 真值补读量 / 基线加载量，可为负数 |
+
+同时保存上述原始累计次数、各阶段 `*_evictions` 和对应每 token 均值。`first_token_*_per_request` 单列每条非空请求首个 decode token 的平均冷启动成本；`after_first_*_per_token` 排除这些首 token 后再求平均，不代表已经达到稳态。无 decode 调用时计数为 0、比率为 null。
+
+输出 `report.json`、`summary.csv`，以及各数据源的 `text-global.png`、`text-0.png` 等逐层图。JSON 的 `sources.<数据源>.per_layer` 是各层平均每个 decode token 的开销；`global_curve` 是所选层开销之和除以实际 decode token 数，代表一次模型 decode 步骤的总开销，不是层间平均。VL/text 分开汇总；较长生成序列按其实际 token 数贡献更多统计量。
+
+模拟的单位是逻辑专家加载次数，不是底层 Flash 系统调用次数或时延。相同容量与冷启动条件下，理想按需基线是总加载量下界；预取可能以更多总读取换取更少的真值补读。预取策略的 oracle 使用未来真值，并不声称最小化包含强制预测请求后的总 I/O。这里假定预取在目标路由前完成，尚未模拟 Flash 带宽、跨层争用、预取距离、计算耗时或额外 staging buffer；预取也必须占用同一个 N 容量缓存。
+
+此前的 RequiredK 直方图和限量 trace 缺少完整专家访问顺序，不能直接用于缓存模拟。previous-token 模式需要进一步建模预取与上一 token 同层访问的交错时序，当前采集入口会明确拒绝该模式。
+
 ## 7. 代码导航与产物
 
 | 文件 | 职责 |
@@ -355,6 +405,8 @@ python -m prefetch.evaluation.plot prefetch/outputs/eval_teacher/text-stepfinal.
 | datasets/prepare.py / datasets/dataset.py | 规范化、过滤、processor、mask |
 | training/train.py / training/runtime.py | KL 损失、两阶段训练、DDP、保存恢复、周期验证 |
 | evaluation/evaluate.py / evaluation/plot.py | 独立评测与曲线 |
+| evaluation/cache/trace.py / collect.py | 完整 decode 路由观测与多卡 JSONL 采集 |
+| evaluation/cache/oracle.py / simulate.py / report.py | 每层 oracle 缓存模拟、I/O 汇总与容量曲线 |
 | examples/infer_base_demo.py / evaluation/evaluate_base.py | 纯基模 prompt 推理、固定验证集 NLL/PPL |
 | examples/infer_prefetch_demo.py / examples/smoke_test.py | 单 prompt 演示、真实模型检查 |
 
