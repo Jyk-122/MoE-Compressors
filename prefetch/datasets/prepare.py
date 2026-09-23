@@ -91,25 +91,32 @@ def write_splits(records, directory, fraction, seed, total=None, desc="Prepare")
 
 def filter_records(args):
     from transformers import AutoProcessor
-    from prefetch.datasets.dataset import OverlengthSample, SFTCollator
+    from prefetch.datasets.dataset import MissingUserTurn, OverlengthSample, SFTCollator
     processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
     collate = SFTCollator(processor, args.max_length, max_image_side=args.max_image_side)
-    kept = rejected = 0
+    kept = rejected = missing_user_turn = 0
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    with Path(args.input).open(encoding="utf-8") as source, output.open("w", encoding="utf-8") as target:
-        for line in tqdm(source, desc=f"Filter {Path(args.input).name}", unit="sample", dynamic_ncols=True):
+    with logging_redirect_tqdm(), Path(args.input).open(encoding="utf-8") as source, \
+            output.open("w", encoding="utf-8") as target:
+        for line_number, line in enumerate(tqdm(source, desc=f"Filter {Path(args.input).name}",
+                                                unit="sample", dynamic_ncols=True), start=1):
             record = json.loads(line)
             try:
                 batch = collate([record])
             except OverlengthSample:
                 rejected += 1
                 continue
+            except MissingUserTurn as error:
+                missing_user_turn += 1
+                logger.warning("Skipping %s (%s:%d): %s", record.get("id", "<unknown>"),
+                               args.input, line_number, error)
+                continue
             record["num_tokens"] = batch["input_ids"].shape[1]
             record["assistant_text_tokens"] = int(batch["router_mask"].sum())
             target.write(json.dumps(record, ensure_ascii=False) + "\n")
             kept += 1
-    return dict(kept=kept, overlength=rejected, processor=args.model_path,
+    return dict(kept=kept, overlength=rejected, missing_user_turn=missing_user_turn, processor=args.model_path,
                 max_length=args.max_length, max_image_side=args.max_image_side)
 
 

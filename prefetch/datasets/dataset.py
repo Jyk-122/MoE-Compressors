@@ -11,6 +11,10 @@ class OverlengthSample(ValueError):
     pass
 
 
+class MissingUserTurn(ValueError):
+    pass
+
+
 def open_images(paths, max_image_side=None):
     images = []
     for path in paths:
@@ -32,7 +36,7 @@ def multimodal_messages(messages, image_paths):
             inserted = True
         message["content"] = content
     if image_paths and not inserted:
-        raise ValueError("An image example needs a user turn")
+        raise MissingUserTurn("An image example needs a user turn")
     return messages
 
 
@@ -61,8 +65,8 @@ class SFTCollator:
             raise ValueError("Use micro_batch_size=1; use gradient accumulation for a larger training batch")
         example = examples[0]
         paths = example.get("images") or []
-        images = open_images(paths, self.max_image_side)
         messages = multimodal_messages(example["messages"], paths)
+        images = open_images(paths, self.max_image_side)
         batch = dict(processor_call(self.processor, messages, images))
         ids = batch["input_ids"]
         if ids.shape[1] > self.max_length:

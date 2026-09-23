@@ -122,7 +122,7 @@ for source in cog tulu; do
 done
 ~~~
 
-过滤保留完整对话和图像 span，报告 kept/overlength 数与 processor 配置。全量过滤需要 CPU 和图像读取时间，先用小样本检查模板。若 chat prefix 与完整序列 token 不一致，错误包含样本 ID，应按该 checkpoint 的 processor 调整 datasets/dataset.py 的区间提取。
+过滤保留完整对话和图像 span，报告 kept/overlength/missing_user_turn 数与 processor 配置。带图片但没有 user 消息的样本会记录 WARNING 并跳过，日志包含样本 ID、输入文件和行号，计入 missing_user_turn；过滤继续处理后续记录。全量过滤需要 CPU 和图像读取时间，先用小样本检查模板。若 chat prefix 与完整序列 token 不一致，错误包含样本 ID，应按该 checkpoint 的 processor 调整 datasets/dataset.py 的区间提取。
 
 每卡微批固定 1 条，不做 packing。data.train[].weight 控制 VL/text 采样；all_exhausted 策略可能重采样较小集合。data.validation 中的集合独立出报告，也可增加子集。默认只评价 assistant 文本输入位置，可切换 all_text；LM labels 包含 assistant 结束 token，router 文本指标排除 tokenizer 的 special tokens。
 

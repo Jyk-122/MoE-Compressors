@@ -1,11 +1,14 @@
 from types import SimpleNamespace
 import json
+import logging
+import sys
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from prefetch.datasets.dataset import OverlengthSample, SFTCollator, load_records, training_records
+from prefetch.datasets.dataset import MissingUserTurn, OverlengthSample, SFTCollator, load_records, training_records
+from prefetch.datasets.prepare import filter_records
 
 
 class ToyProcessor:
@@ -54,6 +57,53 @@ def test_visual_expansion_is_preserved(tmp_path):
 def test_overlength_is_explicit():
     with pytest.raises(OverlengthSample):
         SFTCollator(ToyProcessor(), max_length=2)([example()])
+
+
+@pytest.mark.parametrize("messages", [[], [dict(role="assistant", content="A cat.")],
+                                       [dict(role="system", content="Describe images.")]])
+def test_image_without_user_turn_is_identified_before_image_loading(messages):
+    record = dict(id="missing-user", images=["not-opened.png"], messages=messages)
+    with pytest.raises(MissingUserTurn, match="needs a user turn"):
+        SFTCollator(ToyProcessor())([record])
+
+
+def test_filter_skips_missing_user_and_continues(tmp_path, monkeypatch, caplog, capsys):
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
+        AutoProcessor=SimpleNamespace(from_pretrained=lambda *args, **kwargs: ToyProcessor())))
+    records = [dict(example(), id="first"),
+               dict(id="missing-user", images=["not-opened.png"], messages=[dict(role="assistant", content="A cat.")]),
+               dict(id="long", images=[], messages=[dict(role="user", content="hello" * 100),
+                                                     dict(role="assistant", content="yes")]),
+               dict(example(), id="last")]
+    source, output = tmp_path / "train.jsonl", tmp_path / "train.filtered.jsonl"
+    source.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    args = SimpleNamespace(input=str(source), output=str(output), model_path="toy", max_length=64, max_image_side=672)
+    with caplog.at_level(logging.WARNING, logger="prefetch.datasets.prepare"):
+        report = filter_records(args)
+    assert report["kept"] == 2 and report["overlength"] == 1 and report["missing_user_turn"] == 1
+    saved = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [record["id"] for record in saved] == ["first", "last"]
+    assert all(record["num_tokens"] > 0 and record["assistant_text_tokens"] > 0 for record in saved)
+    assert "missing-user" in caplog.text and f"{source}:2" in caplog.text
+    assert "Filter train.jsonl" in capsys.readouterr().err
+
+
+def test_filter_preserves_other_errors(tmp_path, monkeypatch):
+    from prefetch.datasets import dataset
+
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
+        AutoProcessor=SimpleNamespace(from_pretrained=lambda *args, **kwargs: ToyProcessor())))
+
+    def fail(self, examples):
+        raise ValueError("chat-template prefixes do not align")
+
+    monkeypatch.setattr(dataset.SFTCollator, "__call__", fail)
+    source = tmp_path / "train.jsonl"
+    source.write_text(json.dumps(example()) + "\n", encoding="utf-8")
+    args = SimpleNamespace(input=str(source), output=str(tmp_path / "filtered.jsonl"),
+                           model_path="toy", max_length=64, max_image_side=672)
+    with pytest.raises(ValueError, match="chat-template prefixes do not align"):
+        filter_records(args)
 
 
 @pytest.mark.parametrize("images", [[], ["image.jpg"]])
