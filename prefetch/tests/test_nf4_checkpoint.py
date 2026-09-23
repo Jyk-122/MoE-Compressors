@@ -182,14 +182,6 @@ def test_cache_loader_uses_config_skeleton(tmp_path, fake_bnb, monkeypatch):
     assert not restored.training
 
 
-def test_packed_loading_is_parallel(monkeypatch):
-    import prefetch.backbone.loading as loading
-    monkeypatch.setattr(loading.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(loading.dist, "barrier", lambda: pytest.fail("Packed loading must not serialize ranks"))
-    monkeypatch.setattr(loading, "_load_one", lambda config, device: "loaded")
-    assert load_model({"model": {"nf4_checkpoint": "cache", "serial_load": True}}, "cpu") == "loaded"
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Real NF4 roundtrip requires CUDA")
 @pytest.mark.parametrize("blocksize", [64, 128])
 def test_nf4_checkpoint_cuda_roundtrip(tmp_path, monkeypatch, blocksize):

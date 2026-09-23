@@ -1,4 +1,4 @@
-"""Quantize the base once on one GPU and export a packed NF4 checkpoint."""
+"""Quantize the base on CPU, move to one GPU, and export a packed NF4 checkpoint."""
 from __future__ import annotations
 
 import argparse

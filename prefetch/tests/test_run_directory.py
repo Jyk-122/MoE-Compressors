@@ -83,6 +83,22 @@ def test_resume_validates_training_config(tmp_path):
         runtime.prepare_run_directory(config, checkpoint)
 
 
+def test_legacy_loading_option_is_ignored_on_read_and_resume(tmp_path):
+    config = run_config(tmp_path)
+    config["model"] = dict(path="base", serial_load=True)
+    path = tmp_path / "config.yaml"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    current = runtime.read_config(path)
+    assert current["model"] == {"path": "base"}
+    checkpoint = tmp_path / "checkpoint-100"
+    checkpoint.mkdir()
+    saved_path = checkpoint / "run_config.json"
+    saved_path.write_text(json.dumps(config), encoding="utf-8")
+    runtime.prepare_run_directory(current, checkpoint)
+    assert current["model"] == {"path": "base"}
+    assert json.loads(saved_path.read_text(encoding="utf-8"))["model"]["serial_load"] is True
+
+
 def _run_directory_worker(process_rank, init_method, root):
     import torch.distributed as dist
     dist.init_process_group("gloo", init_method=init_method, rank=process_rank,

@@ -6,7 +6,6 @@ model:
   quantization: experts_nf4
   nf4_blocksize: 64
   nf4_checkpoint: null
-  serial_load: true         # Applies only when loading from the BF16 source.
   router_forward_kwargs: {logits_to_keep: 1}
 lora:
   enabled: false

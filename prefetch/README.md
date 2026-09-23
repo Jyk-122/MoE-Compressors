@@ -29,8 +29,8 @@ prefetch/
 ~~~bash
 python -m pip install -r prefetch/requirements.txt
 python -m pytest prefetch/tests -q
-# 可选：CPU/Gloo 两进程梯度同步及无重复评测计数测试。
-RUN_DDP_TESTS=1 python -m pytest prefetch/tests/test_patch.py -q
+# 可选：CPU/Gloo 两进程加载并发、梯度同步及评测计数测试。
+RUN_DDP_TESTS=1 python -m pytest prefetch/tests/test_loading.py prefetch/tests/test_patch.py -q
 ~~~
 
 所有命令从仓库根目录运行，以文中的 python -m 完整模块路径启动。例如训练入口为 `python -m prefetch.training.train`，推理示例为 `python -m prefetch.examples.infer_prefetch_demo`。完整 checkpoint 必须包含原模型 remote code、processor 和配套依赖；[assets/modeling.py](assets/modeling.py) 用于结构参考。加载沿用原 demo 的 key_mapping。
@@ -174,7 +174,13 @@ NPROC_PER_NODE=8 bash prefetch/scripts/train_ddp.sh prefetch/configs/same_token.
 
 N 必须为正数，且多卡训练至少要有每卡一条样本；当前 sampler 使用 `drop_last=True`，每轮实际使用条数会向下取整到卡数的倍数，debug 时建议 N 能被卡数整除。这个参数限制进入训练的数据集大小，HF 对 JSON 的初始读取/缓存流程保持原样。`training.max_steps` 和验证集 `data.validation.*.limit` 独立控制：只缩小训练集仍会循环训练到 max_steps，短测时请一起调小。生效的 `data.train_limit` 会写入 run_config.json，续训时保留相同设置（若原来通过命令行设置，续训也传相同 `--limit`）。
 
-每卡一份基模，DDP 仅管理可训练参数。8 卡×微批 1×累积 8 的有效训练 batch 为 64，与端侧 batch=1 的推理设定分别定义。从 BF16 源加载时，serial_load 默认按 rank 串行执行，CPU 需容纳一份 BF16 基模及缓冲。配置 nf4_checkpoint 后，各 rank 并行读取已量化权重，serial_load 不再参与；用法见下节。
+每卡一份基模，DDP 仅管理可训练参数。8 卡×微批 1×累积 8 的有效训练 batch 为 64，与端侧 batch=1 的推理设定分别定义。所有加载路径都由各 rank 并发执行：
+
+- `quantization: none`：Transformers/Accelerate 通过 `device_map={"": 本 rank 的 GPU}` 直接加载到对应卡。
+- `quantization: experts_nf4` 且提供 `nf4_checkpoint`：各 rank 读取 packed 权重及量化状态，恢复到自己的 GPU。
+- `quantization: experts_nf4` 且 `nf4_checkpoint: null`：各 rank 在 CPU 上加载 BF16 基模并完成专家 NF4 量化，再将 packed 权重、量化状态和其余模块搬到各自 GPU。
+
+现场 CPU 量化由各进程独立完成，主机需容纳并发模型副本和量化临时内存；CPU 核数、内存带宽及磁盘吞吐决定实际启动耗时。固定实验建议先导出 NF4 checkpoint，随后并行加载复用。旧 YAML / run_config.json 中的 `serial_load` 字段作为兼容字段忽略，续训仍核对其余运行配置。
 
 router 阶段基模与 LoRA 冻结，基模处于 eval/no_grad。patch 在独立梯度作用域内执行 prerouter 和预测对齐，source 特征、teacher 标签均 detach；模型前向结束后，training/train.py 计算各目标层平均 KL，再反向。验证损失与覆盖率按有效 token 汇总。LoRA 阶段可启用 non-reentrant gradient checkpointing。
 
@@ -202,7 +208,7 @@ NF4 路径以显存和语义对齐为目标，逐专家实现的吞吐需实测�
 
 ### 一次量化，重复加载
 
-先编辑 YAML 中的 model.path，在单卡上导出纯基模。这个入口会关闭 LoRA，并从 BF16 源创建新的 NF4 权重：
+先编辑 YAML 中的 model.path，使用单进程导出纯基模。这个入口会关闭 LoRA，在 CPU 上从 BF16 源生成 NF4 权重，再搬到指定的单张 GPU 并保存：
 
 ~~~bash
 CUDA_VISIBLE_DEVICES=0 python -m prefetch.backbone.export_nf4 \
@@ -220,13 +226,14 @@ model:
   quantization: experts_nf4
   nf4_blocksize: 64
   nf4_checkpoint: prefetch/outputs/base_nf4_b64
-  serial_load: true
   router_forward_kwargs: {logits_to_keep: 1}
 ~~~
 
 将字段合入原配置，其余设置保留。加载时从 model.path 读取配置、remote code 和 processor，创建空参数骨架，然后直接恢复已量化权重；不读取 BF16 模型权重，也不重新量化。请保留原目录及不可变版本，model.path 须与导出时一致。nf4_blocksize 必须与 checkpoint 一致；要比较 128，请另行导出并使用独立目录。
 
 NF4 checkpoint 由本工程加载，不直接传给通用 AutoModel.from_pretrained。加载时按 MoE/原精度分片读取，CPU 不再需要完整 BF16 权重；每卡仍保存完整 NF4 基模，多卡并发读盘吞吐需实测。首次导出仍需 BF16 源权重所需的 CPU 内存。
+
+CPU 量化沿用 bitsandbytes 0.48.2 的 NF4 和双重量化设置；`Params4bit.to("cpu")` 执行量化，随后搬到 GPU 时直接迁移 packed 数据与量化状态。CPU 与 CUDA 量化后端可能存在舍入差异，跨运行复现或续训应使用同一份已导出的 NF4 权重；历史 CUDA 现场量化运行切换到 CPU 现场量化，不保证基模逐位一致。
 
 服务器上先验证真实 bitsandbytes 保存/恢复和输入反向，再运行完整模型 smoke_test：
 
@@ -239,7 +246,7 @@ CUDA_VISIBLE_DEVICES=0 python -m prefetch.examples.smoke_test \
   --sample-file prefetch/data/cog/train.filtered.jsonl
 ~~~
 
-CUDA roundtrip 测试覆盖 blocksize=64/128，检查 packed 权重、量化状态和输出一致，并检查恢复后的输入梯度。本地 CPU 测试只验证序列化流程与加载分支，不能替代真实 NF4 CUDA 验证。
+真实 bitsandbytes 测试覆盖 blocksize=64/128 的 CPU NF4 量化、packed 权重及量化状态的 CPU→CUDA 搬运、CUDA 前向和输入梯度，以及 checkpoint 保存/恢复。搬运测试要求 packed 权重保持一致且不触发重新量化。本地使用模拟依赖的 CPU 测试验证加载分支、序列化与双进程并发，真实 NF4 CPU/CUDA 测试需在目标依赖环境执行。
 
 ### 验证基模输出与量化精度
 

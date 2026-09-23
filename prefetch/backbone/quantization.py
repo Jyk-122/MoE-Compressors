@@ -31,6 +31,7 @@ class NF4Experts(nn.Module):
                                           compress_statistics=True, device="meta")
                 if quantize:
                     weight = weights[index].detach().contiguous()
+                    # bitsandbytes 0.48.2 quantizes on .to("cpu") as well as .to("cuda").
                     linear.weight = bnb.nn.Params4bit(weight, requires_grad=False, blocksize=blocksize,
                                                       quant_type="nf4", compress_statistics=True,
                                                       module=linear).to(device)
@@ -48,7 +49,7 @@ class NF4Experts(nn.Module):
 
 
 def quantize_experts(model, device, blocksize=64):
-    """Load on CPU first; at most one expert is transiently converted on GPU."""
+    """Convert each expert on the requested device, retaining packed weights and state."""
     converted = 0
     for name, block in find_moe_blocks(model):
         original = block.experts

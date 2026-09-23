@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 def read_config(path):
     with open(path, encoding="utf-8") as file:
         config = yaml.safe_load(file)
+    config.get("model", {}).pop("serial_load", None)  # Legacy loading-only option.
     lora = config.get("lora", {})
     if lora.get("enabled") and lora.get("checkpoint"):
         adapter = json.loads((Path(lora["checkpoint"]) / "lora_config.json").read_text(encoding="utf-8"))
@@ -58,8 +59,10 @@ def world_size():
 
 def prepare_run_directory(config, resume=None):
     """Use output_dir as the parent for new runs; resume keeps the saved run directory."""
+    config.get("model", {}).pop("serial_load", None)
     if resume:
         saved = json.loads((Path(resume) / "run_config.json").read_text(encoding="utf-8"))
+        saved.get("model", {}).pop("serial_load", None)
         config["output_dir"] = saved["output_dir"]
         if config != saved:
             raise ValueError("Resume requires the same run config; use a fresh run for changed experiments")

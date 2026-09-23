@@ -116,7 +116,7 @@ HF 5.0.0 通用 bitsandbytes 替换针对 nn.Linear/Conv1D。本模型专家权�
 
 experts_nf4 将每专家两个二维矩阵包装为 bitsandbytes Linear4bit，保留激活、top-k 权重和 index_add 聚合。其他模块保留原精度；none 提供 BF16 基线。
 
-加载流程：CPU 原模型→逐 MoE/专家转换到本 rank CUDA NF4→释放原专家 CPU 权重→迁移其他模块→安装 adapter/head。默认各 rank 串行加载，控制同时存在的 CPU 模型副本。
+各 rank 并发加载自己的基模副本。BF16 通过 Transformers/Accelerate 的 device_map 直接加载到本 rank GPU；已有 NF4 checkpoint 则恢复 packed 权重和量化状态。现场 NF4 的流程为：CPU 原模型→CPU 逐 MoE/专家量化→释放原专家 BF16 权重→整模迁移到本 rank GPU→安装 adapter/head。现场量化期间主机需容纳并发副本及临时内存；固定实验可通过预先导出的 NF4 checkpoint 复用权重。
 
 routed-expert 参数共 35×384×3×2560×256=26,424,115,200。BF16 载荷约 49.2 GiB，4-bit 载荷约 12.3 GiB，另加量化状态和其他开销。报告记录实际转换数、CUDA allocator 峰值。
 

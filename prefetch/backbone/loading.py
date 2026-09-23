@@ -7,7 +7,6 @@ import math
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from prefetch.backbone.structure import find_moe_blocks
@@ -84,7 +83,8 @@ def load_lora(model, directory):
                 param.copy_(values[name])
 
 
-def _load_one(config, device):
+def load_model(config, device):
+    """Each rank loads its own replica; fresh NF4 weights are quantized on CPU."""
     from transformers import AutoModelForCausalLM, AutoProcessor
     from prefetch.backbone.quantization import quantize_experts
     base = config["model"]
@@ -98,17 +98,22 @@ def _load_one(config, device):
         if quantization != "experts_nf4":
             raise ValueError("nf4_checkpoint requires model.quantization=experts_nf4")
         from prefetch.backbone.nf4_checkpoint import load_nf4_checkpoint
+        logger.info("Loading NF4 checkpoint %s on %s", checkpoint, device)
         model, source_parameters = load_nf4_checkpoint(base, device)
     else:
+        load_device = "cpu" if quantization == "experts_nf4" else device
+        logger.info("Loading BF16 weights from %s on %s", base["path"], load_device)
         kwargs = dict(trust_remote_code=True, torch_dtype=torch.bfloat16,
-                      device_map={"": "cpu"}, key_mapping=KEY_MAPPING)
+                      device_map={"": load_device}, key_mapping=KEY_MAPPING)
         if base.get("attn_implementation"):
             kwargs["attn_implementation"] = base["attn_implementation"]
         model = AutoModelForCausalLM.from_pretrained(base["path"], **kwargs)
         model.requires_grad_(False)
         if quantization == "experts_nf4":
-            source_parameters = quantize_experts(model, device, blocksize)
-        model.to(device)
+            logger.info("Quantizing routed experts on CPU (NF4 blocksize=%d)", blocksize)
+            source_parameters = quantize_experts(model, "cpu", blocksize)
+            logger.info("Moving CPU-quantized model to %s", device)
+            model.to(device)
     gc.collect()
     processor = AutoProcessor.from_pretrained(base["path"], trust_remote_code=True)
     lora = config.get("lora", {})
@@ -135,16 +140,3 @@ def _load_one(config, device):
                   peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30)
     logger.info("%s", json.dumps({"loading": report}))
     return model, processor, report
-
-
-def load_model(config, device):
-    """BF16 loading can be serial; packed NF4 checkpoints load independently per rank."""
-    base = config["model"]
-    if dist.is_initialized() and base.get("serial_load", True) and not base.get("nf4_checkpoint"):
-        result = None
-        for rank in range(dist.get_world_size()):
-            if dist.get_rank() == rank:
-                result = _load_one(config, device)
-            dist.barrier()
-        return result
-    return _load_one(config, device)
