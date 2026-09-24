@@ -48,7 +48,7 @@ def compute_prerouter_loss(state, router_mask):
     """Read the collected routing tensors after forward and compute the training loss."""
     if state.config.temperature <= 0:
         raise ValueError("temperature must be positive")
-    mask = state.valid_mask & router_mask[0].bool()
+    mask = state.valid_mask & router_mask[0, state.target_start:].bool()
     losses = []
     for _, target in state.pairs:
         prediction = state.predictions[target][mask]
@@ -88,7 +88,7 @@ class TrainingTask(nn.Module):
             return self.backbone(**inputs, use_cache=False).loss
         inputs.pop("labels", None)
         state = self.prerouter_state
-        state.reset(train_prerouter=torch.is_grad_enabled())
+        state.reset(train_prerouter=torch.is_grad_enabled(), router_mask=batch["router_mask"])
         with torch.no_grad():
             self.backbone(**inputs, use_cache=False, **self.forward_kwargs)
         loss = compute_prerouter_loss(state, batch["router_mask"])

@@ -52,11 +52,10 @@ def processor_call(processor, messages, images, generation=False):
 
 class SFTCollator:
     def __init__(self, processor, max_length=2048, router_tokens="assistant", max_image_side=672):
-        if router_tokens not in {"assistant", "all_text"}:
-            raise ValueError("router_tokens must be assistant or all_text")
+        if router_tokens != "assistant":
+            raise ValueError("router_tokens must be assistant: router supervision uses response inputs")
         self.processor = processor
         self.max_length = max_length
-        self.router_tokens = router_tokens
         self.max_image_side = max_image_side
         self.special_ids = set(processor.tokenizer.all_special_ids)
 
@@ -87,7 +86,7 @@ class SFTCollator:
         text_tokens = valid.clone()
         for token_id in self.special_ids:
             text_tokens &= ids != token_id
-        router_mask = text_tokens & assistant if self.router_tokens == "assistant" else text_tokens
+        router_mask = text_tokens & assistant
         labels = ids.clone()
         labels[~(assistant & valid)] = -100
         if not (assistant & text_tokens).any() or not (labels[:, 1:] != -100).any():

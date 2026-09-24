@@ -72,6 +72,16 @@ def test_previous_token_trace_requires_event_timing_support():
         DecodeTrace(state)
 
 
+def test_cache_trace_requires_native_execution():
+    model = ToyModel().eval().requires_grad_(False)
+    state = patch(model, config())
+    trace = DecodeTrace(state)
+    state.config.prerouter_enabled = True
+    with pytest.raises(ValueError, match="prerouter_enabled=False"):
+        with trace.capture(model):
+            pytest.fail("The routing policy must be checked before generation")
+
+
 def test_collection_shards_complete_requests_for_offline_simulation(tmp_path, monkeypatch):
     import prefetch.evaluation.cache.collect as collection
     from prefetch.evaluation.cache.simulate import simulate_files
@@ -84,7 +94,11 @@ def test_collection_shards_complete_requests_for_offline_simulation(tmp_path, mo
     monkeypatch.setattr(collection, "world_size", lambda: 2)
     monkeypatch.setattr(collection, "load_records", lambda *args: [{"id": f"sample-{i}"} for i in range(3)])
     monkeypatch.setattr(collection, "generation_inputs", lambda *args: {"input_ids": torch.tensor([[1, 2]])})
-    monkeypatch.setattr(collection, "patch", lambda model, **kwargs: patch(model, config(excluded_token_ids=[3])))
+    def install(model, **kwargs):
+        assert kwargs["prerouter_enabled"] is False
+        return patch(model, config(excluded_token_ids=[3], prerouter_enabled=True),
+                     prerouter_enabled=kwargs["prerouter_enabled"])
+    monkeypatch.setattr(collection, "patch", install)
 
     def load_model(*args):
         model = ToyModel().eval().requires_grad_(False)

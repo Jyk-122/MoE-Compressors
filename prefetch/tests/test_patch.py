@@ -42,6 +42,7 @@ class ToyMoE(nn.Module):
         self.experts = ToyExperts(hidden, experts)
         self.shared_experts = nn.Linear(hidden, hidden, bias=False)
         self.n_group, self.top_k = 1, top_k
+        self.norm_topk_prob, self.routed_scaling_factor = False, 1.0
         self.register_buffer("e_score_correction_bias", torch.linspace(-0.1, 0.1, experts))
 
     def route_tokens_to_experts(self, logits):
@@ -126,7 +127,8 @@ def test_original_output_preserved_and_patch_removable(model, mode, distance):
 
 
 @pytest.mark.parametrize("mode,distance", ROUTING_CASES)
-def test_reference_model_moe_forward_and_routes(model, mode, distance):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_reference_model_moe_forward_and_routes(model, mode, distance, enabled):
     # Execute the four self-contained reference classes at a small dimension.
     import ast
     from pathlib import Path
@@ -148,13 +150,27 @@ def test_reference_model_moe_forward_and_routes(model, mode, distance):
             nn.init.normal_(parameter, std=0.1)
     values = batch()
     original = model(values["input_ids"]).logits
-    state = patch(model, config(mode=mode, distance=distance))
+    state = patch(model, config(mode=mode, distance=distance, prerouter_enabled=enabled))
+    handles = []
+    for index, (_, block) in enumerate(state.blocks):
+        def check_weights(module, args, index=index, block=block):
+            if index not in state.targets:
+                return
+            _, indices, weights = args
+            scores = state.router_logits[index].sigmoid().gather(1, indices[state.target_start:])
+            expected = scores / (scores.sum(-1, keepdim=True) + 1e-20) * block.routed_scaling_factor
+            torch.testing.assert_close(weights[state.target_start:], expected)
+        handles.append(block.experts.register_forward_pre_hook(check_weights))
     task = TrainingTask(model, state, "router")
     task(values, record_metrics=True).backward()
-    torch.testing.assert_close(model(values["input_ids"]).logits, original, rtol=0, atol=0)
+    output = model(values["input_ids"]).logits
+    if not enabled:
+        torch.testing.assert_close(output, original, rtol=0, atol=0)
     for target, logits in state.router_logits.items():
         expected = model.layers[target].mlp.route_tokens_to_experts(logits)[0]
         torch.testing.assert_close(state.router_indices[target], expected, rtol=0, atol=0)
+    for handle in handles:
+        handle.remove()
 
 
 def test_exception_clears_routing_state(model, monkeypatch):
@@ -214,21 +230,42 @@ def test_full_sequence_equals_prefill_then_incremental(model, mode, distance):
     ids = torch.tensor([[1, 3, 5, 7, 9]])
     state = patch(model, config(mode=mode, distance=distance, trace_limit=20))
     meter = RoutingMetrics(state)
+    response_mask = torch.tensor([[False, False, True, True, True]])
+    state.reset(router_mask=response_mask)
     model(input_ids=ids)
     meter.update(state)
+    assert meter.trace[0]["target_token"] == 2
+    assert meter.trace[0]["source_token"] == 2 - int(mode == "previous_token")
     full = meter.counts[0].clone()
     meter.reset()
     with capture_generation(model, state, meter):
         model(input_ids=ids[:, :2], attention_mask=torch.ones(1, 2))
         for i in range(2, ids.shape[1]):
             model(input_ids=ids[:, i:i + 1], attention_mask=torch.ones(1, i + 1))
-    torch.testing.assert_close(full, meter.counts[1:].sum(0), rtol=0, atol=0)
+    torch.testing.assert_close(full, meter.counts[1], rtol=0, atol=0)
+    assert int(meter.counts[1, :, 1].sum()) == 3 * len(state.pairs)
+    assert "prefill" not in meter.report()["phases"]
     if mode == "previous_token":
         first = next(row for row in meter.trace if row["phase"] == "decode")
         assert first["source_token"] == 1 and first["target_token"] == 2
         assert first["forward_index"] == 1
         assert first["target_moe"] - first["source_moe"] == distance
     assert not model._forward_hooks
+
+
+@pytest.mark.parametrize("mode,distance", ROUTING_CASES)
+def test_response_only_loss_and_metrics(model, mode, distance):
+    state = patch(model, config(mode=mode, distance=distance, trace_limit=20))
+    task = TrainingTask(model, state, "router")
+    values = batch((1, 3, 5, 7, 9))
+    values["router_mask"] = torch.tensor([[False, False, True, True, False]])
+    task(values, record_metrics=True).backward()
+    assert state.predictions[state.pairs[0][1]].shape[0] == 5 - int(mode == "previous_token")
+    assert int(task.meter.counts[0, :, 1].sum()) == 2 * len(state.pairs)
+    assert {row["target_token"] for row in task.meter.trace} == {2, 3}
+    assert all(row["source_token"] == row["target_token"] - int(mode == "previous_token")
+               for row in task.meter.trace)
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in state.parameters())
 
 
 @pytest.mark.parametrize("distance", [0, 1, 2])
@@ -256,7 +293,7 @@ def test_reset_prevents_cross_request_pairing(model, distance):
     with capture_generation(model, state, meter):
         model(input_ids=torch.tensor([[1]]))
         model(input_ids=torch.tensor([[2]]))
-    assert int(meter.counts[2, :, 1].sum()) == len(state.pairs)
+    assert int(meter.counts[1, :, 1].sum()) == len(state.pairs)
 
 
 @pytest.mark.parametrize("distance", [0, 1, 2])
@@ -285,6 +322,7 @@ def test_zero_valid_tokens_produce_connected_zero_loss(model, distance):
 
 def test_metrics_read_actual_selection_without_rerouting(model, monkeypatch):
     state = patch(model, config(targets=[1]))
+    state.reset(router_mask=torch.ones(1, 3, dtype=torch.bool))
     block = model.layers[1].mlp
     block.e_score_correction_bias[0] = 3.0
     model(input_ids=torch.tensor([[1, 3, 5]]))
@@ -357,7 +395,7 @@ def test_loss_and_gradients_match_independent_reference(model, mode, distance, h
 def test_forward_collects_data_for_external_loss_and_metrics(model):
     state = patch(model, config())
     meter = RoutingMetrics(state)
-    state.reset(train_prerouter=True)
+    state.reset(train_prerouter=True, router_mask=torch.ones(1, 3, dtype=torch.bool))
     with torch.no_grad():
         model(input_ids=torch.tensor([[1, 3, 5]]))
     assert int(meter.counts.sum()) == 0

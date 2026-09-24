@@ -11,7 +11,7 @@ from prefetch.evaluation.metrics import report_histograms
 
 class RoutingMetrics:
     """Coverage/trace accumulator, updated explicitly from a completed forward."""
-    phases = ("teacher_forcing", "prefill", "decode")
+    phases = ("teacher_forcing", "decode")
 
     def __init__(self, state):
         self.config, self.layers = state.config, state.layers
@@ -26,9 +26,14 @@ class RoutingMetrics:
 
     @torch.no_grad()
     def update(self, state, router_mask=None):
+        if state.phase == "prefill":
+            return
         mask = state.valid_mask
-        if router_mask is not None:
-            mask = mask & router_mask[0].bool()
+        if state.phase == "teacher_forcing":
+            router_mask = state.router_mask if router_mask is None else router_mask
+            if router_mask is None:
+                raise ValueError("Teacher-forcing metrics require a response router_mask")
+            mask = mask & router_mask[0, state.target_start:].bool()
         for slot, (source, target) in enumerate(state.pairs):
             truth = state.router_indices[target][mask]
             if not truth.numel():
@@ -51,7 +56,7 @@ class RoutingMetrics:
             positions = mask.nonzero().flatten()[:remaining].tolist()
             predicted = order[:remaining, :k].tolist()
             for position, prediction, actual in zip(positions, predicted, truth[:remaining].tolist()):
-                token = position + state.token_offset
+                token = position + state.target_start + state.token_offset
                 self.trace.append(dict(phase=state.phase, forward_index=state.forward_index,
                                        batch_index=0, target_token=token,
                                        source_token=token - int(self.config.mode == "previous_token"),
@@ -60,7 +65,11 @@ class RoutingMetrics:
 
     def report(self, distributed=False):
         metadata = dict(config=asdict(self.config), layers=self.layers,
-                        teacher="current_base_actual_routing",
+                        teacher="native_router_on_current_hidden_states",
+                        execution=("prerouter_indices_native_weights" if self.config.prerouter_enabled
+                                   else "native_router"),
+                        execution_scope="decode_and_teacher_forced_response",
+                        metric_scope=dict(teacher_forcing="response_text_inputs", decode="all_forwarded_inputs"),
                         producer_timing="after_source_routing_before_experts")
         counts = self.counts.clone()
         if distributed:

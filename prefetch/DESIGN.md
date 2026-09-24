@@ -6,7 +6,7 @@
 
 固定基模版本、量化方式、attention adapter、数据 split、head 结构与温度，比较预测位置。一个 predictor 输出完整排序，一次训练评估所有候选数 k′。
 
-原 router 决定实际专家及权重；head 是旁路。真值使用当前基模的 gate 输出及原生 route_tokens_to_experts。可选 attention LoRA 先用原路由 SFT，再冻结 adapter 训练 predictor。router 阶段只对 head 求梯度，teacher 标签 detach。
+默认原 router 决定实际专家及权重；head 是旁路。prefill 始终使用原 router。`prerouter_enabled=true` 时在 decode 及 teacher-forcing 的 response 输入位置用预测结果选择专家，再从原 gate 的 sigmoid 分数中提取对应权重，按原规则归一化、缩放。真值使用当前 hidden states 上的 gate 输出及原生 route_tokens_to_experts。可选 attention LoRA 先用原路由 SFT，再冻结 adapter 训练 predictor。router 阶段只对 head 求梯度，teacher 标签 detach。
 
 此阶段实现预测训练与正确性评测。Flash→DRAM 调度、缓存容量和端侧时延模型可后续读取排序与覆盖率结果，独立控制传输变量。
 
@@ -31,26 +31,27 @@ MoE 序号从 0 开始，checkpoint 同时保存真实模块路径：
 
 M=distance 按 MoE 数计算：same_token 要求 M≥1；previous_token 允许 M≥0。M=0 时，source 和 target 属于同一 MoE，token 相差 1，所有层 i≥0 均可作为目标；序列首 token 仍无跨 token 标签。prefetch.targets 可固定共同目标层，默认使用全部有效目标。
 
-训练和推理的 batch size 均为 1，MoE 输入为 [1,S,H]，state 中的路由信息为 [S,E] 或 [S,K]。每卡训练一条样本，可用 DDP 和梯度累积增加有效训练 batch；样本间独立，不做 packing。
+训练和推理的 batch size 均为 1，正常数据流程不做 padding，MoE 输入为 [1,S,H]，state 中的路由信息为 [T,E] 或 [T,K]。teacher forcing 的 same-token 模式 T=S，previous-token 模式 T=S−1，decode 时 T=1。每卡训练一条样本，可用 DDP 和梯度累积增加有效训练 batch；样本间独立，不做 packing。
 
 全模型共用一个 PrerouterState，以下字典都以目标 MoE 序号为键：
 
 | 字段 | 内容 | 生命周期 |
 |---|---|---|
-| predictions | 对齐到目标位置的预测 logits [S,E] | 当前 forward |
-| router_logits | detached 原 router logits [S,E] | 当前 forward |
-| router_indices | 实际选出的专家 [S,K] | 当前 forward |
+| predictions | 对齐到目标位置的预测 logits [T,E] | 当前 teacher-forcing/decode forward |
+| router_logits | detached 原 router logits [T,E] | 当前 teacher-forcing/decode forward |
+| router_indices | 原 router 在当前 hidden states 上选出的专家 [T,K] | 当前 teacher-forcing/decode forward |
 | next_predictions | 下一 decode 的预测 [1,E] | 跨一个 forward |
 
 传递规则集中在 prerouter/state.py：
 
-1. same_token：source i 的输出直接放入 predictions[i+M]。
-2. previous_token 完整序列：source i 的 source[:-1] 对齐 target i+M 的 target[1:]，首位置无效；检查 source/target attention mask。M=0 时在同一层完成对齐。
-3. previous_token decode：forward 开始时把 next_predictions 交给 predictions，再建立新的 next_predictions。当前 forward 的 head 输出保存到下一轮。
+1. same_token：teacher forcing 和 decode 中，source i 的输出直接放入 predictions[i+M]；prefill 只执行原 MoE。
+2. previous_token teacher forcing：保存 source i 的 logits[:-1]，同时保存 target i+M 的 router_logits[1:] 和 router_indices[1:]。T=S−1，target_start=1；监督范围同步切片 router_mask[:,1:]。M=0 时在同一层完成对齐。
+3. previous_token prefill：head 只读取最后一个位置，保存 [1,E] 的 next_predictions；prefill 各位置执行原 router，也不收集路由指标。
+4. previous_token decode：forward 开始时把 next_predictions 交给 predictions，再建立新的 next_predictions。当前 forward 的 head 输出保存到下一轮。
 
-state.valid_mask 标记对齐后有效的位置，并排除配置中的特殊 token。训练函数再与数据的 router_mask 取交集；router mask 对应当前输入 token，LM loss 才做下一 token shift。
+state.valid_mask 表示已对齐监督位置的有效性，并在 teacher forcing 中排除配置指定的 token。训练和 teacher-forcing 指标与 router_mask[0,target_start:] 取交集，只使用 response 文本输入位置；路由替换也限定在这些位置。首个 response 可由 prompt 尾部预测，筛选只看目标位置。decode 则统计实际发生的输入调用，包括特殊 token，不受 teacher-forcing 文本排除规则限制。router mask 对应当前输入 token，LM loss 才做下一 token shift；LM 的 EOS 标签保留。
 
-每条样本开始调用 state.reset(train_prerouter=True)。手动生成开始调用 state.reset(generation=True)，支持 num_beams=1、use_cache=true 的单 token decode；prefill 的尾部预测用于首个 decode。next_predictions 只保存最后一个位置的 detached clone。完整 VL processor 的 input_ids 长度须与 MoE 输入一致。
+每条样本开始调用 state.reset(train_prerouter=True, router_mask=router_mask)。手动生成开始调用 state.reset(generation=True)，支持 num_beams=1、use_cache=true 的单 token decode；prefill 的尾部预测用于首个 decode。next_predictions 只保存最后一个位置的 detached clone。完整 VL processor 的 input_ids 长度须与 MoE 输入一致。
 
 ## 4. 模块职责和调用顺序
 
@@ -58,6 +59,7 @@ state.valid_mask 标记对齐后有效的位置，并排除配置中的特殊 to
 
 - prerouter/block.py：Prerouter 的网络结构和 forward。
 - prerouter/patch.py：patch 返回 model.prerouter_state；安装 head，替换 MoE 和 model forward；unpatch(model) 恢复。
+- prerouter/routing.py：select_experts 统一返回执行专家及权重；调用方传入对应同一批目标位置的原 router logits/route 和 prerouter logits，None 预测表示使用原路由。
 - prerouter/state.py：PrerouterState 收集路由张量，管理层映射、token 对齐与请求生命周期。
 - training/train.py：router_loss / compute_prerouter_loss 定义损失；TrainingTask 运行基模，再读取 state 算 loss。
 - evaluation/routing.py：RoutingMetrics 独立读取 state，累计覆盖率和 trace。
@@ -66,7 +68,7 @@ state.valid_mask 标记对齐后有效的位置，并排除配置中的特殊 to
 一次 router 训练：
 
 ~~~python
-state.reset(train_prerouter=True)
+state.reset(train_prerouter=True, router_mask=router_mask)
 with torch.no_grad():
     model(**inputs, use_cache=False)
 loss = compute_prerouter_loss(state, router_mask)
@@ -77,9 +79,11 @@ loss.backward()
 
 DDP wrapper 只注册可训练 ParameterList，参数按配置中的 pair 顺序收集，保持 optimizer 恢复顺序；冻结基模通过普通引用持有。head/LoRA 使用 FP32 master weights，新增支路内部 CUDA BF16 autocast。
 
-生成评测使用 capture_generation(model, state, meter) 包住一次 generate。评测侧临时挂 model forward hook，每步完成后 meter.update(state)，请求结束时卸载观察器并清理 state；报告计数单独保留。直接调用 model forward 只收集信息，由调用方决定后续处理。
+生成评测使用 capture_generation(model, state, meter) 包住一次 generate。评测侧临时挂 model forward hook，每步完成后 meter.update(state)，其中 prefill 自动返回，decode 累计指标；请求结束时卸载观察器并清理 state，报告计数单独保留。直接调用 model forward 只收集信息，由调用方决定后续处理。
 
-prerouter 读取 source MoE 输入，实际调用在 source 原路由选择之后、专家计算之前；报告 producer_timing=after_source_routing_before_experts。未来改变执行路由时，修改 moe_forward 中的 topk_indices/topk_weights 选择即可，监督和指标仍可读取原 router 标签。
+prerouter 读取 source MoE 输入，实际调用在 source 原路由选择之后、专家计算之前；报告 producer_timing=after_source_routing_before_experts。moe_forward 根据 phase 和开关决定执行策略：prefill 使用原路由；decode 可用 select_experts 替换；teacher forcing 只将 response 行交给 select_experts 并写回这些行。无预测器的层及 previous-token 整段序列的首位置使用原路由。监督和指标读取已收集的原 router 标签，原 router 始终参与权重计算。
+
+开关可通过 YAML、patch(..., prerouter_enabled=...) 或 state.config.prerouter_enabled 设置；显式 patch 参数优先于传入配置和 checkpoint 值，旧 checkpoint 默认关闭。请求 reset 保留策略；切换策略后用新请求重新构建 KV cache。路由改变后，原 router 标签对应改变后的当前轨迹。evaluate_base 支持在固定验证集上比较开关前后的 assistant NLL/PPL；缓存 I/O trace 采集固定使用原路由。
 
 ## 5. Head、损失与指标
 
@@ -95,12 +99,12 @@ prerouter 读取 source MoE 输入，实际调用在 source 原路由选择之�
 
 teacher/bias detach。T 显式配置，初始 0.1 需小样本验证；损失不额外乘 T²。logit_kl 作为原始 logits 蒸馏对照。训练对样本、目标层取均值，验证汇总有效 token；空有效样本给出连接全部 head 的零损失。
 
-P_k′ 按 s_pred 的稳定降序排名；R 来自目标层本次实际执行的 topk_indices。每个有效 token/目标层：
+P_k′ 按 s_pred 的稳定降序排名；R 来自目标层收集的原 router topk_indices。每个有效 token/目标层：
 
     Recall@k′ = |R ∩ P_k′| / K
     FullCoverage@k′ = 1[R ⊆ P_k′]
 
-真实专家 rank 直方图计算 Recall，最大真实专家 rank 直方图计算 FullCoverage。GPU 间整数计数相加后计算比例；per-layer/global、VL/text、teacher_forcing/prefill/decode 分别报告。空分母为 null，k′=E 必须完整覆盖。
+真实专家 rank 直方图计算 Recall，最大真实专家 rank 直方图计算 FullCoverage。GPU 间整数计数相加后计算比例；per-layer/global、VL/text、teacher_forcing/decode 分别报告。teacher_forcing 只统计参考答案的 response 文本输入，decode 统计真实生成调用，prefill 不进入指标。空分母为 null，k′=E 必须完整覆盖。
 
 完整直方图支持任意 k′、共同层汇总和经验覆盖分位数。经验 k′ 需在未见样本和真实生成分布再次检验。
 
@@ -141,7 +145,7 @@ checkpoint 保存 predictor 或 LoRA safetensors、配置、optimizer/scheduler�
 ## 9. 验收
 
 1. 小模型检查 patch 保留 native forward、层映射、mask、请求隔离。
-2. previous_token 完整序列与 prefill+decode 计数一致。
+2. previous_token 对齐切片及首个 response 监督正确；完整序列的 response 指标与相应逐 token decode 计数一致。
 3. head 梯度、teacher detach、零有效 token、checkpoint roundtrip。
 4. LoRA 零初始化与保存恢复；NF4 packed 权重、expert 前向和输入梯度。
 5. 真实文本/图像 processor 的 mask/长度、BF16/NF4 native logits 对齐。

@@ -1,6 +1,6 @@
 # MoE Prefetch Router 训练工程
 
-在较早的 MoE 输入处预测目标层路由，训练一次即可评估多个候选数 k′。原 router 决定实际执行专家；真值来自当前基模（包含所选量化和 attention LoRA）的实际前向。
+在较早的 MoE 输入处预测目标层路由，训练一次即可评估多个候选数 k′。训练与 teacher-forcing 验证使用 response 文本输入位置；生成评测使用真实 decode 调用。prefill 始终由原 router 执行；开启 `prefetch.prerouter_enabled` 可在 decode 和 teacher-forcing 的 response 位置使用预测专家，混合权重仍来自原 router。真值始终来自原 router 在当前 hidden states 上的选择（包含所选量化和 attention LoRA）。
 
 支持同 token 提前 M≥1 个 MoE、上一 token 同层或提前 M≥1 个 MoE、可选 attention LoRA SFT、routed-expert NF4、多卡训练、恢复、覆盖率曲线和单 prompt 推理。语义见 [DESIGN.md](DESIGN.md)。本阶段测量预测能力；Flash→DRAM 调度和端侧时延模拟可在后续实验中接入。
 
@@ -54,12 +54,12 @@ prefetch:
 ### Patch 阅读顺序
 
 1. [prerouter/block.py](prerouter/block.py)：Prerouter 是独立的 nn.Module，forward 输入 hidden states，输出预测 logits。
-2. [prerouter/patch.py](prerouter/patch.py)：moe_forward 明确写出原 router、信息收集、prerouter 和专家计算；patch 安装模块并替换 forward，unpatch 恢复。
+2. [prerouter/patch.py](prerouter/patch.py)：moe_forward 明确写出原 router、信息收集、prerouter 和专家计算；[prerouter/routing.py](prerouter/routing.py) 的 select_experts 集中决定执行专家和权重。patch 安装模块并替换 forward，unpatch 恢复。
 3. [prerouter/state.py](prerouter/state.py)：全模型共用一个 PrerouterState，按目标层保存 predictions、router_logits、router_indices，处理层间和 token 间传递。
 4. [training/train.py](training/train.py)：compute_prerouter_loss 在模型前向结束后读取 state 计算 KL；TrainingTask 负责训练调用和 DDP 可训练参数。
 5. [evaluation/routing.py](evaluation/routing.py)：RoutingMetrics 读取 state 统计覆盖率和 trace；capture_generation 为 generate 的每次 forward 安装临时评测观察器。
 
-训练和推理均要求 batch size=1。state 中的路由张量直接使用 [S,E] / [S,K]，省去 batch 维。最小训练调用：
+训练和推理均要求 batch size=1，正常数据流程不做 padding。state 中的路由张量直接使用 [T,E] / [T,K]，省去 batch 维；teacher forcing 的 same-token 模式 T=S，previous-token 模式 T=S−1，decode 时 T=1。最小训练调用：
 
 ~~~python
 import torch
@@ -70,7 +70,7 @@ from prefetch.evaluation.routing import RoutingMetrics
 model.eval().requires_grad_(False)
 state = patch(model, config)           # 同时可通过 model.prerouter_state 访问
 meter = RoutingMetrics(state)
-state.reset(train_prerouter=True)      # 每条训练样本开始前调用
+state.reset(train_prerouter=True, router_mask=router_mask)  # [1,S] response 输入位置
 with torch.no_grad():
     model(input_ids=ids, attention_mask=attention_mask, use_cache=False)
 loss = compute_prerouter_loss(state, router_mask)
@@ -80,10 +80,10 @@ meter.update(state, router_mask)       # 按需统计，与 loss 独立
 target = state.pairs[0][1]
 state.predictions[target]             # 已对齐目标 token 的预测 logits
 state.router_logits[target]           # 原 router logits，已 detach
-state.router_indices[target]          # 本次实际执行的 top-k 专家
+state.router_indices[target]          # 原 router 在当前 hidden states 上选择的 top-k 专家
 ~~~
 
-head 注册为 source_moe.prerouter，输入是归一化后的 MoE 输入；调用时机为 source 原路由选择完成后、专家执行前。报告的 producer_timing 字段记录此时机。后续实验修改专家选择时，入口就是 moe_forward 中的 topk_indices/topk_weights 赋值。
+head 注册为 source_moe.prerouter，输入是归一化后的 MoE 输入；调用时机为 source 原路由选择完成后、专家执行前。报告的 producer_timing 字段记录此时机。专家执行策略统一由 `prerouter/routing.py::select_experts` 扩展，监督和指标读取原 router 标签。
 
 ## 2. 数据准备
 
@@ -124,7 +124,7 @@ done
 
 过滤保留完整对话和图像 span，报告 kept/overlength/missing_user_turn 数与 processor 配置。带图片但没有 user 消息的样本会记录 WARNING 并跳过，日志包含样本 ID、输入文件和行号，计入 missing_user_turn；过滤继续处理后续记录。全量过滤需要 CPU 和图像读取时间，先用小样本检查模板。若 chat prefix 与完整序列 token 不一致，错误包含样本 ID，应按该 checkpoint 的 processor 调整 datasets/dataset.py 的区间提取。
 
-每卡微批固定 1 条，不做 packing。data.train[].weight 控制 VL/text 采样；all_exhausted 策略可能重采样较小集合。data.validation 中的集合独立出报告，也可增加子集。默认只评价 assistant 文本输入位置，可切换 all_text；LM labels 包含 assistant 结束 token，router 文本指标排除 tokenizer 的 special tokens。
+每卡微批固定 1 条，不做 packing。data.train[].weight 控制 VL/text 采样；all_exhausted 策略可能重采样较小集合。data.validation 中的集合独立出报告，也可增加子集。`data.router_tokens` 固定为 `assistant`，KL 监督及 teacher-forcing 路由指标只使用 response 文本输入位置；配置为 `all_text` 时会提示改为 `assistant`。LM labels 包含 assistant 结束 token，router 文本指标排除 tokenizer 的 special tokens。
 
 [CogVLM-SFT-311K](https://huggingface.co/datasets/THUDM/CogVLM-SFT-311K) 为 CC-BY-NC-4.0；[Tulu](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture) 部分子集也有非商业约束。商业用途需按实际子集授权筛选。
 
@@ -287,9 +287,74 @@ done
 
 router 阶段的周期验证、独立评测和单 prompt demo 自动报告 Recall、平均命中数和 RequiredK 分布，包含 global/per-layer 统计。训练验证日志也打印 RequiredK 摘要。LoRA 阶段报告 SFT 验证损失。
 
+### 用预测专家执行 MoE
+
+将以下字段合入完整 YAML 的 `prefetch` 配置，默认值为 `false`：
+
+~~~yaml
+prefetch:
+  prerouter_enabled: true
+~~~
+
+- `false`：原 router 决定专家和权重；prerouter 继续产生预测，供训练与覆盖率评测。
+- `true`：按 `sigmoid(prerouter_logits) + 目标层 correction bias` 的稳定降序选择 `block.top_k` 个专家，再从 `sigmoid(router_logits)` 中 gather 这些专家的分数，按 `norm_topk_prob` 归一化并乘 `routed_scaling_factor`。correction bias 只参与选专家，权重始终来自原 router，shared experts 照常执行。
+
+推理 prefill 始终执行原 router，路由指标只统计 decode。same-token 在 prefill 不调用 head；previous-token 只对各 source 层的最后一个输入位置调用 head，将 `[1,E]` 预测保存到 `next_predictions`，供首个 decode 使用。decode 的实际输入位置均可使用预测专家，包括已实际送入模型的特殊 token；无预测器的层使用原路由。
+
+teacher forcing 中，开关只作用于 `router_mask` 指定的 response 文本输入位置，prompt 保持原路由。通过 `state.reset(router_mask=router_mask)` 传入范围；训练、验证及 NLL 入口已自动传入。previous-token 直接保存 source 的 `logits[:-1]`，与 target 的 `router_logits[1:]`、`router_indices[1:]` 配对；`target_start=1` 用于切片监督范围及还原 trace 中的位置，same-token 则为 0。首个 response 的预测可以来自 prompt 尾部，筛选依据是目标 token 所属的 response 范围。
+
+`state.valid_mask` 保留监督位置的有效性和配置的 token 排除规则，teacher-forcing loss/指标再与 `router_mask[0, target_start:]` 取交集。真实 decode 统计实际调用，不使用这些文本排除规则。`prefetch.ks` 仅控制覆盖率曲线，实际执行数量由模型的 `top_k` 决定。
+
+运行时也可以设置：
+
+~~~python
+state = patch(model, checkpoint=checkpoint, prerouter_enabled=True)
+# 可在独立请求之间切换；每次重新 prefill，建立与执行策略匹配的 KV cache。
+state.config.prerouter_enabled = False
+state.reset(generation=True)
+~~~
+
+`patch()` 的显式参数优先于传入配置中的开关，配置优先于 checkpoint 保存值；旧 checkpoint 未保存该字段时默认为关闭。网络结构、层映射和 head 权重仍从 checkpoint 恢复。`state.reset()` 清理请求张量，保留开关设置。
+
+自定义策略接口位于 [prerouter/routing.py](prerouter/routing.py)：
+
+~~~python
+topk_indices, topk_weights = select_experts(
+    block, router_logits, original_route, prerouter_logits=None
+)
+~~~
+
+`original_route` 是本次原 router 产生的 `(indices, weights)`；调用方传入对应同一批目标位置的 logits 和原路由，输出为这些位置的 `[T,K]`。`prerouter_logits=None` 表示采用原路由。`moe_forward` 在 teacher forcing 中取出 response 行交给此函数，并将结果写回这些行；decode 直接使用单个位置。实际执行分支使用 detached 预测选 ID，router 阶段仍通过独立 KL loss 训练 head。
+
+单 prompt 对比，在下列命令中分别使用 `--prerouter-enabled` / `--no-prerouter-enabled`，输出到不同目录：
+
+~~~bash
+python -m prefetch.examples.infer_prefetch_demo \
+  --checkpoint prefetch/outputs/previous_token_20260923_150530/checkpoint-2000 \
+  --prompt '请解释一下什么是混合专家模型。' --prerouter-enabled \
+  --output prefetch/outputs/predicted_demo/metrics.json
+~~~
+
+定量比较可复用 assistant NLL/PPL 入口，在同一批过滤后的验证样本上分别运行：
+
+~~~bash
+for policy in native predicted; do
+  flag=--no-prerouter-enabled
+  if [ "$policy" = predicted ]; then flag=--prerouter-enabled; fi
+  CUDA_VISIBLE_DEVICES=0 python -m prefetch.evaluation.evaluate_base \
+    --checkpoint prefetch/outputs/previous_token_20260923_150530/checkpoint-2000 \
+    "$flag" --sample-file prefetch/data/tulu/validation.filtered.jsonl --limit 128 \
+    --output "prefetch/outputs/routing_quality/$policy.json"
+done
+~~~
+
+提供 predictor checkpoint 时使用其对应的基模、量化和 attention adapter。路由替换范围为 teacher-forcing 的 response 文本输入，prompt 保持原路由。比较 `assistant_nll` 的 predicted−native 差值及 `assistant_perplexity` 的变化，并确认 `tokens/examples` 相同。这里测量固定参考答案下的 teacher-forcing 条件 NLL，LM 标签仍含结束符，不代表任务准确率；任务精度还需在相同任务集上比较生成答案。`evaluation.evaluate` 也接受开关，但报告的是路由指标。
+
+执行策略改变后，下游 hidden states 和生成轨迹也会改变。`state.router_indices`、KL 标签及 Recall 的真值仍为原 router 在**当前轨迹**上的选择，并非另外运行一次原模型得到的基线路由。报告的 `metadata.config.prerouter_enabled` 和 `metadata.execution` 标识执行策略。常规预测器训练保持开关关闭；开启训练会使用改变后的轨迹。缓存 I/O 的 trace 采集固定关闭此开关，保持原路由轨迹。
+
 ### 路由指标
 
-统计单位是一个有效输入 token 在一个目标 MoE 层的调用（token-layer pair）。令原 router 实际选出的专家集合为 $R$，大小为 $K$（当前模型为 8）；prerouter 排序前 $k'$ 个专家为 $P_{k'}$。真值来自当前基模的实际路由，预测按 `sigmoid(logits) + 目标层 correction bias` 排序。$k'$ 控制预测候选数，实际执行专家仍由原 router 决定。
+统计单位是一个有效输入 token 在一个目标 MoE 层的调用（token-layer pair）。令原 router 在当前 hidden states 上选出的专家集合为 $R$，大小为 $K$（当前模型为 8）；prerouter 排序前 $k'$ 个专家为 $P_{k'}$。预测按 `sigmoid(logits) + 目标层 correction bias` 排序。$k'$ 控制预测候选数；实际执行策略由 `prerouter_enabled` 控制，执行数量为模型的 $K$。
 
 - **平均命中数（mean_hits）**：$\mathbb E[|R\cap P_{k'}|]$，表示每次调用平均找到了几个真值专家。
 - **Recall@$k'$**：$\mathbb E[|R\cap P_{k'}|/K]$，分母为真值专家数。当前 $K=8$ 时，`mean_hits = 8 * recall`；分母若取 $k'$ 则是 Precision。
@@ -299,7 +364,9 @@ RequiredK 报告 `mean`、`median`、`min`、`max`、`p90`、`p95`、`p99`。中
 
 `full_coverage` 字段保留，其含义正是 RequiredK 的累积分布：$\mathrm{FullCoverage@}k'=\Pr(K_{\mathrm{req}}\le k')$。例如 CDF 在 $k'=32$ 时为 0.8，表示选前 32 个候选足以覆盖 80% 的调用。它不要求同一 token 的所有 MoE 层同时覆盖。
 
-global 按有效 token-layer pair 汇总，per-layer 只汇总对应目标层；长回答贡献更多统计量。训练验证采用 teacher forcing，默认只统计 assistant 文本输入位置并排除 special tokens。generation 的 prefill/decode 分别统计。空集合的统计值为 `null`、计数为 0。RequiredK 是利用真值计算的事后评测量，不是运行时可直接获得的预取预算，也不包含 DRAM 缓存命中和 Flash 搬运时延。
+global 按有效 token-layer pair 汇总，per-layer 只汇总对应目标层；长回答贡献更多统计量。报告使用 `teacher_forcing` 和 `decode` 两个 phase：前者是参考答案 response 文本输入位置的预测指标，后者是真实生成过程中逐次 decode 调用的指标，两者独立汇总。prefill 不参与路由指标。空集合的统计值为 `null`、计数为 0。RequiredK 是利用真值计算的事后评测量，不是运行时可直接获得的预取预算，也不包含 DRAM 缓存命中和 Flash 搬运时延。
+
+router 指标对应当前输入位置，不能直接用 LM 的下一 token 标签位置代替。prefill 输出第一个回答 token 后，该 token 再输入模型才发生首个 decode。EOS 通常作为输出触发停止，不再进入下一次 MoE；若生成因长度上限停止，最后一个输出 token 也通常尚未再次输入模型。周期验证的 teacher forcing 是参考答案轨迹上的近似评测，真实端侧结论以 generation 的 `decode` 指标为准。
 
 以报告前缀 `vl-step300` 为例，产物为：
 
@@ -335,9 +402,9 @@ CUDA_VISIBLE_DEVICES=0 python -m prefetch.examples.infer_prefetch_demo \
 
 纯文本 demo 省略 --image。连线检查可省略 --checkpoint 并传 --config，此时报告标记 predictor=initialized。
 
-generation 评测只使用验证对话的第一个 assistant 回答前的上下文，prefill/decode 分开报告。支持 batch=1、num_beams=1、use_cache=true 的普通生成。返回的最后一个生成 token 通常尚未再输入模型，因此 decode 路由调用数可能比生成 token 数少 1。
+generation 评测只使用验证对话的第一个 assistant 回答前的上下文，报告实际 decode 调用。支持 batch=1、num_beams=1、use_cache=true 的普通生成。返回的最后一个生成 token 通常尚未再输入模型，因此 decode 路由调用数可能比生成 token 数少 1。
 
-demo 使用 with capture_generation(model, state, meter) 包住每次 generate：进入时重置请求状态，每个 forward 完成后统计，退出时释放观察器和请求张量。上一 token 模式用 prefill 尾部预测首个 decode。手动逐 token 推理可先调用 state.reset(generation=True)，再在每次 forward 后调用 meter.update(state)。trace 包含 source/target MoE 序号、输入 token 位置、预测集和真值；trace_limit 分阶段限额。demo 时间包含预测及统计开销，不代表 Flash 预取收益。
+demo 使用 with capture_generation(model, state, meter) 包住每次 generate：进入时重置请求状态，decode forward 完成后统计，退出时释放观察器和请求张量。上一 token 模式用 prefill 尾部预测首个 decode。手动逐 token 推理可先调用 state.reset(generation=True)，再在每次 forward 后调用 meter.update(state)，该函数在 prefill 自动返回。trace 包含 source/target MoE 序号、输入 token 位置、预测集和真值；trace_limit 分阶段限额。demo 时间包含预测及统计开销，不代表 Flash 预取收益。
 
 ### 从已有 JSON 生成统计与图表
 
@@ -416,6 +483,7 @@ python -m prefetch.evaluation.cache.simulate \
 |---|---|
 | prerouter/block.py | 独立 Prerouter 神经网络 |
 | prerouter/patch.py | MoE forward、模型入口与安装/卸载 |
+| prerouter/routing.py | 执行专家选择、原 router 权重提取与回退策略 |
 | prerouter/state.py | 全局路由数据、层映射与跨 token 状态 |
 | evaluation/routing.py / evaluation/metrics.py | 覆盖率计数、trace 与汇总报告 |
 | prerouter/configuration.py / prerouter/checkpoint.py | 预测配置、head 保存加载 |
@@ -427,7 +495,7 @@ python -m prefetch.evaluation.cache.simulate \
 | evaluation/cache/trace.py / collect.py | 完整 decode 路由观测与多卡 JSONL 采集 |
 | evaluation/cache/oracle.py / simulate.py / report.py | 每层 oracle 缓存模拟、I/O 汇总与容量曲线 |
 | utils/logging.py | 命令行日志格式、级别与 rank 标识 |
-| examples/infer_base_demo.py / evaluation/evaluate_base.py | 纯基模 prompt 推理、固定验证集 NLL/PPL |
+| examples/infer_base_demo.py / evaluation/evaluate_base.py | 纯基模 prompt 推理、量化与路由策略的固定验证集 NLL/PPL |
 | examples/infer_prefetch_demo.py / examples/smoke_test.py | 单 prompt 演示、真实模型检查 |
 
 训练 checkpoint 保存 head 或 LoRA、运行配置、optimizer/scheduler、各 rank RNG、epoch 和下个 batch 位置。head 模块归 source block 所有，predictor.safetensors 仍采用目标 MoE 序号作为键；已有 target-keyed head checkpoint 可加载，optimizer 参数顺序保持配置中的 pair 顺序。基模权重由 model.path 或独立的 model.nf4_checkpoint 提供，请保留不可变的基模、NF4 checkpoint 与 adapter 版本。当前支持 n_group=1、常规 attention；换模型结构前检查层映射和执行语义。

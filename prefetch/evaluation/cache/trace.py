@@ -39,6 +39,8 @@ class DecodeTrace:
 
     @contextmanager
     def capture(self, model):
+        if self.state.config.prerouter_enabled:
+            raise ValueError("Cache I/O comparison requires prerouter_enabled=False for native routing")
         self.records = [dict(moe=layer["moe"], truth=[],
                              prediction=[] if layer["source_moe"] is not None else None)
                         for layer in self.layers]

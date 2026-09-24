@@ -49,9 +49,14 @@ def test_visual_expansion_is_preserved(tmp_path):
     from PIL import Image
     path = tmp_path / "image.png"
     Image.new("RGB", (4, 4)).save(path)
-    batch = SFTCollator(ToyProcessor(), router_tokens="all_text")([example([str(path)])])
+    batch = SFTCollator(ToyProcessor())([example([str(path)])])
     assert int((batch["input_ids"] == 4).sum()) == 3
     assert not batch["router_mask"][batch["input_ids"] == 4].any()
+
+
+def test_router_supervision_requires_response_scope():
+    with pytest.raises(ValueError, match="router_tokens must be assistant"):
+        SFTCollator(ToyProcessor(), router_tokens="all_text")
 
 
 def test_overlength_is_explicit():

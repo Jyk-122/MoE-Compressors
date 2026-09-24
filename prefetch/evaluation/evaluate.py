@@ -55,8 +55,6 @@ def generation_inputs(processor, example, max_image_side=672):
 @torch.no_grad()
 def evaluate_generation(model, state, processor, config, device, output, max_new_tokens):
     model.eval()
-    state.config.excluded_token_ids = list(set(state.config.excluded_token_ids) |
-                                          set(processor.tokenizer.all_special_ids))
     meter = RoutingMetrics(state)
     for name, source in config["data"].get("validation", {}).items():
         dataset = load_records(source["path"], source.get("limit"))
@@ -68,7 +66,7 @@ def evaluate_generation(model, state, processor, config, device, output, max_new
                                max_new_tokens=max_new_tokens)
         report = meter.report(distributed=dist.is_initialized())
         report["evaluation"] = dict(source=name, examples=len(dataset), mode="first_answer_generation",
-                                     max_new_tokens=max_new_tokens, prefill_tokens="all_text", decode_tokens="all_text")
+                                     max_new_tokens=max_new_tokens, decode_tokens="all_forwarded_inputs")
         if rank() == 0:
             path = Path(output) / f"{name}-generation.json"
             save_report(report, path)
@@ -83,12 +81,16 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--mode", choices=["teacher_forcing", "generation"], default="teacher_forcing")
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--prerouter-enabled", action=argparse.BooleanOptionalAction, default=None,
+                        help="Execute predicted experts with native weights; default follows config/checkpoint")
     args = parser.parse_args()
     configure_logging()
     config = experiment_config(args.config, args.checkpoint)
     device = setup(config.get("seed", 42))
     model, processor, _ = load_model(config, device)
-    state = patch(model, checkpoint=args.checkpoint)
+    state = patch(model, config.get("prefetch"), checkpoint=args.checkpoint,
+                  prerouter_enabled=args.prerouter_enabled)
+    logger.info("prerouter_enabled=%s", state.config.prerouter_enabled)
     if args.mode == "teacher_forcing":
         task = TrainingTask(model, state, "router", config["model"].get("router_forward_kwargs"))
         evaluate_task(task, processor, config, device, args.output, "final")

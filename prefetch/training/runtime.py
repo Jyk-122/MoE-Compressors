@@ -137,7 +137,8 @@ def evaluate_task(task, processor, config, device, output_dir, step):
             batch = to_device(batch, device)
             loss = task(batch, record_metrics=True)
             count = ((batch["labels"][:, 1:] != -100).sum() if task.stage == "lora"
-                     else (task.prerouter_state.valid_mask & batch["router_mask"][0]).sum())
+                     else (task.prerouter_state.valid_mask &
+                           batch["router_mask"][0, task.prerouter_state.target_start:]).sum())
             totals += torch.stack((loss.double() * count, count.double()))
         if dist.is_initialized():
             dist.all_reduce(totals)

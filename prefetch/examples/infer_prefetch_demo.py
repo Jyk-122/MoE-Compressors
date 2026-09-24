@@ -1,4 +1,4 @@
-"""Single-request prefetch prediction demo; original routing executes the experts."""
+"""Single-request demo with native or prerouter-selected expert execution."""
 from __future__ import annotations
 
 import argparse
@@ -26,6 +26,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", help="YAML config; can be inferred from a trained checkpoint")
     parser.add_argument("--checkpoint", help="Omit for an initialized-head wiring smoke test")
+    parser.add_argument("--prerouter-enabled", action=argparse.BooleanOptionalAction, default=None,
+                        help="Execute predicted experts with native weights; default follows config/checkpoint")
     parser.add_argument("--prompt", default="请描述一下这张图。")
     parser.add_argument("--image")
     parser.add_argument("--max-new-tokens", type=int, default=128)
@@ -39,10 +41,10 @@ def main():
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     model, processor, _ = load_model(config, device)
-    state = patch(model, config["prefetch"], checkpoint=args.checkpoint)
+    state = patch(model, config["prefetch"], checkpoint=args.checkpoint,
+                  prerouter_enabled=args.prerouter_enabled)
+    logger.info("prerouter_enabled=%s", state.config.prerouter_enabled)
     state.config.trace_limit = args.trace_limit
-    state.config.excluded_token_ids = sorted(set(state.config.excluded_token_ids) |
-                                            set(processor.tokenizer.all_special_ids))
     paths = [args.image] if args.image else []
     messages = multimodal_messages([dict(role="user", content=args.prompt)], paths)
     inputs = to_device(processor_call(processor, messages, open_images(paths, config["data"].get("max_image_side", 672)),
@@ -67,8 +69,7 @@ def main():
     save_report(report, args.output)
     plot_report(report, Path(args.output).with_suffix(""))
     print(answer)
-    for phase in ("prefill", "decode"):
-        logger.info("%s %s", phase, json.dumps(report["phases"][phase]["global"], ensure_ascii=False))
+    logger.info("decode %s", json.dumps(report["phases"]["decode"]["global"], ensure_ascii=False))
     logger.info("Metrics: %s; instrumented generation: %.3fs", args.output, elapsed)
 
 

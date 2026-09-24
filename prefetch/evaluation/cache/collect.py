@@ -40,7 +40,8 @@ def main():
     config = experiment_config(args.config, args.checkpoint)
     device = setup(config.get("seed", 42))
     model, processor, _ = load_model(config, device)
-    state = patch(model, checkpoint=args.checkpoint)
+    # This experiment compares prefetch I/O on an unchanged native-routing trajectory.
+    state = patch(model, checkpoint=args.checkpoint, prerouter_enabled=False)
     model.eval()
     trace = DecodeTrace(state, prediction_k=8)
     output = Path(args.output)

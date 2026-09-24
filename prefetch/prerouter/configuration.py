@@ -13,8 +13,9 @@ class PrefetchConfig:
     loss: str = "score_kl"
     targets: list[int] | None = None
     ks: list[int] = field(default_factory=lambda: [8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384])
-    excluded_token_ids: list[int] = field(default_factory=list)
+    excluded_token_ids: list[int] = field(default_factory=list)  # Teacher-forcing supervision only.
     trace_limit: int = 0
+    prerouter_enabled: bool = False  # Decode / teacher-forced response uses predicted experts.
 
 
 def layer_pairs(num_moe, mode="same_token", distance=1, targets=None):
