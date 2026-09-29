@@ -51,14 +51,14 @@ M=distance 按 MoE 数计算：same_token 要求 M≥1；previous_token 允许 M
 
 state.valid_mask 表示已对齐监督位置的有效性，并在 teacher forcing 中排除配置指定的 token。训练和 teacher-forcing 指标与 router_mask[0,target_start:] 取交集，只使用 response 文本输入位置；路由替换也限定在这些位置。首个 response 可由 prompt 尾部预测，筛选只看目标位置。decode 则统计实际发生的输入调用，包括特殊 token，不受 teacher-forcing 文本排除规则限制。router mask 对应当前输入 token，LM loss 才做下一 token shift；LM 的 EOS 标签保留。
 
-每条样本开始调用 state.reset(train_prerouter=True, router_mask=router_mask)。手动生成开始调用 state.reset(generation=True)，支持 num_beams=1、use_cache=true 的单 token decode；prefill 的尾部预测用于首个 decode。next_predictions 只保存最后一个位置的 detached clone。完整 VL processor 的 input_ids 长度须与 MoE 输入一致。
+每条训练样本开始调用 state.reset(train_prerouter=True, router_mask=router_mask)。patch 包装 model.generate，每次进入时调用 state.reset(generation=True)，通过 finally 在返回或异常时清理 state；首次 forward 为 prefill，后续为 decode。支持 batch=1、num_beams=1、use_cache=true 的普通单 token decode；prefill 的尾部预测用于首个 decode。手动调用 forward 的生成循环由调用方初始化和清理请求，也可使用 capture_generation。next_predictions 只保存最后一个位置的 detached clone。完整 VL processor 的 input_ids 长度须与 MoE 输入一致。
 
 ## 4. 模块职责和调用顺序
 
 组织方式参考 Edge0 的 [PrerouterState](https://github.com/Edge0-AI/Edge0/blob/fb4cd2c49ebe22bb230e1451ecb8fb4957ca62e6/src/edge0/prerouter/state.py) 和 [安装/forward patch](https://github.com/Edge0-AI/Edge0/blob/fb4cd2c49ebe22bb230e1451ecb8fb4957ca62e6/src/edge0/prerouter/install.py)。
 
 - prerouter/block.py：Prerouter 的网络结构和 forward。
-- prerouter/patch.py：patch 返回 model.prerouter_state；安装 head，替换 MoE 和 model forward；unpatch(model) 恢复。
+- prerouter/patch.py：patch 返回 model.prerouter_state；安装 head，替换 MoE 和 model forward，包装已有的 generate 管理请求生命周期；unpatch(model) 恢复原方法。generate 包装器保留原签名，透传参数、返回值和异常。
 - prerouter/routing.py：select_experts 统一返回执行专家及权重；调用方传入对应同一批目标位置的原 router logits/route 和 prerouter logits，None 预测表示使用原路由。
 - prerouter/state.py：PrerouterState 收集路由张量，管理层映射、token 对齐与请求生命周期。
 - training/train.py：router_loss / compute_prerouter_loss 定义损失；TrainingTask 运行基模，再读取 state 算 loss。

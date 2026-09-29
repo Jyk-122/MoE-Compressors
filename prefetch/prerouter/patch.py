@@ -1,7 +1,8 @@
-"""Install Prerouter modules and explicit MoE/model forward patches."""
+"""Install Prerouter modules, forward patches, and generation request lifecycle."""
 from __future__ import annotations
 
 from functools import wraps
+from inspect import signature
 from types import MethodType
 
 import torch
@@ -105,11 +106,33 @@ def patch(model, config=None, checkpoint=None, *, prerouter_enabled=None):
             state.active = False
 
     model.forward = forward
+    if hasattr(model, "generate"):
+        original_generate = model.generate
+        model._prerouter_generate = ("generate" in model.__dict__, original_generate)
+
+        @wraps(original_generate)
+        def generate(*args, **kwargs):
+            state.reset(generation=True)
+            try:
+                return original_generate(*args, **kwargs)
+            finally:
+                state.reset()
+
+        # Keep the bound signature through decorators such as torch.no_grad.
+        generate.__signature__ = signature(original_generate)
+        model.generate = generate
     return state
 
 
 def unpatch(model):
     state = model.prerouter_state
+    if hasattr(model, "_prerouter_generate"):
+        had_override, original = model._prerouter_generate
+        if had_override:
+            model.generate = original
+        else:
+            del model.generate
+        del model._prerouter_generate
     for module in [model] + [block for _, block in state.blocks]:
         had_override, original = module._prerouter_forward
         if had_override:

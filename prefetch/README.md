@@ -54,7 +54,7 @@ prefetch:
 ### Patch 阅读顺序
 
 1. [prerouter/block.py](prerouter/block.py)：Prerouter 是独立的 nn.Module，forward 输入 hidden states，输出预测 logits。
-2. [prerouter/patch.py](prerouter/patch.py)：moe_forward 明确写出原 router、信息收集、prerouter 和专家计算；[prerouter/routing.py](prerouter/routing.py) 的 select_experts 集中决定执行专家和权重。patch 安装模块并替换 forward，unpatch 恢复。
+2. [prerouter/patch.py](prerouter/patch.py)：moe_forward 明确写出原 router、信息收集、prerouter 和专家计算；[prerouter/routing.py](prerouter/routing.py) 的 select_experts 集中决定执行专家和权重。patch 安装模块、替换 forward，并包装 generate 管理请求状态；unpatch 恢复原方法。
 3. [prerouter/state.py](prerouter/state.py)：全模型共用一个 PrerouterState，按目标层保存 predictions、router_logits、router_indices，处理层间和 token 间传递。
 4. [training/train.py](training/train.py)：compute_prerouter_loss 在模型前向结束后读取 state 计算 KL；TrainingTask 负责训练调用和 DDP 可训练参数。
 5. [evaluation/routing.py](evaluation/routing.py)：RoutingMetrics 读取 state 统计覆盖率和 trace；capture_generation 为 generate 的每次 forward 安装临时评测观察器。
@@ -309,10 +309,13 @@ teacher forcing 中，开关只作用于 `router_mask` 指定的 response 文本
 
 ~~~python
 state = patch(model, checkpoint=checkpoint, prerouter_enabled=True)
+outputs = model.generate(**inputs, max_new_tokens=128, use_cache=True, num_beams=1)
 # 可在独立请求之间切换；每次重新 prefill，建立与执行策略匹配的 KV cache。
 state.config.prerouter_enabled = False
-state.reset(generation=True)
+outputs = model.generate(**inputs, max_new_tokens=128, use_cache=True, num_beams=1)
 ~~~
+
+`patch()` 自动包装模型的 `generate()`：每次调用前初始化生成状态，首次 forward 为 prefill，后续为 decode；正常返回或发生异常时清理请求张量。调用参数、返回值和异常由原 `generate()` 处理，连续请求各自独立。适用于通过该模型 `generate()` 调用的评测框架，要求 batch=1、num_beams=1、use_cache=true 的普通生成。`unpatch(model)` 恢复原 `forward()` 和 `generate()`。
 
 `patch()` 的显式参数优先于传入配置中的开关，配置优先于 checkpoint 保存值；旧 checkpoint 未保存该字段时默认为关闭。网络结构、层映射和 head 权重仍从 checkpoint 恢复。`state.reset()` 清理请求张量，保留开关设置。
 
@@ -404,7 +407,7 @@ CUDA_VISIBLE_DEVICES=0 python -m prefetch.examples.infer_prefetch_demo \
 
 generation 评测只使用验证对话的第一个 assistant 回答前的上下文，报告实际 decode 调用。支持 batch=1、num_beams=1、use_cache=true 的普通生成。返回的最后一个生成 token 通常尚未再输入模型，因此 decode 路由调用数可能比生成 token 数少 1。
 
-demo 使用 with capture_generation(model, state, meter) 包住每次 generate：进入时重置请求状态，decode forward 完成后统计，退出时释放观察器和请求张量。上一 token 模式用 prefill 尾部预测首个 decode。手动逐 token 推理可先调用 state.reset(generation=True)，再在每次 forward 后调用 meter.update(state)，该函数在 prefill 自动返回。trace 包含 source/target MoE 序号、输入 token 位置、预测集和真值；trace_limit 分阶段限额。demo 时间包含预测及统计开销，不代表 Flash 预取收益。
+demo 使用 `with capture_generation(model, state, meter)` 包住每次 `generate()`，按需添加指标观察器：decode forward 完成后统计，退出时释放观察器。`generate()` 自动清理 state，累计指标和 trace 保留在 meter 中；只需模型输出时可直接调用 `model.generate()`。上一 token 模式用 prefill 尾部预测首个 decode。手动逐 token 调用 forward 时，由调用方在请求开始调用 `state.reset(generation=True)`，每次 forward 后调用 `meter.update(state)`（prefill 自动返回），并在请求结束的 finally 中调用 `state.reset()`；也可以用 `capture_generation` 管理这一手动循环。trace 包含 source/target MoE 序号、输入 token 位置、预测集和真值；trace_limit 分阶段限额。demo 时间包含预测及统计开销，不代表 Flash 预取收益。
 
 ### 从已有 JSON 生成统计与图表
 

@@ -20,7 +20,7 @@ class PrerouterState:
         self.reset()
 
     def reset(self, generation=False, train_prerouter=False, router_mask=None):
-        """Call before each independent training sample or generation request."""
+        """Initialize a sample/request; the generate patch manages generation calls."""
         self.generation, self.train_prerouter = generation, train_prerouter
         self.active = False
         self.phase = "teacher_forcing"
