@@ -28,12 +28,13 @@ MoE 序号从 0 开始，checkpoint 同时保存真实模块路径：
 |---|---|---|---|
 | same_token | token t，MoE i−M 输入 | token t，MoE i router | i≥M |
 | previous_token | token t−1，MoE i−M 输入 | token t，MoE i router | i≥M |
+| previous_top | token t−1，MoE i−M 输入 + token t 的 embedding | token t，MoE i router | i≥M |
 
-M=distance 按 MoE 数计算：same_token 要求 M≥1；previous_token 允许 M≥0。M=0 时，source 和 target 属于同一 MoE，token 相差 1，所有层 i≥0 均可作为目标；序列首 token 仍无跨 token 标签。prefetch.targets 可固定共同目标层，默认使用全部有效目标。
+M=distance 按 MoE 数计算：same_token 要求 M≥1；previous_token / previous_top 允许 M≥0。M=0 时，source 和 target 属于同一 MoE，token 相差 1，所有层 i≥0 均可作为目标；序列首 token 仍无跨 token 标签。prefetch.targets 可固定共同目标层，默认使用全部有效目标。
 
-训练和推理的 batch size 均为 1，正常数据流程不做 padding，MoE 输入为 [1,S,H]，state 中的路由信息为 [T,E] 或 [T,K]。teacher forcing 的 same-token 模式 T=S，previous-token 模式 T=S−1，decode 时 T=1。每卡训练一条样本，可用 DDP 和梯度累积增加有效训练 batch；样本间独立，不做 packing。
+训练和推理的 batch size 均为 1，正常数据流程不做 padding，MoE 输入为 [1,S,H]，state 中的路由信息为 [T,E] 或 [T,K]。teacher forcing 的 same_token 模式 T=S，previous_token / previous_top 模式 T=S−1，decode 时 T=1。每卡训练一条样本，可用 DDP 和梯度累积增加有效训练 batch；样本间独立，不做 packing。
 
-全模型共用一个 PrerouterState，以下字典都以目标 MoE 序号为键：
+全模型共用一个 PrerouterState，以下路由字典都以目标 MoE 序号为键：
 
 | 字段 | 内容 | 生命周期 |
 |---|---|---|
@@ -42,12 +43,16 @@ M=distance 按 MoE 数计算：same_token 要求 M≥1；previous_token 允许 M
 | router_indices | 原 router 在当前 hidden states 上选出的专家 [T,K] | 当前 teacher-forcing/decode forward |
 | next_predictions | 下一 decode 的预测 [1,E] | 跨一个 forward |
 
+previous_top 另有 `source_hidden` 字典，以 source MoE 为键，保存下次 decode 使用的 `[1,H]` detached clone；`token_embeddings` 是本次 forward 的冻结输入 embedding `[S,D]`。reset 清理这些张量。
+
 传递规则集中在 prerouter/state.py：
 
 1. same_token：teacher forcing 和 decode 中，source i 的输出直接放入 predictions[i+M]；prefill 只执行原 MoE。
 2. previous_token teacher forcing：保存 source i 的 logits[:-1]，同时保存 target i+M 的 router_logits[1:] 和 router_indices[1:]。T=S−1，target_start=1；监督范围同步切片 router_mask[:,1:]。M=0 时在同一层完成对齐。
 3. previous_token prefill：head 只读取最后一个位置，保存 [1,E] 的 next_predictions；prefill 各位置执行原 router，也不收集路由指标。
 4. previous_token decode：forward 开始时把 next_predictions 交给 predictions，再建立新的 next_predictions。当前 forward 的 head 输出保存到下一轮。
+5. previous_top teacher forcing：source MoE 中计算 `head(hidden[:-1], token_embeddings[1:])`，直接保存为 `[S−1,E]` 的 predictions；target 与监督 mask 同步切片 `[1:]`。
+6. previous_top generation：prefill 仅保存各 source 的最后一行 hidden。decode 入口查询当前已采样 token 的 embedding，通过 `prepare_token_predictions` 逐 head 结合上轮 hidden 生成全部 predictions，清空已消费的 source_hidden，再执行当前各层并缓存新的 hidden。每次 decode 的 head 均在第一个 decoder layer 之前完成。
 
 state.valid_mask 表示已对齐监督位置的有效性，并在 teacher forcing 中排除配置指定的 token。训练和 teacher-forcing 指标与 router_mask[0,target_start:] 取交集，只使用 response 文本输入位置；路由替换也限定在这些位置。首个 response 可由 prompt 尾部预测，筛选只看目标位置。decode 则统计实际发生的输入调用，包括特殊 token，不受 teacher-forcing 文本排除规则限制。router mask 对应当前输入 token，LM loss 才做下一 token shift；LM 的 EOS 标签保留。
 
@@ -81,13 +86,15 @@ DDP wrapper 只注册可训练 ParameterList，参数按配置中的 pair 顺序
 
 生成评测使用 capture_generation(model, state, meter) 包住一次 generate。评测侧临时挂 model forward hook，每步完成后 meter.update(state)，其中 prefill 自动返回，decode 累计指标；请求结束时卸载观察器并清理 state，报告计数单独保留。直接调用 model forward 只收集信息，由调用方决定后续处理。
 
-prerouter 读取 source MoE 输入，实际调用在 source 原路由选择之后、专家计算之前；报告 producer_timing=after_source_routing_before_experts。moe_forward 根据 phase 和开关决定执行策略：prefill 使用原路由；decode 可用 select_experts 替换；teacher forcing 只将 response 行交给 select_experts 并写回这些行。无预测器的层及 previous-token 整段序列的首位置使用原路由。监督和指标读取已收集的原 router 标签，原 router 始终参与权重计算。
+same_token / previous_token 的 head 在 source 原路由选择之后、专家计算之前调用，生成报告 producer_timing=after_source_routing_before_experts。previous_top 的生成报告为 decode_start_after_token_embedding，teacher forcing 仍在 source MoE 中批量对齐计算。moe_forward 根据 phase 和开关决定执行策略：prefill 使用原路由；decode 可用 select_experts 替换；teacher forcing 只将 response 行交给 select_experts 并写回这些行。无预测器的层及两种跨 token 模式的序列首位置使用原路由。监督和指标读取已收集的原 router 标签，原 router 始终参与权重计算。
 
 开关可通过 YAML、patch(..., prerouter_enabled=...) 或 state.config.prerouter_enabled 设置；显式 patch 参数优先于传入配置和 checkpoint 值，旧 checkpoint 默认关闭。请求 reset 保留策略；切换策略后用新请求重新构建 KV cache。路由改变后，原 router 标签对应改变后的当前轨迹。evaluate_base 支持在固定验证集上比较开关前后的 assistant NLL/PPL；缓存 I/O trace 采集固定使用原路由。
 
 ## 5. Head、损失与指标
 
 每目标默认 Linear(2560,512)→GELU→Linear(512,384)。linear 基线使用单层 Linear，初始化为目标 gate 权重。
+
+previous_top 的 MLP 为 `W2 · GELU(Wh · previous_hidden + We · current_embedding + b1) + b2`；linear 为两条线性投影之和。embedding 通过基模 `get_input_embeddings()` 查询，维度取该 embedding 的权重宽度。新增 `token_proj`（We）零初始化；embedding 和 hidden 输入冻结，两条 head 分支可训练。checkpoint 保留原有 target_moe 前缀的 net 权重键，并新增 `<target>.token_proj.weight`；已有模式的权重键保持兼容。
 
 默认 score_kl：
 
@@ -145,7 +152,7 @@ checkpoint 保存 predictor 或 LoRA safetensors、配置、optimizer/scheduler�
 ## 9. 验收
 
 1. 小模型检查 patch 保留 native forward、层映射、mask、请求隔离。
-2. previous_token 对齐切片及首个 response 监督正确；完整序列的 response 指标与相应逐 token decode 计数一致。
+2. previous_token / previous_top 对齐切片及首个 response 监督正确；完整序列的 response 指标与相应逐 token decode 计数一致；previous_top 的非零 embedding 分支参与预测，且全部 decode 预测在首层之前就绪。
 3. head 梯度、teacher detach、零有效 token、checkpoint roundtrip。
 4. LoRA 零初始化与保存恢复；NF4 packed 权重、expert 前向和输入梯度。
 5. 真实文本/图像 processor 的 mask/长度、BF16/NF4 native logits 对齐。

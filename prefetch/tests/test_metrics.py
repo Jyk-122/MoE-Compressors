@@ -15,10 +15,13 @@ def test_layer_mapping():
     assert layer_pairs(35, "previous_token", distance=0) == [(i, i) for i in range(35)]
     assert layer_pairs(35, "previous_token", distance=0, targets=[0, 3]) == [(0, 0), (3, 3)]
     assert layer_pairs(35, "previous_token", distance=2)[0] == (0, 2)
+    assert layer_pairs(35, "previous_top", distance=0) == [(i, i) for i in range(35)]
+    assert layer_pairs(35, "previous_top", distance=2, targets=[2, 5]) == [(0, 2), (3, 5)]
     assert layer_pairs(35, distance=2, targets=[3, 5]) == [(1, 3), (3, 5)]
 
 
 @pytest.mark.parametrize("kwargs", [{"distance": 0}, {"mode": "previous_token", "distance": -1},
+                                    {"mode": "previous_top", "distance": -1},
                                     {"targets": [0]}, {"targets": []}, {"targets": [2, 2]},
                                     {"mode": "previous_token", "distance": 0, "targets": [-1]},
                                     {"mode": "previous_token", "distance": 0, "targets": [35]}])

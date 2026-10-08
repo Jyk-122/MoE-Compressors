@@ -1,0 +1,49 @@
+seed: 42
+stage: router
+output_dir: prefetch/outputs  # Each run creates previous_top_<startup time>.
+model:
+  path: /path/to/full/BF16/checkpoint
+  quantization: none
+  nf4_blocksize: 64
+  nf4_checkpoint: null
+  router_forward_kwargs: {logits_to_keep: 1}
+lora:
+  enabled: false
+  checkpoint: null
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+prefetch:
+  mode: previous_top
+  distance: 0              # Source: previous token, MoE i-M; target: current token, MoE i.
+  targets: null
+  head: mlp               # Previous hidden and current token embedding fuse before GELU.
+  hidden_dim: 512
+  loss: score_kl
+  temperature: 0.1
+  ks: [8, 12, 16, 24, 48, 96, 192, 384]
+  prerouter_enabled: false
+data:
+  seed: 42
+  max_length: 2048
+  max_image_side: null
+  router_tokens: assistant
+  num_workers: 0
+  # train_limit: 128
+  train:
+    - {path: prefetch/data/cog/train.filtered.jsonl, weight: 0.5}
+    - {path: prefetch/data/tulu/train.filtered.jsonl, weight: 0.5}
+  validation:
+    vl: {path: prefetch/data/cog/validation.filtered.jsonl, limit: 128}
+    text: {path: prefetch/data/tulu/validation.filtered.jsonl, limit: 128}
+training:
+  max_steps: 10000
+  gradient_accumulation: 4
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  warmup_steps: 50
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  log_every: 10
+  eval_every: 1000
+  save_every: 1000

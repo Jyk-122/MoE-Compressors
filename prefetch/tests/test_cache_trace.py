@@ -65,9 +65,10 @@ def test_observers_removed_after_exception():
     assert not state.generation
 
 
-def test_previous_token_trace_requires_event_timing_support():
+@pytest.mark.parametrize("mode", ["previous_token", "previous_top"])
+def test_cross_token_trace_requires_event_timing_support(mode):
     model = ToyModel().eval().requires_grad_(False)
-    state = patch(model, config(mode="previous_token"))
+    state = patch(model, config(mode=mode))
     with pytest.raises(ValueError, match="same_token"):
         DecodeTrace(state)
 

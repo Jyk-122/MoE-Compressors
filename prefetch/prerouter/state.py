@@ -33,6 +33,8 @@ class PrerouterState:
         self.router_logits = {}    # target -> [T,E], detached native gate output
         self.router_indices = {}   # target -> [T,K], native selection on current hidden states
         self.next_predictions = {} # target -> [1,E], for the next decode token
+        self.source_hidden = {}    # source -> [1,H], saved for the next previous_top decode
+        self.token_embeddings = None  # [S,D], frozen input embeddings for previous_top
 
     def begin_forward(self, input_ids, attention_mask=None):
         if input_ids is None or input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -45,7 +47,7 @@ class PrerouterState:
         self.sequence_length = input_ids.shape[1]
         valid = (torch.ones_like(input_ids[0], dtype=torch.bool) if attention_mask is None
                  else attention_mask[0, -self.sequence_length:].bool())
-        previous = self.config.mode == "previous_token"
+        previous = self.config.mode != "same_token"
         self.target_start = int(previous and self.phase == "teacher_forcing")
         self.valid_mask = valid[self.target_start:].clone()
         if self.target_start:
@@ -56,15 +58,20 @@ class PrerouterState:
             if self.config.prerouter_enabled and self.router_mask is None:
                 raise ValueError("Teacher-forcing expert substitution requires state.reset(router_mask=response_mask)")
 
-        self.predictions = self.next_predictions if previous and self.phase == "decode" else {}
+        self.predictions = {}
+        if self.config.mode == "previous_token" and self.phase == "decode":
+            self.predictions = self.next_predictions
         self.next_predictions = {}
+        self.token_embeddings = None
+        if self.phase != "decode":
+            self.source_hidden = {}
         self.router_logits, self.router_indices = {}, {}
         self.active = True
 
     def publish(self, source, logits):
-        """Pair source[:-1] with target[1:], or hand one prediction to the next decode."""
+        """Store aligned predictions, or hand previous_token predictions to decode."""
         target = self.target_of[source]
-        if self.config.mode == "same_token":
+        if self.config.mode != "previous_token":
             self.predictions[target] = logits
         else:
             if self.phase == "teacher_forcing":

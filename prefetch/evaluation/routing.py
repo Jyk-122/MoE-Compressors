@@ -59,7 +59,7 @@ class RoutingMetrics:
                 token = position + state.target_start + state.token_offset
                 self.trace.append(dict(phase=state.phase, forward_index=state.forward_index,
                                        batch_index=0, target_token=token,
-                                       source_token=token - int(self.config.mode == "previous_token"),
+                                       source_token=token - int(self.config.mode != "same_token"),
                                        source_moe=source, target_moe=target,
                                        predictions=prediction, truth=actual))
 
@@ -70,7 +70,8 @@ class RoutingMetrics:
                                    else "native_router"),
                         execution_scope="decode_and_teacher_forced_response",
                         metric_scope=dict(teacher_forcing="response_text_inputs", decode="all_forwarded_inputs"),
-                        producer_timing="after_source_routing_before_experts")
+                        producer_timing=("decode_start_after_token_embedding" if self.config.mode == "previous_top"
+                                         else "after_source_routing_before_experts"))
         counts = self.counts.clone()
         if distributed:
             torch.distributed.all_reduce(counts)

@@ -6,10 +6,15 @@ import json
 from pathlib import Path
 
 
+def _weight_key(target, name):
+    # Preserve existing net keys; the conditioning branch uses token_proj.* keys.
+    return f"{target}.{name[4:] if name.startswith('net.') else name}"
+
+
 def predictor_state_dict(state):
-    return {f"{target}.{name}": value.detach().cpu().contiguous()
+    return {_weight_key(target, name): value.detach().cpu().contiguous()
             for source, target in state.pairs
-            for name, value in state.prerouters[source].net.state_dict().items()}
+            for name, value in state.prerouters[source].state_dict().items()}
 
 
 def save_predictor(state, directory):
@@ -31,11 +36,10 @@ def load_predictor(state, directory, metadata):
     if metadata["layers"] != state.layers:
         raise ValueError("Checkpoint source/target layer mapping differs from the loaded base")
     weights = load_file(str(Path(directory) / "predictor.safetensors"))
-    expected = {f"{target}.{name}" for source, target in state.pairs
-                for name in state.prerouters[source].net.state_dict()}
+    expected = {_weight_key(target, name) for source, target in state.pairs
+                for name in state.prerouters[source].state_dict()}
     if set(weights) != expected:
         raise ValueError("Checkpoint head keys differ from the configured predictors")
     for source, target in state.pairs:
-        prefix = f"{target}."
-        state.prerouters[source].net.load_state_dict(
-            {name[len(prefix):]: value for name, value in weights.items() if name.startswith(prefix)})
+        head = state.prerouters[source]
+        head.load_state_dict({name: weights[_weight_key(target, name)] for name in head.state_dict()})

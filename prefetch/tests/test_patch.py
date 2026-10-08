@@ -16,7 +16,8 @@ from prefetch.training.train import TrainingTask, compute_prerouter_loss, router
 
 
 ROUTING_CASES = [("same_token", 1), ("previous_token", 0),
-                 ("previous_token", 1), ("previous_token", 2)]
+                 ("previous_token", 1), ("previous_token", 2),
+                 ("previous_top", 0), ("previous_top", 1), ("previous_top", 2)]
 
 
 class ToyRouter(nn.Linear):
@@ -73,6 +74,9 @@ class ToyModel(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(32, 6)
         self.layers = nn.ModuleList([ToyLayer() for _ in range(4)])
+
+    def get_input_embeddings(self):
+        return self.embed
 
     def forward(self, input_ids, attention_mask=None, **kwargs):
         x = self.embed(input_ids)
@@ -235,7 +239,7 @@ def test_full_sequence_equals_prefill_then_incremental(model, mode, distance):
     model(input_ids=ids)
     meter.update(state)
     assert meter.trace[0]["target_token"] == 2
-    assert meter.trace[0]["source_token"] == 2 - int(mode == "previous_token")
+    assert meter.trace[0]["source_token"] == 2 - int(mode != "same_token")
     full = meter.counts[0].clone()
     meter.reset()
     with capture_generation(model, state, meter):
@@ -245,7 +249,7 @@ def test_full_sequence_equals_prefill_then_incremental(model, mode, distance):
     torch.testing.assert_close(full, meter.counts[1], rtol=0, atol=0)
     assert int(meter.counts[1, :, 1].sum()) == 3 * len(state.pairs)
     assert "prefill" not in meter.report()["phases"]
-    if mode == "previous_token":
+    if mode != "same_token":
         first = next(row for row in meter.trace if row["phase"] == "decode")
         assert first["source_token"] == 1 and first["target_token"] == 2
         assert first["forward_index"] == 1
@@ -260,10 +264,10 @@ def test_response_only_loss_and_metrics(model, mode, distance):
     values = batch((1, 3, 5, 7, 9))
     values["router_mask"] = torch.tensor([[False, False, True, True, False]])
     task(values, record_metrics=True).backward()
-    assert state.predictions[state.pairs[0][1]].shape[0] == 5 - int(mode == "previous_token")
+    assert state.predictions[state.pairs[0][1]].shape[0] == 5 - int(mode != "same_token")
     assert int(task.meter.counts[0, :, 1].sum()) == 2 * len(state.pairs)
     assert {row["target_token"] for row in task.meter.trace} == {2, 3}
-    assert all(row["source_token"] == row["target_token"] - int(mode == "previous_token")
+    assert all(row["source_token"] == row["target_token"] - int(mode != "same_token")
                for row in task.meter.trace)
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in state.parameters())
 
@@ -297,8 +301,9 @@ def test_reset_prevents_cross_request_pairing(model, distance):
 
 
 @pytest.mark.parametrize("distance", [0, 1, 2])
-def test_padding_exclusions_and_target_mask(model, distance):
-    state = patch(model, config(mode="previous_token", distance=distance, excluded_token_ids=[3]))
+@pytest.mark.parametrize("mode", ["previous_token", "previous_top"])
+def test_padding_exclusions_and_target_mask(model, mode, distance):
+    state = patch(model, config(mode=mode, distance=distance, excluded_token_ids=[3]))
     task = TrainingTask(model, state, "router")
     values = batch((0, 1, 2, 3, 4, 0))
     values["router_mask"] = torch.tensor([[0, 0, 1, 1, 1, 0]], dtype=torch.bool)
@@ -311,8 +316,9 @@ def test_padding_exclusions_and_target_mask(model, distance):
 
 
 @pytest.mark.parametrize("distance", [0, 1, 2])
-def test_zero_valid_tokens_produce_connected_zero_loss(model, distance):
-    state = patch(model, config(mode="previous_token", distance=distance))
+@pytest.mark.parametrize("mode", ["previous_token", "previous_top"])
+def test_zero_valid_tokens_produce_connected_zero_loss(model, mode, distance):
+    state = patch(model, config(mode=mode, distance=distance))
     task = TrainingTask(model, state, "router")
     loss = task(batch((1,)), record_metrics=True)
     loss.backward()
@@ -358,6 +364,9 @@ def test_loss_and_gradients_match_independent_reference(model, mode, distance, h
             captured[index] = (args[0][0].detach(), logits.detach())
         handles.append(layer.mlp.gate.register_forward_hook(capture))
     state = patch(model, cfg)
+    if mode == "previous_top":
+        for head in state.prerouters.values():
+            nn.init.normal_(head.token_proj.weight, std=0.1)
     task = TrainingTask(model, state, "router")
     actual = task(values)
     actual.backward()
@@ -372,11 +381,17 @@ def test_loss_and_gradients_match_independent_reference(model, mode, distance, h
 
     losses = []
     for source, target in state.pairs:
-        prediction = state.prerouters[source](captured[source][0])
+        if mode == "previous_top":
+            prediction = state.prerouters[source](captured[source][0][:-1],
+                                                  model.embed(values["input_ids"])[0, 1:])
+        else:
+            prediction = state.prerouters[source](captured[source][0])
         teacher = captured[target][1]
         mask = values["router_mask"][0] & values["attention_mask"][0]
-        if mode == "previous_token":
-            prediction, teacher = prediction[:-1], teacher[1:]
+        if mode != "same_token":
+            if mode == "previous_token":
+                prediction = prediction[:-1]
+            teacher = teacher[1:]
             mask = mask[1:] & values["attention_mask"][0, :-1]
         prediction, teacher = prediction[mask], teacher[mask]
         if loss_kind == "score_kl":

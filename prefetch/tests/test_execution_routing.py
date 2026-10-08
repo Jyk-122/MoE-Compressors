@@ -71,11 +71,11 @@ def test_execution_and_teacher_are_separate(model, mode, distance, enabled):
             lambda module, args, index=index: captured.update({index: (args[1].clone(), args[2].clone())})))
     output = model(ids, attention_mask=attention).logits
     available = attention[0].clone()
-    if mode == "previous_token":
+    if mode != "same_token":
         available[0] = False
         available[1:] &= attention[0, :-1]
     available &= response_mask[0] & (ids[0] != 3)
-    start = int(mode == "previous_token")
+    start = int(mode != "same_token")
     assert state.target_start == start
     differences = 0
     for target in state.targets:

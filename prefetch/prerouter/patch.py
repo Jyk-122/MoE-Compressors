@@ -15,6 +15,39 @@ from prefetch.prerouter.routing import select_experts
 from prefetch.prerouter.state import PrerouterState
 
 
+def produce_prediction(block, hidden_states):
+    """Produce a layer prediction, or retain source features for previous_top."""
+    state, index = block.prerouter_state, block.moe_index
+    if state.phase == "prefill" and state.config.mode == "same_token":
+        return
+    if hidden_states.shape[:2] != (1, state.sequence_length):
+        raise ValueError("MoE input must match processor input_ids [1, sequence]")
+    source = hidden_states[0].detach()
+    if state.config.mode == "previous_top" and state.generation:
+        state.source_hidden[index] = source[-1:].clone()
+        return
+    # Only the prerouter builds a training graph; the backbone stays frozen.
+    with torch.set_grad_enabled(state.train_prerouter):
+        if state.config.mode == "previous_top":
+            prediction = block.prerouter(source[:-1], state.token_embeddings[1:])
+        else:
+            source = source[-1:] if state.phase == "prefill" else source
+            prediction = block.prerouter(source)
+        state.publish(index, prediction)
+
+
+def prepare_token_predictions(state, embedding, input_ids):
+    """Condition every previous_top head on the sampled token before decode layers."""
+    with torch.no_grad():
+        state.token_embeddings = embedding(input_ids)[0]
+    if state.phase == "decode":
+        with torch.set_grad_enabled(state.train_prerouter):
+            for source, target in state.pairs:
+                state.predictions[target] = state.prerouters[source](
+                    state.source_hidden[source], state.token_embeddings)
+        state.source_hidden = {}  # Consumed; this forward will save the next source features.
+
+
 def moe_forward(self, hidden_states):
     """OpenPXX SparseMoeBlock forward, with routing capture and a prerouter branch."""
     state, index = self.prerouter_state, self.moe_index
@@ -22,15 +55,8 @@ def moe_forward(self, hidden_states):
     original_route = self.route_tokens_to_experts(router_logits)
     if state.active:
         state.record(index, router_logits, original_route[0])
-        produce = state.phase != "prefill" or state.config.mode == "previous_token"
-        if index in state.prerouters and produce:
-            if hidden_states.shape[:2] != (1, state.sequence_length):
-                raise ValueError("MoE input must match processor input_ids [1, sequence]")
-            # Only the prerouter builds a training graph; the backbone stays frozen.
-            with torch.set_grad_enabled(state.train_prerouter):
-                source = hidden_states[0, -1:] if state.phase == "prefill" else hidden_states[0]
-                prediction = self.prerouter(source.detach())
-                state.publish(index, prediction)
+        if index in state.prerouters:
+            produce_prediction(self, hidden_states)
 
     topk_indices, topk_weights = original_route
     if state.active and state.config.prerouter_enabled and index in state.predictions:
@@ -76,10 +102,13 @@ def patch(model, config=None, checkpoint=None, *, prerouter_enabled=None):
         raise ValueError("Prerouter ranking requires n_group=1")
     if len({layer["experts"] for layer in state.layers}) != 1:
         raise ValueError("Prediction targets must have the same expert count")
+    embedding = model.get_input_embeddings() if config.mode == "previous_top" else None
+    embedding_dim = embedding.weight.shape[1] if embedding is not None else None
     for source, target in state.pairs:
         source_gate, target_gate = state.blocks[source][1].gate, state.blocks[target][1].gate
         head = Prerouter(source_gate.weight.shape[1], target_gate.weight.shape[0],
-                         config.head, config.hidden_dim).to(device=source_gate.weight.device, dtype=torch.float32)
+                         config.head, config.hidden_dim, embedding_dim=embedding_dim).to(
+                             device=source_gate.weight.device, dtype=torch.float32)
         if config.head == "linear":
             with torch.no_grad():
                 head.net.weight.copy_(target_gate.weight)
@@ -96,8 +125,11 @@ def patch(model, config=None, checkpoint=None, *, prerouter_enabled=None):
     @wraps(original_forward)
     def forward(*args, **kwargs):
         try:
-            state.begin_forward(kwargs.get("input_ids", args[0] if args else None),
+            input_ids = kwargs.get("input_ids", args[0] if args else None)
+            state.begin_forward(input_ids,
                                 kwargs.get("attention_mask", args[1] if len(args) > 1 else None))
+            if config.mode == "previous_top" and state.phase != "prefill":
+                prepare_token_predictions(state, embedding, input_ids)
             return original_forward(*args, **kwargs)
         except Exception:
             state.reset()

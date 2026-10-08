@@ -40,6 +40,7 @@ def assert_idle(state):
     assert state.router_mask is None and state.valid_mask is None
     assert not state.predictions and not state.next_predictions
     assert not state.router_logits and not state.router_indices
+    assert not state.source_hidden and state.token_embeddings is None
 
 
 @pytest.mark.parametrize("mode,distance", ROUTING_CASES)

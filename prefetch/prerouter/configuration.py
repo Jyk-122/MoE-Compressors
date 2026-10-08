@@ -19,9 +19,9 @@ class PrefetchConfig:
 
 
 def layer_pairs(num_moe, mode="same_token", distance=1, targets=None):
-    if mode not in {"same_token", "previous_token"}:
+    if mode not in {"same_token", "previous_token", "previous_top"}:
         raise ValueError(f"Unknown prediction mode: {mode}")
-    minimum = 0 if mode == "previous_token" else 1
+    minimum = 1 if mode == "same_token" else 0
     if distance < minimum:
         raise ValueError(f"{mode} requires distance >= {minimum}")
     chosen = list(range(distance, num_moe)) if targets is None else list(targets)

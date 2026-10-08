@@ -23,6 +23,7 @@ def run_config(root, mode="same_token", stage="router"):
 @pytest.mark.parametrize("mode,stage,prefix", [
     ("same_token", "router", "same_token"),
     ("previous_token", "router", "previous_token"),
+    ("previous_top", "router", "previous_top"),
     (None, "lora", "lora"),
 ])
 def test_run_name_uses_mode_and_startup_time(tmp_path, monkeypatch, mode, stage, prefix):
