@@ -54,14 +54,17 @@ def main():
     parser.add_argument("--sample-file", required=True, help="Same held-out filtered JSONL for both runs")
     parser.add_argument("--limit", type=int, default=128)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--execution-mode", choices=["native", "predicted", "compensated"],
+                        help="Expert execution policy; overrides the legacy prerouter switch")
     args = parser.parse_args()
     configure_logging()
     if args.limit <= 0:
         parser.error("limit must be positive")
     if not args.config and not args.checkpoint:
         parser.error("Provide --config or --checkpoint")
-    if args.prerouter_enabled and not args.checkpoint:
-        parser.error("--prerouter-enabled requires a trained --checkpoint")
+    if (args.execution_mode in {"predicted", "compensated"} or
+            (args.execution_mode is None and args.prerouter_enabled)) and not args.checkpoint:
+        parser.error("Predicted or compensated execution requires a trained --checkpoint")
     if args.checkpoint:
         config = experiment_config(args.config, args.checkpoint)
         if args.quantization and args.quantization != config["model"].get("quantization", "none"):
@@ -77,7 +80,7 @@ def main():
     torch.cuda.set_device(device)
     model, processor, loading = load_model(config, device)
     state = (patch(model, config.get("prefetch"), checkpoint=args.checkpoint,
-                   prerouter_enabled=args.prerouter_enabled) if args.checkpoint else None)
+                   prerouter_enabled=args.prerouter_enabled, execution_mode=args.execution_mode) if args.checkpoint else None)
     report = evaluate_base(model, processor, config["data"], args.sample_file, device, args.limit)
     report.update(sample_file=args.sample_file, data=config["data"], loading=loading)
     if state is not None:

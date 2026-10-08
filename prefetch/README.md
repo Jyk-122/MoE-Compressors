@@ -313,7 +313,7 @@ router 阶段的周期验证、独立评测和单 prompt demo 自动报告 Recal
 
 ### 用预测专家执行 MoE
 
-将以下字段合入完整 YAML 的 `prefetch` 配置，默认值为 `false`：
+执行策略可通过 `execution_mode: native | predicted | compensated` 设置，补偿配置见 [compensation/README.md](compensation/README.md)。下面的布尔开关适用于未指定 `execution_mode` 的配置，默认值为 `false`：
 
 ~~~yaml
 prefetch:
@@ -377,11 +377,11 @@ done
 
 提供 predictor checkpoint 时使用其对应的基模、量化和 attention adapter。路由替换范围为 teacher-forcing 的 response 文本输入，prompt 保持原路由。比较 `assistant_nll` 的 predicted−native 差值及 `assistant_perplexity` 的变化，并确认 `tokens/examples` 相同。这里测量固定参考答案下的 teacher-forcing 条件 NLL，LM 标签仍含结束符，不代表任务准确率；任务精度还需在相同任务集上比较生成答案。`evaluation.evaluate` 也接受开关，但报告的是路由指标。
 
-执行策略改变后，下游 hidden states 和生成轨迹也会改变。`state.router_indices`、KL 标签及 Recall 的真值仍为原 router 在**当前轨迹**上的选择，并非另外运行一次原模型得到的基线路由。报告的 `metadata.config.prerouter_enabled` 和 `metadata.execution` 标识执行策略。常规预测器训练保持开关关闭；开启训练会使用改变后的轨迹。缓存 I/O 的 trace 采集固定关闭此开关，保持原路由轨迹。
+执行策略改变后，下游 hidden states 和生成轨迹也会改变。`state.router_indices`、KL 标签及 Recall 的真值仍为原 router 在**当前轨迹**上的选择，并非另外运行一次原模型得到的基线路由。报告的 `metadata.execution` 标识实际执行策略，`metadata.config` 保存模式与补偿配置。常规预测器训练保持开关关闭；开启训练会使用改变后的轨迹。缓存 I/O 的 trace 采集固定关闭此开关，保持原路由轨迹。
 
 ### 路由指标
 
-统计单位是一个有效输入 token 在一个目标 MoE 层的调用（token-layer pair）。令原 router 在当前 hidden states 上选出的专家集合为 $R$，大小为 $K$（当前模型为 8）；prerouter 排序前 $k'$ 个专家为 $P_{k'}$。预测按 `sigmoid(logits) + 目标层 correction bias` 排序。$k'$ 控制预测候选数；实际执行策略由 `prerouter_enabled` 控制，执行数量为模型的 $K$。
+统计单位是一个有效输入 token 在一个目标 MoE 层的调用（token-layer pair）。令原 router 在当前 hidden states 上选出的专家集合为 $R$，大小为 $K$（当前模型为 8）；prerouter 排序前 $k'$ 个专家为 $P_{k'}$。预测按 `sigmoid(logits) + 目标层 correction bias` 排序。$k'$ 控制预测候选数；实际执行策略由 `execution_mode` 控制，未指定时沿用 `prerouter_enabled`；执行集合大小为模型的 $K$。
 
 - **平均命中数（mean_hits）**：$\mathbb E[|R\cap P_{k'}|]$，表示每次调用平均找到了几个真值专家。
 - **Recall@$k'$**：$\mathbb E[|R\cap P_{k'}|/K]$，分母为真值专家数。当前 $K=8$ 时，`mean_hits = 8 * recall`；分母若取 $k'$ 则是 Precision。
@@ -526,3 +526,7 @@ python -m prefetch.evaluation.cache.simulate \
 | examples/infer_prefetch_demo.py / examples/smoke_test.py | 单 prompt 演示、真实模型检查 |
 
 训练 checkpoint 保存 head 或 LoRA、运行配置、optimizer/scheduler、各 rank RNG、epoch 和下个 batch 位置。head 模块归 source block 所有，predictor.safetensors 仍采用目标 MoE 序号作为键；已有 target-keyed head checkpoint 可加载，optimizer 参数顺序保持配置中的 pair 顺序。基模权重由 model.path 或独立的 model.nf4_checkpoint 提供，请保留不可变的基模、NF4 checkpoint 与 adapter 版本。当前支持 n_group=1、常规 attention；换模型结构前检查层映射和执行语义。
+
+## 专家补偿
+
+支持 native、predicted、compensated 三种专家执行模式。OWA、ExFold 的实现、独立校准入口及配置示例见 [compensation/README.md](compensation/README.md)。

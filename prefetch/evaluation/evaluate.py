@@ -83,14 +83,16 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--prerouter-enabled", action=argparse.BooleanOptionalAction, default=None,
                         help="Execute predicted experts with native weights; default follows config/checkpoint")
+    parser.add_argument("--execution-mode", choices=["native", "predicted", "compensated"],
+                        help="Expert execution policy; overrides the legacy prerouter switch")
     args = parser.parse_args()
     configure_logging()
     config = experiment_config(args.config, args.checkpoint)
     device = setup(config.get("seed", 42))
     model, processor, _ = load_model(config, device)
     state = patch(model, config.get("prefetch"), checkpoint=args.checkpoint,
-                  prerouter_enabled=args.prerouter_enabled)
-    logger.info("prerouter_enabled=%s", state.config.prerouter_enabled)
+                  prerouter_enabled=args.prerouter_enabled, execution_mode=args.execution_mode)
+    logger.info("execution_mode=%s", state.config.execution)
     if args.mode == "teacher_forcing":
         task = TrainingTask(model, state, "router", config["model"].get("router_forward_kwargs"))
         evaluate_task(task, processor, config, device, args.output, "final")

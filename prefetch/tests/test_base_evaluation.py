@@ -79,7 +79,7 @@ def test_routing_nll_cli_preserves_adapter(tmp_path, monkeypatch, enabled):
         assert config["lora"] == {"enabled": True, "checkpoint": "adapter"}
         return None, None, {}
     monkeypatch.setattr(evaluation, "load_model", load)
-    def install(model, config, checkpoint, prerouter_enabled):
+    def install(model, config, checkpoint, prerouter_enabled, execution_mode):
         assert checkpoint == "predictor" and prerouter_enabled is enabled
         return SimpleNamespace(config=PrefetchConfig(prerouter_enabled=enabled))
     monkeypatch.setattr(evaluation, "patch", install)

@@ -1,6 +1,7 @@
 """Install Prerouter modules, forward patches, and generation request lifecycle."""
 from __future__ import annotations
 
+from dataclasses import asdict
 from functools import wraps
 from inspect import signature
 from types import MethodType
@@ -59,18 +60,28 @@ def moe_forward(self, hidden_states):
             produce_prediction(self, hidden_states)
 
     topk_indices, topk_weights = original_route
-    if state.active and state.config.prerouter_enabled and index in state.predictions:
+    execution = state.config.execution
+    if (state.active and index in state.predictions and
+            (execution != "native" or state.route_observer is not None)):
         prediction = state.predictions[index]
         if state.phase == "decode":
-            topk_indices, topk_weights = select_experts(self, router_logits, original_route, prediction)
-        elif state.phase == "teacher_forcing":
+            rows = torch.arange(router_logits.shape[0], device=router_logits.device)
+        else:
             # Prompt rows keep native routing; response rows emulate decode execution.
             mask = state.valid_mask & state.router_mask[0, state.target_start:].bool()
             rows = mask.nonzero().flatten() + state.target_start
-            route = select_experts(self, router_logits[rows],
-                                   (topk_indices[rows], topk_weights[rows]), prediction[mask])
+            prediction = prediction[mask]
+        native = topk_indices[rows], topk_weights[rows]
+        predicted = select_experts(self, router_logits[rows], native, prediction)
+        if state.route_observer is not None:
+            state.route_observer(index, self, hidden_states.reshape(-1, hidden_states.shape[-1])[rows],
+                                 native, predicted)
+        if execution != "native":
+            indices, weights = predicted
+            if execution == "compensated":
+                weights = state.compensators[index](*native, indices, weights)
             topk_indices, topk_weights = topk_indices.clone(), topk_weights.clone()
-            topk_indices[rows], topk_weights[rows] = route
+            topk_indices[rows], topk_weights[rows] = indices, weights
     output = self.experts(hidden_states.view(-1, hidden_states.shape[-1]),
                           topk_indices, topk_weights).view_as(hidden_states)
     return output + self.shared_experts(hidden_states)
@@ -84,19 +95,30 @@ def patch_moe_block(block, index, state):
     block.forward = MethodType(moe_forward, block)
 
 
-def patch(model, config=None, checkpoint=None, *, prerouter_enabled=None):
+def patch(model, config=None, checkpoint=None, *, prerouter_enabled=None,
+          execution_mode=None, compensation=None):
     """Return the global state; losses and metrics are computed by callers."""
     if hasattr(model, "prerouter_state"):
         raise ValueError("Model already has a prerouter patch")
     # Execution policy can be changed while checkpoint architecture stays fixed.
-    if prerouter_enabled is None and config is not None:
-        prerouter_enabled = (config.get("prerouter_enabled") if isinstance(config, dict)
-                             else config.prerouter_enabled)
+    requested = config if isinstance(config, dict) else asdict(config) if config is not None else {}
+    # An explicit legacy CLI switch also overrides a saved execution_mode.
+    if execution_mode is None and prerouter_enabled is None:
+        execution_mode = requested.get("execution_mode")
+    if prerouter_enabled is None:
+        prerouter_enabled = requested.get("prerouter_enabled")
+    if compensation is None:
+        compensation = requested.get("compensation")
     metadata = read_metadata(checkpoint) if checkpoint else None
     config = metadata["config"] if metadata else config
     config = PrefetchConfig(**config) if isinstance(config, dict) else config or PrefetchConfig()
     if prerouter_enabled is not None:
         config.prerouter_enabled = prerouter_enabled
+        config.execution_mode = None
+    if execution_mode is not None:
+        config.execution_mode = execution_mode
+    if compensation is not None:
+        config.compensation = compensation
     state = PrerouterState(find_moe_blocks(model), config)
     if any(block.n_group != 1 for _, block in state.blocks):
         raise ValueError("Prerouter ranking requires n_group=1")
@@ -115,6 +137,9 @@ def patch(model, config=None, checkpoint=None, *, prerouter_enabled=None):
         state.prerouters[source] = head
     if checkpoint:
         load_predictor(state, checkpoint, metadata)
+    if config.execution == "compensated":
+        from prefetch.compensation.artifacts import build_compensators
+        state.compensators = build_compensators(state)
     for index, (_, block) in enumerate(state.blocks):
         patch_moe_block(block, index, state)
 

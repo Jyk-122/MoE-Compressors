@@ -66,8 +66,8 @@ class RoutingMetrics:
     def report(self, distributed=False):
         metadata = dict(config=asdict(self.config), layers=self.layers,
                         teacher="native_router_on_current_hidden_states",
-                        execution=("prerouter_indices_native_weights" if self.config.prerouter_enabled
-                                   else "native_router"),
+                        execution={"native": "native_router", "predicted": "prerouter_indices_native_weights",
+                                   "compensated": "prerouter_indices_compensated_weights"}[self.config.execution],
                         execution_scope="decode_and_teacher_forced_response",
                         metric_scope=dict(teacher_forcing="response_text_inputs", decode="all_forwarded_inputs"),
                         producer_timing=("decode_start_after_token_embedding" if self.config.mode == "previous_top"

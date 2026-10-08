@@ -47,6 +47,10 @@ def main():
         torch.testing.assert_close(original, patched, rtol=0, atol=0)
         logger.info("Native logits preserved; output shape=%s", tuple(patched.shape))
         state.config.prerouter_enabled = config["prefetch"].get("prerouter_enabled", False)
+        state.config.execution_mode = config["prefetch"].get("execution_mode")
+        if state.config.execution == "compensated":
+            from prefetch.compensation.artifacts import build_compensators
+            state.compensators = build_compensators(state)
         del original, patched
     elif config["training"].get("gradient_checkpointing", True):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})

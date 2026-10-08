@@ -34,6 +34,8 @@ def main():
     parser.add_argument("--trace-limit", type=int, default=8)
     parser.add_argument("--trace-k", type=int, default=16)
     parser.add_argument("--output", default="prefetch/outputs/demo/metrics.json")
+    parser.add_argument("--execution-mode", choices=["native", "predicted", "compensated"],
+                        help="Expert execution policy; overrides the legacy prerouter switch")
     args = parser.parse_args()
     configure_logging()
     config = experiment_config(args.config, args.checkpoint)
@@ -42,8 +44,8 @@ def main():
     torch.cuda.set_device(device)
     model, processor, _ = load_model(config, device)
     state = patch(model, config["prefetch"], checkpoint=args.checkpoint,
-                  prerouter_enabled=args.prerouter_enabled)
-    logger.info("prerouter_enabled=%s", state.config.prerouter_enabled)
+                  prerouter_enabled=args.prerouter_enabled, execution_mode=args.execution_mode)
+    logger.info("execution_mode=%s", state.config.execution)
     state.config.trace_limit = args.trace_limit
     paths = [args.image] if args.image else []
     messages = multimodal_messages([dict(role="user", content=args.prompt)], paths)

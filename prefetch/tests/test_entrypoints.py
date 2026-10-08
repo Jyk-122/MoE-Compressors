@@ -9,6 +9,8 @@ import pytest
     "prefetch.datasets.prepare",
     "prefetch.backbone.export_nf4",
     "prefetch.training.train",
+    "prefetch.compensation.owa.calibrate",
+    "prefetch.compensation.exfold.calibrate",
     "prefetch.evaluation.evaluate",
     "prefetch.evaluation.evaluate_base",
     "prefetch.evaluation.plot",

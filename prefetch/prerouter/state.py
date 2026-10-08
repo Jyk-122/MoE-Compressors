@@ -13,6 +13,8 @@ class PrerouterState:
         self.target_of = dict(self.pairs)
         self.targets = {target for _, target in self.pairs}
         self.prerouters = {}  # source MoE -> nn.Module (registered on that MoE)
+        self.compensators = {}  # target MoE -> weight adjustment module
+        self.route_observer = None  # Optional calibration callback; survives request reset.
         self.layers = [dict(source_moe=source, target_moe=target,
                             source_name=blocks[source][0], target_name=blocks[target][0],
                             experts=blocks[target][1].gate.weight.shape[0],
@@ -55,7 +57,7 @@ class PrerouterState:
         if self.phase == "teacher_forcing":
             for token_id in self.config.excluded_token_ids:
                 self.valid_mask &= input_ids[0, self.target_start:] != token_id
-            if self.config.prerouter_enabled and self.router_mask is None:
+            if (self.config.execution != "native" or self.route_observer is not None) and self.router_mask is None:
                 raise ValueError("Teacher-forcing expert substitution requires state.reset(router_mask=response_mask)")
 
         self.predictions = {}
