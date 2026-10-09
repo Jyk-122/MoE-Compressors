@@ -11,6 +11,7 @@ compensation/
 ├── __init__.py
 ├── artifacts.py          # 校准结果读写、构建补偿模块
 ├── calibration.py        # 共用数据循环、专家输出采集
+├── cli.py                # 推理与评测共用的命令行参数
 ├── owa/
 │   ├── __init__.py
 │   ├── compensate.py     # OWA 权重补偿
@@ -24,7 +25,22 @@ compensation/
 
 ## 配置与调用
 
-在原运行 YAML 的 `prefetch` 下添加：
+命令行可直接指定补偿方法和校准文件，三个入口 `infer_prefetch_demo`、`evaluation.evaluate`、`evaluation.evaluate_base` 使用相同参数。例如：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m prefetch.examples.infer_prefetch_demo \
+  --checkpoint prefetch/outputs/previous_token_20260925_133256/checkpoint-10000 \
+  --prompt '请描述一下这张图。' --image prefetch/datasets/demo.jpg \
+  --output prefetch/outputs/demo/metrics.json \
+  --execution-mode compensated \
+  --method exfold --path prefetch/outputs/exfold.safetensors
+```
+
+OWA 可以用 `--method owa --alpha1 1.0 --alpha2 0.9` 直接指定参数，也可以用 `--method owa --path prefetch/outputs/owa.safetensors` 加载校准结果；`--hit-min` 和 `--hit-max` 控制触发区间。
+
+命令行显式指定的字段覆盖运行配置，运行配置未提供补偿设置时使用 checkpoint 中的设置。同一方法保留其他已配置字段；切换方法时，以新方法的命令行参数构建补偿设置。`--execution-mode compensated` 控制是否启用补偿。
+
+也可以在原运行 YAML 的 `prefetch` 下配置：
 
 ```yaml
 execution_mode: compensated  # native / predicted / compensated

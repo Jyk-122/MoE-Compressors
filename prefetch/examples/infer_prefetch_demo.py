@@ -14,6 +14,7 @@ from prefetch.evaluation.evaluate import experiment_config
 from prefetch.backbone.loading import load_model
 from prefetch.evaluation.metrics import save_report
 from prefetch.prerouter.patch import patch
+from prefetch.compensation.cli import add_compensation_arguments, compensation_from_args
 from prefetch.evaluation.plot import plot_report
 from prefetch.evaluation.routing import RoutingMetrics, capture_generation
 from prefetch.utils.logging import configure_logging
@@ -36,15 +37,18 @@ def main():
     parser.add_argument("--output", default="prefetch/outputs/demo/metrics.json")
     parser.add_argument("--execution-mode", choices=["native", "predicted", "compensated"],
                         help="Expert execution policy; overrides the legacy prerouter switch")
+    add_compensation_arguments(parser)
     args = parser.parse_args()
     configure_logging()
     config = experiment_config(args.config, args.checkpoint)
+    compensation = compensation_from_args(args, config.get("prefetch"), args.checkpoint)
     torch.manual_seed(config.get("seed", 42))
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     model, processor, _ = load_model(config, device)
     state = patch(model, config["prefetch"], checkpoint=args.checkpoint,
-                  prerouter_enabled=args.prerouter_enabled, execution_mode=args.execution_mode)
+                  prerouter_enabled=args.prerouter_enabled, execution_mode=args.execution_mode,
+                  compensation=compensation)
     logger.info("execution_mode=%s", state.config.execution)
     state.config.trace_limit = args.trace_limit
     paths = [args.image] if args.image else []

@@ -529,4 +529,4 @@ python -m prefetch.evaluation.cache.simulate \
 
 ## 专家补偿
 
-支持 native、predicted、compensated 三种专家执行模式。OWA、ExFold 的实现、独立校准入口及配置示例见 [compensation/README.md](compensation/README.md)。
+支持 native、predicted、compensated 三种专家执行模式。推理与评测可直接传入 `--execution-mode compensated --method exfold --path outputs/exfold.safetensors`；OWA 可传入 `--method owa --alpha1 1.0 --alpha2 0.9`。实现、独立校准入口及完整示例见 [compensation/README.md](compensation/README.md)。

@@ -13,6 +13,7 @@ from prefetch.datasets.dataset import load_records, multimodal_messages, open_im
 from prefetch.backbone.loading import load_model
 from prefetch.evaluation.metrics import save_report
 from prefetch.prerouter.patch import patch
+from prefetch.compensation.cli import add_compensation_arguments, compensation_from_args
 from prefetch.evaluation.plot import plot_report
 from prefetch.evaluation.routing import RoutingMetrics, capture_generation
 from prefetch.training.runtime import evaluate_task, rank, read_config, setup, world_size
@@ -85,13 +86,16 @@ def main():
                         help="Execute predicted experts with native weights; default follows config/checkpoint")
     parser.add_argument("--execution-mode", choices=["native", "predicted", "compensated"],
                         help="Expert execution policy; overrides the legacy prerouter switch")
+    add_compensation_arguments(parser)
     args = parser.parse_args()
     configure_logging()
     config = experiment_config(args.config, args.checkpoint)
+    compensation = compensation_from_args(args, config.get("prefetch"), args.checkpoint)
     device = setup(config.get("seed", 42))
     model, processor, _ = load_model(config, device)
     state = patch(model, config.get("prefetch"), checkpoint=args.checkpoint,
-                  prerouter_enabled=args.prerouter_enabled, execution_mode=args.execution_mode)
+                  prerouter_enabled=args.prerouter_enabled, execution_mode=args.execution_mode,
+                  compensation=compensation)
     logger.info("execution_mode=%s", state.config.execution)
     if args.mode == "teacher_forcing":
         task = TrainingTask(model, state, "router", config["model"].get("router_forward_kwargs"))
