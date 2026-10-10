@@ -41,13 +41,12 @@ def main():
         kwargs = config["model"].get("router_forward_kwargs", {})
         with torch.no_grad():
             original = model(**inputs, use_cache=False, **kwargs).logits.detach()
-        state = patch(model, config["prefetch"], prerouter_enabled=False)
+        state = patch(model, config["prefetch"], execution_mode="native")
         with torch.no_grad():
             patched = model(**inputs, use_cache=False, **kwargs).logits.detach()
         torch.testing.assert_close(original, patched, rtol=0, atol=0)
         logger.info("Native logits preserved; output shape=%s", tuple(patched.shape))
-        state.config.prerouter_enabled = config["prefetch"].get("prerouter_enabled", False)
-        state.config.execution_mode = config["prefetch"].get("execution_mode")
+        state.config.execution_mode = config["prefetch"].get("execution_mode", "native")
         if state.config.execution == "compensated":
             from prefetch.compensation.artifacts import build_compensators
             state.compensators = build_compensators(state)

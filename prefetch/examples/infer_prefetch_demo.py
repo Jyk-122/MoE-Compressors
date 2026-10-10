@@ -27,8 +27,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", help="YAML config; can be inferred from a trained checkpoint")
     parser.add_argument("--checkpoint", help="Omit for an initialized-head wiring smoke test")
-    parser.add_argument("--prerouter-enabled", action=argparse.BooleanOptionalAction, default=None,
-                        help="Execute predicted experts with native weights; default follows config/checkpoint")
     parser.add_argument("--prompt", default="请描述一下这张图。")
     parser.add_argument("--image")
     parser.add_argument("--max-new-tokens", type=int, default=128)
@@ -36,7 +34,7 @@ def main():
     parser.add_argument("--trace-k", type=int, default=16)
     parser.add_argument("--output", default="prefetch/outputs/demo/metrics.json")
     parser.add_argument("--execution-mode", choices=["native", "predicted", "compensated"],
-                        help="Expert execution policy; overrides the legacy prerouter switch")
+                        help="Expert execution policy; follows config/checkpoint, otherwise native")
     add_compensation_arguments(parser)
     args = parser.parse_args()
     configure_logging()
@@ -47,7 +45,7 @@ def main():
     torch.cuda.set_device(device)
     model, processor, _ = load_model(config, device)
     state = patch(model, config["prefetch"], checkpoint=args.checkpoint,
-                  prerouter_enabled=args.prerouter_enabled, execution_mode=args.execution_mode,
+                  execution_mode=args.execution_mode,
                   compensation=compensation)
     logger.info("execution_mode=%s", state.config.execution)
     state.config.trace_limit = args.trace_limit

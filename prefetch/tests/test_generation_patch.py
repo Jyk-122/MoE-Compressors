@@ -44,12 +44,12 @@ def assert_idle(state):
 
 
 @pytest.mark.parametrize("mode,distance", ROUTING_CASES)
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("execution_mode", ["native", "predicted"])
 @pytest.mark.parametrize("prompt", [(1,), (1, 3, 5)])
-def test_direct_generate_isolates_requests(model, mode, distance, enabled, prompt):
+def test_direct_generate_isolates_requests(model, mode, distance, execution_mode, prompt):
     ids = torch.tensor([prompt])
     expected = model.generate(ids)
-    state = patch(model, config(mode=mode, distance=distance, prerouter_enabled=enabled))
+    state = patch(model, config(mode=mode, distance=distance, execution_mode=execution_mode))
     phases = []
 
     def observe(module, args, output):
@@ -69,12 +69,12 @@ def test_direct_generate_isolates_requests(model, mode, distance, enabled, promp
         assert phases == [("prefill", 0, 0), ("decode", 1, len(prompt)),
                           ("decode", 2, len(prompt) + 1)]
         torch.testing.assert_close(actual.logits[0], expected.logits[0], rtol=0, atol=0)
-        if not enabled:
+        if execution_mode == "native":
             torch.testing.assert_close(actual.sequences, expected.sequences, rtol=0, atol=0)
             for result, reference in zip(actual.logits, expected.logits):
                 torch.testing.assert_close(result, reference, rtol=0, atol=0)
         assert_idle(state)
-        assert state.config.prerouter_enabled is enabled
+        assert state.config.execution_mode == execution_mode
     handle.remove()
 
 
@@ -119,7 +119,7 @@ def test_generate_exception_cleans_state_and_allows_next_request(model, after_fo
         return output if after_forward else original(input_ids)
 
     model.generate = MethodType(generate, model)
-    state = patch(model, config(mode="previous_token", distance=0, prerouter_enabled=True))
+    state = patch(model, config(mode="previous_token", distance=0, execution_mode="predicted"))
     with pytest.raises(RuntimeError, match="generation failed") as caught:
         model.generate(torch.tensor([[1, 3]]), fail=True)
     assert caught.value is failure
@@ -157,7 +157,7 @@ def test_generation_cache_trace_survives_cleanup(model):
 
 @pytest.mark.parametrize("mode,distance", ROUTING_CASES)
 def test_training_after_generate(model, mode, distance):
-    state = patch(model, config(mode=mode, distance=distance, prerouter_enabled=True))
+    state = patch(model, config(mode=mode, distance=distance, execution_mode="predicted"))
     model.generate(torch.tensor([[1, 3]]))
     task = TrainingTask(model, state, "router")
     task(batch(), record_metrics=True).backward()

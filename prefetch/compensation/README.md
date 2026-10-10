@@ -58,7 +58,7 @@ compensation:
 | predicted | prerouter top-k | 当前真实 gate 在预测 ID 上的分数，按 block 配置归一化和缩放 |
 | compensated | prerouter top-k | OWA 或 ExFold 的补偿权重 |
 
-推理和评测入口的 `--execution-mode` 覆盖配置。未指定新字段时，`prerouter_enabled` 继续控制 native/predicted。显式新模式参数优先于旧开关。
+推理和评测统一通过 `--execution-mode native|predicted|compensated` 选择执行模式。优先级为命令行/Python 显式参数 > 传入配置 > checkpoint 保存值，默认使用 `native`。
 
 支持 `same_token`、`previous_token`、`previous_top`。生成 prefill 使用原生路由，decode 使用所选模式；teacher forcing 仅修改有效 response 输入行，沿用 attention mask、excluded token 和前一 token 对齐规则。路由指标的标签来自当前隐藏状态上的真实 router。
 

@@ -82,10 +82,8 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--mode", choices=["teacher_forcing", "generation"], default="teacher_forcing")
     parser.add_argument("--max-new-tokens", type=int, default=128)
-    parser.add_argument("--prerouter-enabled", action=argparse.BooleanOptionalAction, default=None,
-                        help="Execute predicted experts with native weights; default follows config/checkpoint")
     parser.add_argument("--execution-mode", choices=["native", "predicted", "compensated"],
-                        help="Expert execution policy; overrides the legacy prerouter switch")
+                        help="Expert execution policy; follows config/checkpoint, otherwise native")
     add_compensation_arguments(parser)
     args = parser.parse_args()
     configure_logging()
@@ -94,7 +92,7 @@ def main():
     device = setup(config.get("seed", 42))
     model, processor, _ = load_model(config, device)
     state = patch(model, config.get("prefetch"), checkpoint=args.checkpoint,
-                  prerouter_enabled=args.prerouter_enabled, execution_mode=args.execution_mode,
+                  execution_mode=args.execution_mode,
                   compensation=compensation)
     logger.info("execution_mode=%s", state.config.execution)
     if args.mode == "teacher_forcing":

@@ -191,13 +191,13 @@ def test_owa_artifact_and_checkpoint_execution_overrides(tmp_path):
     assert all(m.alpha1 == 2 for m in state.compensators.values())
     save_predictor(state, tmp_path / "predictor")
     unpatch(model)
-    state = patch(model, checkpoint=tmp_path / "predictor", prerouter_enabled=False)
+    state = patch(model, checkpoint=tmp_path / "predictor", execution_mode="native")
     assert state.config.execution == "native"
     unpatch(model)
     state = patch(model, {"execution_mode": "predicted"}, checkpoint=tmp_path / "predictor")
     assert state.config.execution == "predicted"
     unpatch(model)
-    state = patch(model, checkpoint=tmp_path / "predictor", prerouter_enabled=False,
+    state = patch(model, {"execution_mode": "native"}, checkpoint=tmp_path / "predictor",
                   execution_mode="compensated")
     assert state.config.execution == "compensated"
 

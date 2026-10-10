@@ -51,12 +51,12 @@ def test_conditioned_head_matches_formula(kind):
 
 @pytest.mark.parametrize("distance", [0, 1, 2])
 @pytest.mark.parametrize("kind", ["linear", "mlp"])
-@pytest.mark.parametrize("enabled", [False, True])
-def test_all_predictions_ready_before_decode_layers(model, distance, kind, enabled):
+@pytest.mark.parametrize("execution_mode", ["native", "predicted"])
+def test_all_predictions_ready_before_decode_layers(model, distance, kind, execution_mode):
     ids = torch.tensor([[1, 3, 5]])
     native = model(ids).logits
     state = patch(model, PrefetchConfig(mode="previous_top", distance=distance, head=kind,
-                                        hidden_dim=5, prerouter_enabled=enabled, ks=[2, 8]))
+                                        hidden_dim=5, execution_mode=execution_mode, ks=[2, 8]))
     condition_heads(state)
     state.reset(generation=True)
     calls, handles = [], []
@@ -95,11 +95,11 @@ def test_all_predictions_ready_before_decode_layers(model, distance, kind, enabl
 
 @pytest.mark.parametrize("distance", [0, 1, 2])
 @pytest.mark.parametrize("kind", ["linear", "mlp"])
-@pytest.mark.parametrize("enabled", [False, True])
-def test_conditioned_teacher_forcing_matches_decode(model, distance, kind, enabled):
+@pytest.mark.parametrize("execution_mode", ["native", "predicted"])
+def test_conditioned_teacher_forcing_matches_decode(model, distance, kind, execution_mode):
     ids = torch.tensor([[1, 3, 5, 7, 9]])
     state = patch(model, PrefetchConfig(mode="previous_top", distance=distance, head=kind, hidden_dim=5,
-                                        prerouter_enabled=enabled, trace_limit=50, ks=[2, 8]))
+                                        execution_mode=execution_mode, trace_limit=50, ks=[2, 8]))
     condition_heads(state)
     meter = RoutingMetrics(state)
     state.reset(router_mask=torch.tensor([[False, False, True, True, True]]))

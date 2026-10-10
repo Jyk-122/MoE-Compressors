@@ -66,8 +66,8 @@ def test_predictor_evaluation_checks_nf4_blocksize(tmp_path, monkeypatch):
         evaluation.experiment_config("config.yaml", tmp_path)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_routing_nll_cli_preserves_adapter(tmp_path, monkeypatch, enabled):
+@pytest.mark.parametrize("execution_mode", ["native", "predicted", "compensated"])
+def test_routing_nll_cli_preserves_adapter(tmp_path, monkeypatch, execution_mode):
     import sys
     import prefetch.evaluation.evaluate_base as evaluation
     config = dict(stage="router", model={"quantization": "none"}, data={},
@@ -79,25 +79,27 @@ def test_routing_nll_cli_preserves_adapter(tmp_path, monkeypatch, enabled):
         assert config["lora"] == {"enabled": True, "checkpoint": "adapter"}
         return None, None, {}
     monkeypatch.setattr(evaluation, "load_model", load)
-    def install(model, config, checkpoint, prerouter_enabled, execution_mode, compensation):
-        assert checkpoint == "predictor" and prerouter_enabled is enabled
+    expected_mode = execution_mode
+    def install(model, config, checkpoint, execution_mode, compensation):
+        assert checkpoint == "predictor" and execution_mode == expected_mode
         assert compensation is None
-        return SimpleNamespace(config=PrefetchConfig(prerouter_enabled=enabled))
+        return SimpleNamespace(config=PrefetchConfig(execution_mode=execution_mode))
     monkeypatch.setattr(evaluation, "patch", install)
     monkeypatch.setattr(evaluation, "evaluate_base", lambda *args: {"assistant_nll": 1.0})
     output = tmp_path / "nll.json"
     monkeypatch.setattr(sys, "argv", ["evaluate_base", "--checkpoint", "predictor",
                                      "--sample-file", "samples", "--output", str(output),
-                                     "--prerouter-enabled" if enabled else "--no-prerouter-enabled"])
+                                     "--execution-mode", execution_mode])
     evaluation.main()
     report = json.loads(output.read_text(encoding="utf-8"))
-    assert report["prefetch"]["prerouter_enabled"] is enabled
+    assert report["prefetch"]["execution_mode"] == execution_mode
 
 
-def test_routing_nll_requires_trained_checkpoint(monkeypatch):
+@pytest.mark.parametrize("execution_mode", ["predicted", "compensated"])
+def test_routing_nll_requires_trained_checkpoint(monkeypatch, execution_mode):
     import sys
     import prefetch.evaluation.evaluate_base as evaluation
-    monkeypatch.setattr(sys, "argv", ["evaluate_base", "--config", "unused", "--prerouter-enabled",
+    monkeypatch.setattr(sys, "argv", ["evaluate_base", "--config", "unused", "--execution-mode", execution_mode,
                                      "--sample-file", "unused", "--output", "unused"])
     with pytest.raises(SystemExit) as result:
         evaluation.main()

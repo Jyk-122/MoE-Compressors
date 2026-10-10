@@ -1,6 +1,6 @@
 # MoE Prefetch Router 训练工程
 
-在较早的 MoE 输入处预测目标层路由，训练一次即可评估多个候选数 k′。训练与 teacher-forcing 验证使用 response 文本输入位置；生成评测使用真实 decode 调用。prefill 始终由原 router 执行；开启 `prefetch.prerouter_enabled` 可在 decode 和 teacher-forcing 的 response 位置使用预测专家，混合权重仍来自原 router。真值始终来自原 router 在当前 hidden states 上的选择（包含所选量化和 attention LoRA）。
+在较早的 MoE 输入处预测目标层路由，训练一次即可评估多个候选数 k′。训练与 teacher-forcing 验证使用 response 文本输入位置；生成评测使用真实 decode 调用。prefill 始终由原 router 执行；`prefetch.execution_mode` 默认为 `native`；`predicted` 在 decode 和 teacher-forcing 的 response 位置执行预测专家，`compensated` 在预测集合上进一步补偿权重。真值始终来自原 router 在当前 hidden states 上的选择（包含所选量化和 attention LoRA）。
 
 支持同 token 提前 M≥1 个 MoE、上一 token 同层或提前 M≥1 个 MoE，以及结合当前已采样 token embedding 的 `previous_top` 模式。支持可选 attention LoRA SFT、routed-expert NF4、多卡训练、恢复、覆盖率曲线和单 prompt 推理。语义见 [DESIGN.md](DESIGN.md)。本阶段测量预测能力；Flash→DRAM 调度和端侧时延模拟可在后续实验中接入。
 
@@ -71,7 +71,7 @@ prediction = W2 · GELU(Wh · previous_hidden + We · current_embedding + b1) + 
 CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 bash prefetch/scripts/train_ddp.sh prefetch/configs/previous_top.yaml --limit 32
 ~~~
 
-配置默认 `distance: 0`、`prerouter_enabled: false`。后续使用该次运行的 checkpoint，按本文的评测、demo 和 `model.generate()` 接口调用即可；开启 `prerouter_enabled` 时仅替换 decode / teacher-forced response 的专家选择。checkpoint 同时保存 hidden 分支和 `token_proj` 权重；原有模式的 checkpoint 继续按原模式恢复，previous_top 使用独立训练的 checkpoint。
+配置默认 `distance: 0`、`execution_mode: native`。后续使用该次运行的 checkpoint，按本文的评测、demo 和 `model.generate()` 接口调用即可；`predicted` 和 `compensated` 作用于 decode / teacher-forced response 的专家执行。checkpoint 同时保存 hidden 分支和 `token_proj` 权重；原有模式的 checkpoint 继续按原模式恢复，previous_top 使用独立训练的 checkpoint。
 
 该模式提供预测与覆盖率评测，实际 Flash I/O 仍需另行接入；现有离线缓存 I/O 模拟入口仍限定 same_token 模式。
 
@@ -311,39 +311,47 @@ done
 
 router 阶段的周期验证、独立评测和单 prompt demo 自动报告 Recall、平均命中数和 RequiredK 分布，包含 global/per-layer 统计。训练验证日志也打印 RequiredK 摘要。LoRA 阶段报告 SFT 验证损失。
 
-### 用预测专家执行 MoE
+### MoE 执行模式
 
-执行策略可通过 `execution_mode: native | predicted | compensated` 设置，补偿配置见 [compensation/README.md](compensation/README.md)。下面的布尔开关适用于未指定 `execution_mode` 的配置，默认值为 `false`：
+`prefetch.mode` 控制预测的层/token 时序，`prefetch.execution_mode` 控制实际专家执行。后者取值如下，默认是 `native`：
+
+| execution_mode | 执行专家 | 混合权重 |
+| --- | --- | --- |
+| native | 原 router 选择的专家 | 原生路由权重 |
+| predicted | prerouter 预测的专家 | 原 gate 在预测 ID 上的分数，按原规则归一化、缩放 |
+| compensated | prerouter 预测的专家 | 根据原生路由，经 OWA 或 ExFold 补偿后的权重 |
+
+在完整 YAML 的 `prefetch` 下设置：
 
 ~~~yaml
 prefetch:
-  prerouter_enabled: true
+  execution_mode: predicted
 ~~~
 
-- `false`：原 router 决定专家和权重；prerouter 继续产生预测，供训练与覆盖率评测。
-- `true`：按 `sigmoid(prerouter_logits) + 目标层 correction bias` 的稳定降序选择 `block.top_k` 个专家，再从 `sigmoid(router_logits)` 中 gather 这些专家的分数，按 `norm_topk_prob` 归一化并乘 `routed_scaling_factor`。correction bias 只参与选专家，权重始终来自原 router，shared experts 照常执行。
+`predicted` 按 `sigmoid(prerouter_logits) + 目标层 correction bias` 的稳定降序选择 `block.top_k` 个专家，再从 `sigmoid(router_logits)` 中 gather 分数，按 `norm_topk_prob` 归一化并乘 `routed_scaling_factor`。correction bias 只参与选专家。三种模式均照常执行 shared experts，实际执行集合大小由模型的 `top_k` 决定；`prefetch.ks` 只控制覆盖率曲线。
 
-推理 prefill 始终执行原 router，路由指标只统计 decode。same-token 在 prefill 不调用 head；previous-token 只对各 source 层的最后一个输入位置调用 head，将 `[1,E]` 预测保存到 `next_predictions`，供首个 decode 使用。previous_top 则保存尾部 `[1,H]` 的 `source_hidden`，在首个 decode 入口结合当前 token embedding 预测。decode 的实际输入位置均可使用预测专家，包括已实际送入模型的特殊 token；无预测器的层使用原路由。
+推理 prefill 始终执行原 router，路由指标只统计 decode。same-token 在 prefill 不调用 head；previous-token 只对各 source 层最后一个输入位置调用 head，将 `[1,E]` 预测保存到 `next_predictions`，供首个 decode 使用。previous_top 保存尾部 `[1,H]` 的 `source_hidden`，在首个 decode 入口结合当前 token embedding 预测。decode 的实际输入位置均按执行模式路由，包括已送入模型的特殊 token；无预测器的层使用原路由。
 
-teacher forcing 中，开关只作用于 `router_mask` 指定的 response 文本输入位置，prompt 保持原路由。通过 `state.reset(router_mask=router_mask)` 传入范围；训练、验证及 NLL 入口已自动传入。previous-token 保存 source 的 `logits[:-1]`，previous_top 直接计算已对齐的 `head(hidden[:-1], embeddings[1:])`；两者均与 target 的 `router_logits[1:]`、`router_indices[1:]` 配对。`target_start=1` 用于切片监督范围及还原 trace 中的位置，same-token 则为 0。首个 response 的预测可以来自 prompt 尾部，筛选依据是目标 token 所属的 response 范围。
+teacher forcing 中，预测和补偿仅作用于 `router_mask` 指定的有效 response 文本输入位置，prompt 保持原路由。通过 `state.reset(router_mask=router_mask)` 传入范围；训练、验证及 NLL 入口已自动传入。previous-token 保存 source 的 `logits[:-1]`，previous_top 计算 `head(hidden[:-1], embeddings[1:])`；两者均与 target 的 `router_logits[1:]`、`router_indices[1:]` 配对。`target_start=1` 用于切片监督范围及还原 trace 位置，same-token 为 0。首个 response 的预测可以来自 prompt 尾部。
 
-`state.valid_mask` 保留监督位置的有效性和配置的 token 排除规则，teacher-forcing loss/指标再与 `router_mask[0, target_start:]` 取交集。真实 decode 统计实际调用，不使用这些文本排除规则。`prefetch.ks` 仅控制覆盖率曲线，实际执行数量由模型的 `top_k` 决定。
+`state.valid_mask` 保留监督位置的有效性和 token 排除规则，teacher-forcing 路由、loss 和指标再与 `router_mask[0, target_start:]` 取交集。真实 decode 统计实际调用，不使用这些文本排除规则。
 
-运行时也可以设置：
+Python 接口：
 
 ~~~python
-state = patch(model, checkpoint=checkpoint, prerouter_enabled=True)
+state = patch(model, checkpoint=checkpoint, execution_mode="predicted")
 outputs = model.generate(**inputs, max_new_tokens=128, use_cache=True, num_beams=1)
-# 可在独立请求之间切换；每次重新 prefill，建立与执行策略匹配的 KV cache。
-state.config.prerouter_enabled = False
+
+# 在独立请求之间切换模式；重新 prefill，建立与执行策略匹配的 KV cache。
+state.config.execution_mode = "native"
 outputs = model.generate(**inputs, max_new_tokens=128, use_cache=True, num_beams=1)
 ~~~
 
-`patch()` 自动包装模型的 `generate()`：每次调用前初始化生成状态，首次 forward 为 prefill，后续为 decode；正常返回或发生异常时清理请求张量。调用参数、返回值和异常由原 `generate()` 处理，连续请求各自独立。适用于通过该模型 `generate()` 调用的评测框架，要求 batch=1、num_beams=1、use_cache=true 的普通生成。`unpatch(model)` 恢复原 `forward()` 和 `generate()`。
+`patch()` 自动包装 `model.generate()`：每次调用前初始化状态，首次 forward 为 prefill，后续为 decode；正常返回或异常时清理请求张量。适用于 batch=1、num_beams=1、use_cache=true 的普通生成。`unpatch(model)` 恢复原 `forward()` 和 `generate()`。
 
-`patch()` 的显式参数优先于传入配置中的开关，配置优先于 checkpoint 保存值；旧 checkpoint 未保存该字段时默认为关闭。网络结构、层映射和 head 权重仍从 checkpoint 恢复。`state.reset()` 清理请求张量，保留开关设置。
+执行模式优先级为：显式命令行/Python 参数 > 传入配置 > checkpoint 保存值 > `native`。checkpoint 未指定执行模式时使用 `native`；网络结构、层映射和 head 权重从 checkpoint 恢复。`state.reset()` 保留执行模式。使用补偿时，在 `patch()` 初始化时传入 `execution_mode="compensated"` 和 `compensation` 配置，以加载对应模块。
 
-自定义策略接口位于 [prerouter/routing.py](prerouter/routing.py)：
+自定义专家选择接口位于 [prerouter/routing.py](prerouter/routing.py)：
 
 ~~~python
 topk_indices, topk_weights = select_experts(
@@ -351,37 +359,50 @@ topk_indices, topk_weights = select_experts(
 )
 ~~~
 
-`original_route` 是本次原 router 产生的 `(indices, weights)`；调用方传入对应同一批目标位置的 logits 和原路由，输出为这些位置的 `[T,K]`。`prerouter_logits=None` 表示采用原路由。`moe_forward` 在 teacher forcing 中取出 response 行交给此函数，并将结果写回这些行；decode 直接使用单个位置。实际执行分支使用 detached 预测选 ID，router 阶段仍通过独立 KL loss 训练 head。
+`original_route` 为本次原 router 产生的 `(indices, weights)`，调用方传入对齐到同一批目标位置的 logits 和原路由，输出为 `[T,K]`。`prerouter_logits=None` 表示使用原路由。`moe_forward` 按模式选择路由，并在 `compensated` 模式调用补偿模块调整权重。实际专家 ID 使用 detached 预测选择，router 阶段通过独立 KL loss 训练 head。
 
-单 prompt 对比，在下列命令中分别使用 `--prerouter-enabled` / `--no-prerouter-enabled`，输出到不同目录：
+单 prompt 推理，通过 `--execution-mode` 指定模式：
 
 ~~~bash
 python -m prefetch.examples.infer_prefetch_demo \
-  --checkpoint prefetch/outputs/previous_token_20260923_150530/checkpoint-2000 \
-  --prompt '请解释一下什么是混合专家模型。' --prerouter-enabled \
+  --checkpoint prefetch/outputs/previous_token_20260925_133256/checkpoint-10000 \
+  --prompt '请解释一下什么是混合专家模型。' \
+  --execution-mode predicted \
   --output prefetch/outputs/predicted_demo/metrics.json
 ~~~
 
-定量比较可复用 assistant NLL/PPL 入口，在同一批过滤后的验证样本上分别运行：
+使用 ExFold 补偿：
 
 ~~~bash
-for policy in native predicted; do
-  flag=--no-prerouter-enabled
-  if [ "$policy" = predicted ]; then flag=--prerouter-enabled; fi
+python -m prefetch.examples.infer_prefetch_demo \
+  --checkpoint prefetch/outputs/previous_token_20260925_133256/checkpoint-10000 \
+  --prompt '请解释一下什么是混合专家模型。' \
+  --execution-mode compensated --method exfold --path prefetch/outputs/exfold.safetensors \
+  --output prefetch/outputs/compensated_demo/metrics.json
+~~~
+
+OWA 可传入 `--method owa --alpha1 1.0 --alpha2 0.9`，或通过 `--path` 加载校准结果。补偿实现和校准命令见 [compensation/README.md](compensation/README.md)。
+
+准备好 ExFold 校准表后，可在同一验证集上比较三种模式：
+
+~~~bash
+for policy in native predicted compensated; do
   CUDA_VISIBLE_DEVICES=0 python -m prefetch.evaluation.evaluate_base \
-    --checkpoint prefetch/outputs/previous_token_20260923_150530/checkpoint-2000 \
-    "$flag" --sample-file prefetch/data/tulu/validation.filtered.jsonl --limit 128 \
+    --checkpoint prefetch/outputs/previous_token_20260925_133256/checkpoint-10000 \
+    --execution-mode "$policy" \
+    --method exfold --path prefetch/outputs/exfold.safetensors \
+    --sample-file prefetch/data/tulu/validation.filtered.jsonl --limit 128 \
     --output "prefetch/outputs/routing_quality/$policy.json"
 done
 ~~~
 
-提供 predictor checkpoint 时使用其对应的基模、量化和 attention adapter。路由替换范围为 teacher-forcing 的 response 文本输入，prompt 保持原路由。比较 `assistant_nll` 的 predicted−native 差值及 `assistant_perplexity` 的变化，并确认 `tokens/examples` 相同。这里测量固定参考答案下的 teacher-forcing 条件 NLL，LM 标签仍含结束符，不代表任务准确率；任务精度还需在相同任务集上比较生成答案。`evaluation.evaluate` 也接受开关，但报告的是路由指标。
+提供 predictor checkpoint 时使用其对应的基模、量化和 attention adapter。比较 `assistant_nll`、`assistant_perplexity`，并确认 `tokens/examples` 相同。这里测量固定参考答案下的 teacher-forcing 条件 NLL，LM 标签仍含结束符；任务精度需在相同任务集上比较生成答案。`evaluation.evaluate` 同样接受 `--execution-mode` 和补偿参数，用于路由指标评测。
 
-执行策略改变后，下游 hidden states 和生成轨迹也会改变。`state.router_indices`、KL 标签及 Recall 的真值仍为原 router 在**当前轨迹**上的选择，并非另外运行一次原模型得到的基线路由。报告的 `metadata.execution` 标识实际执行策略，`metadata.config` 保存模式与补偿配置。常规预测器训练保持开关关闭；开启训练会使用改变后的轨迹。缓存 I/O 的 trace 采集固定关闭此开关，保持原路由轨迹。
+执行策略会影响下游 hidden states 和生成轨迹。`state.router_indices`、KL 标签及 Recall 的真值来自原 router 在当前轨迹上的选择。`metadata.execution` 标识实际执行策略，`metadata.config` 保存模式和补偿配置。常规预测器训练及 cache I/O trace 采集使用 `native`。
 
 ### 路由指标
 
-统计单位是一个有效输入 token 在一个目标 MoE 层的调用（token-layer pair）。令原 router 在当前 hidden states 上选出的专家集合为 $R$，大小为 $K$（当前模型为 8）；prerouter 排序前 $k'$ 个专家为 $P_{k'}$。预测按 `sigmoid(logits) + 目标层 correction bias` 排序。$k'$ 控制预测候选数；实际执行策略由 `execution_mode` 控制，未指定时沿用 `prerouter_enabled`；执行集合大小为模型的 $K$。
+统计单位是一个有效输入 token 在一个目标 MoE 层的调用（token-layer pair）。令原 router 在当前 hidden states 上选出的专家集合为 $R$，大小为 $K$（当前模型为 8）；prerouter 排序前 $k'$ 个专家为 $P_{k'}$。预测按 `sigmoid(logits) + 目标层 correction bias` 排序。$k'$ 控制预测候选数；实际执行策略由 `execution_mode` 控制，默认为 `native`；执行集合大小为模型的 $K$。
 
 - **平均命中数（mean_hits）**：$\mathbb E[|R\cap P_{k'}|]$，表示每次调用平均找到了几个真值专家。
 - **Recall@$k'$**：$\mathbb E[|R\cap P_{k'}|/K]$，分母为真值专家数。当前 $K=8$ 时，`mean_hits = 8 * recall`；分母若取 $k'$ 则是 Precision。

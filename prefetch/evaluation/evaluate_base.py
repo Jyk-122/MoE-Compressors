@@ -49,14 +49,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", help="YAML config; can be inferred from a predictor checkpoint")
     parser.add_argument("--checkpoint", help="Trained predictor checkpoint for routing comparisons")
-    parser.add_argument("--prerouter-enabled", action=argparse.BooleanOptionalAction, default=None,
-                        help="Execute predicted experts with native weights; default follows config/checkpoint")
     parser.add_argument("--quantization", choices=["none", "experts_nf4"])
     parser.add_argument("--sample-file", required=True, help="Same held-out filtered JSONL for both runs")
     parser.add_argument("--limit", type=int, default=128)
     parser.add_argument("--output", required=True)
     parser.add_argument("--execution-mode", choices=["native", "predicted", "compensated"],
-                        help="Expert execution policy; overrides the legacy prerouter switch")
+                        help="Expert execution policy; follows config/checkpoint, otherwise native")
     add_compensation_arguments(parser)
     args = parser.parse_args()
     configure_logging()
@@ -64,8 +62,7 @@ def main():
         parser.error("limit must be positive")
     if not args.config and not args.checkpoint:
         parser.error("Provide --config or --checkpoint")
-    if (args.execution_mode in {"predicted", "compensated"} or
-            (args.execution_mode is None and args.prerouter_enabled)) and not args.checkpoint:
+    if args.execution_mode in {"predicted", "compensated"} and not args.checkpoint:
         parser.error("Predicted or compensated execution requires a trained --checkpoint")
     if args.checkpoint:
         config = experiment_config(args.config, args.checkpoint)
@@ -85,7 +82,7 @@ def main():
     torch.cuda.set_device(device)
     model, processor, loading = load_model(config, device)
     state = (patch(model, config.get("prefetch"), checkpoint=args.checkpoint,
-                   prerouter_enabled=args.prerouter_enabled, execution_mode=args.execution_mode,
+                   execution_mode=args.execution_mode,
                    compensation=compensation) if args.checkpoint else None)
     report = evaluate_base(model, processor, config["data"], args.sample_file, device, args.limit)
     report.update(sample_file=args.sample_file, data=config["data"], loading=loading)

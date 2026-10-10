@@ -14,6 +14,7 @@ lora:
   alpha: 32
   dropout: 0.0
 prefetch:
+  execution_mode: native
   mode: previous_token
   distance: 0              # 0: same MoE; M>=1: M preceding MoEs, always from the previous token.
   targets: null

@@ -95,26 +95,19 @@ def patch_moe_block(block, index, state):
     block.forward = MethodType(moe_forward, block)
 
 
-def patch(model, config=None, checkpoint=None, *, prerouter_enabled=None,
-          execution_mode=None, compensation=None):
+def patch(model, config=None, checkpoint=None, *, execution_mode=None, compensation=None):
     """Return the global state; losses and metrics are computed by callers."""
     if hasattr(model, "prerouter_state"):
         raise ValueError("Model already has a prerouter patch")
     # Execution policy can be changed while checkpoint architecture stays fixed.
     requested = config if isinstance(config, dict) else asdict(config) if config is not None else {}
-    # An explicit legacy CLI switch also overrides a saved execution_mode.
-    if execution_mode is None and prerouter_enabled is None:
+    if execution_mode is None:
         execution_mode = requested.get("execution_mode")
-    if prerouter_enabled is None:
-        prerouter_enabled = requested.get("prerouter_enabled")
     if compensation is None:
         compensation = requested.get("compensation")
     metadata = read_metadata(checkpoint) if checkpoint else None
     config = metadata["config"] if metadata else config
     config = PrefetchConfig(**config) if isinstance(config, dict) else config or PrefetchConfig()
-    if prerouter_enabled is not None:
-        config.prerouter_enabled = prerouter_enabled
-        config.execution_mode = None
     if execution_mode is not None:
         config.execution_mode = execution_mode
     if compensation is not None:

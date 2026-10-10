@@ -22,7 +22,7 @@ prefetch:
   loss: score_kl
   temperature: 0.1
   ks: [8, 12, 16, 24, 48, 96, 192, 384]
-  prerouter_enabled: false
+  execution_mode: native
 data:
   seed: 42
   max_length: 2048

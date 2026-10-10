@@ -1,9 +1,11 @@
 """Predictor weights use target-MoE keys; live modules belong to producer blocks."""
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, fields
 import json
 from pathlib import Path
+
+from prefetch.prerouter.configuration import PrefetchConfig
 
 
 def _weight_key(target, name):
@@ -28,7 +30,12 @@ def save_predictor(state, directory):
 
 
 def read_metadata(directory):
-    return json.loads((Path(directory) / "prefetch_config.json").read_text(encoding="utf-8"))
+    metadata = json.loads((Path(directory) / "prefetch_config.json").read_text(encoding="utf-8"))
+    # Load saved fields in the current schema; absent/null fields use its defaults.
+    names = {field.name for field in fields(PrefetchConfig)}
+    metadata["config"] = {key: value for key, value in metadata["config"].items()
+                          if key in names and value is not None}
+    return metadata
 
 
 def load_predictor(state, directory, metadata):

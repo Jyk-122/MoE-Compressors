@@ -54,13 +54,13 @@ def test_prediction_ties_follow_metric_order():
 
 
 @pytest.mark.parametrize("mode,distance", ROUTING_CASES)
-@pytest.mark.parametrize("enabled", [False, True])
-def test_execution_and_teacher_are_separate(model, mode, distance, enabled):
+@pytest.mark.parametrize("execution_mode", ["native", "predicted"])
+def test_execution_and_teacher_are_separate(model, mode, distance, execution_mode):
     ids = torch.tensor([[0, 1, 3, 5, 7, 0]])
     attention = ids != 0
     original = model(ids, attention_mask=attention).logits
     state = patch(model, config(mode=mode, distance=distance, excluded_token_ids=[3],
-                                prerouter_enabled=enabled))
+                                execution_mode=execution_mode))
     response_mask = torch.tensor([[False, False, True, True, True, False]])
     state.reset(router_mask=response_mask)
     captured, native_logits, handles = {}, {}, []
@@ -85,7 +85,7 @@ def test_execution_and_teacher_are_separate(model, mode, distance, enabled):
         torch.testing.assert_close(state.router_logits[target], teacher[start:], rtol=0, atol=0)
         torch.testing.assert_close(state.router_indices[target], native_indices[start:], rtol=0, atol=0)
         indices, weights = captured[target]
-        if enabled:
+        if execution_mode == "predicted":
             scores = state.predictions[target].float().sigmoid() + block.e_score_correction_bias
             predicted = scores.sort(dim=-1, descending=True, stable=True).indices[:, :block.top_k]
             assert predicted.shape == (ids.shape[1] - start, block.top_k)
@@ -98,15 +98,15 @@ def test_execution_and_teacher_are_separate(model, mode, distance, enabled):
             expected_indices, expected_weights = native_indices, native_weights
         torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
         torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
-    if enabled:
+    if execution_mode == "predicted":
         assert differences > 0
         assert not torch.equal(output, original)
     else:
         torch.testing.assert_close(output, original, rtol=0, atol=0)
     meter = RoutingMetrics(state)
     meter.update(state)
-    assert meter.report()["metadata"]["config"]["prerouter_enabled"] is enabled
-    state.config.prerouter_enabled = False
+    assert meter.report()["metadata"]["config"]["execution_mode"] == execution_mode
+    state.config.execution_mode = "native"
     state.reset()
     torch.testing.assert_close(model(ids, attention_mask=attention).logits, original, rtol=0, atol=0)
     for handle in handles:
@@ -114,9 +114,9 @@ def test_execution_and_teacher_are_separate(model, mode, distance, enabled):
 
 
 @pytest.mark.parametrize("mode,distance", ROUTING_CASES)
-def test_enabled_full_sequence_matches_incremental(model, mode, distance):
+def test_predicted_full_sequence_matches_incremental(model, mode, distance):
     ids = torch.tensor([[1, 3, 5, 7, 9]])
-    state = patch(model, config(mode=mode, distance=distance, prerouter_enabled=True))
+    state = patch(model, config(mode=mode, distance=distance, execution_mode="predicted"))
     state.reset(router_mask=torch.tensor([[False, False, True, True, True]]))
     full = model(ids).logits
     state.reset(generation=True)
@@ -129,12 +129,12 @@ def test_enabled_full_sequence_matches_incremental(model, mode, distance):
     torch.testing.assert_close(torch.cat(outputs, dim=1), full)
     state.reset(generation=True)
     torch.testing.assert_close(model(ids[:, :2]).logits, outputs[0], rtol=0, atol=0)
-    assert state.config.prerouter_enabled
+    assert state.config.execution_mode == "predicted"
 
 
 @pytest.mark.parametrize("mode,distance", ROUTING_CASES)
 def test_untargeted_layers_keep_native_route(model, mode, distance):
-    state = patch(model, config(mode=mode, distance=distance, targets=[3], prerouter_enabled=True))
+    state = patch(model, config(mode=mode, distance=distance, targets=[3], execution_mode="predicted"))
     state.reset(router_mask=torch.ones(1, 3, dtype=torch.bool))
     handles = []
     native = {}
@@ -153,11 +153,11 @@ def test_untargeted_layers_keep_native_route(model, mode, distance):
 
 
 @pytest.mark.parametrize("mode,distance", ROUTING_CASES)
-@pytest.mark.parametrize("enabled", [False, True])
-def test_prefill_native_tail_prediction_and_decode_metrics(model, mode, distance, enabled):
+@pytest.mark.parametrize("execution_mode", ["native", "predicted"])
+def test_prefill_native_tail_prediction_and_decode_metrics(model, mode, distance, execution_mode):
     ids = torch.tensor([[1, 5, 7]])
     original = model(ids).logits
-    state = patch(model, config(mode=mode, distance=distance, prerouter_enabled=enabled,
+    state = patch(model, config(mode=mode, distance=distance, execution_mode=execution_mode,
                                 excluded_token_ids=[3], trace_limit=20))
     meter = RoutingMetrics(state)
     calls, handles = [], []
@@ -184,40 +184,42 @@ def test_prefill_native_tail_prediction_and_decode_metrics(model, mode, distance
 
 
 def test_teacher_forcing_requires_response_scope(model):
-    state = patch(model, config(prerouter_enabled=True))
+    state = patch(model, config(execution_mode="predicted"))
     with pytest.raises(ValueError, match="response_mask"):
         model(torch.tensor([[1, 3, 5]]))
-    state.config.prerouter_enabled = False
+    state.config.execution_mode = "native"
     model(torch.tensor([[1, 3, 5]]))
     with pytest.raises(ValueError, match="response router_mask"):
         RoutingMetrics(state).update(state)
 
 
-@pytest.mark.parametrize("saved_enabled", [None, False, True])
-def test_checkpoint_execution_policy_override(model, tmp_path, saved_enabled):
+@pytest.mark.parametrize("saved_mode", ["missing", None, "native", "predicted"])
+def test_checkpoint_execution_policy_override(model, tmp_path, saved_mode):
     pytest.importorskip("safetensors")
-    state = patch(model, config(prerouter_enabled=bool(saved_enabled)))
+    state = patch(model, config())
     save_predictor(state, tmp_path)
-    if saved_enabled is None:
-        path = tmp_path / "prefetch_config.json"
-        metadata = json.loads(path.read_text(encoding="utf-8"))
-        metadata["config"].pop("prerouter_enabled")
-        path.write_text(json.dumps(metadata), encoding="utf-8")
+    path = tmp_path / "prefetch_config.json"
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    metadata["config"]["extra_saved_field"] = True
+    if saved_mode == "missing":
+        metadata["config"].pop("execution_mode")
+    else:
+        metadata["config"]["execution_mode"] = saved_mode
+    path.write_text(json.dumps(metadata), encoding="utf-8")
     unpatch(model)
     state = patch(model, checkpoint=tmp_path)
-    assert state.config.prerouter_enabled is bool(saved_enabled)
+    assert state.config.execution_mode == ("predicted" if saved_mode == "predicted" else "native")
     unpatch(model)
-    state = patch(model, {"prerouter_enabled": True}, checkpoint=tmp_path)
-    assert state.config.prerouter_enabled
+    state = patch(model, {"execution_mode": "predicted"}, checkpoint=tmp_path)
+    assert state.config.execution_mode == "predicted"
     unpatch(model)
-    state = patch(model, {"prerouter_enabled": True}, checkpoint=tmp_path, prerouter_enabled=False)
-    assert not state.config.prerouter_enabled
+    state = patch(model, {"execution_mode": "predicted"}, checkpoint=tmp_path, execution_mode="native")
+    assert state.config.execution_mode == "native"
 
 
 @pytest.mark.parametrize("module_name", ["prefetch.examples.infer_prefetch_demo", "prefetch.evaluation.evaluate"])
-@pytest.mark.parametrize("flag,expected", [(None, None), ("--prerouter-enabled", True),
-                                         ("--no-prerouter-enabled", False)])
-def test_cli_passes_execution_override(monkeypatch, module_name, flag, expected):
+@pytest.mark.parametrize("execution_mode", [None, "native", "predicted", "compensated"])
+def test_cli_passes_execution_override(monkeypatch, module_name, execution_mode):
     import importlib
     import sys
     module = importlib.import_module(module_name)
@@ -229,10 +231,12 @@ def test_cli_passes_execution_override(monkeypatch, module_name, flag, expected)
     class ReachedPatch(Exception):
         pass
     def check_patch(*args, **kwargs):
-        assert kwargs["prerouter_enabled"] is expected
+        assert kwargs["execution_mode"] == execution_mode
         raise ReachedPatch
     monkeypatch.setattr(module, "patch", check_patch)
     argv = [module_name, "--checkpoint", "unused", "--output", "unused"]
-    monkeypatch.setattr(sys, "argv", argv + ([flag] if flag else []))
+    if execution_mode is not None:
+        argv += ["--execution-mode", execution_mode]
+    monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(ReachedPatch):
         module.main()

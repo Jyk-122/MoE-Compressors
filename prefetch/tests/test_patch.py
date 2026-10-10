@@ -131,8 +131,8 @@ def test_original_output_preserved_and_patch_removable(model, mode, distance):
 
 
 @pytest.mark.parametrize("mode,distance", ROUTING_CASES)
-@pytest.mark.parametrize("enabled", [False, True])
-def test_reference_model_moe_forward_and_routes(model, mode, distance, enabled):
+@pytest.mark.parametrize("execution_mode", ["native", "predicted"])
+def test_reference_model_moe_forward_and_routes(model, mode, distance, execution_mode):
     # Execute the four self-contained reference classes at a small dimension.
     import ast
     from pathlib import Path
@@ -154,7 +154,7 @@ def test_reference_model_moe_forward_and_routes(model, mode, distance, enabled):
             nn.init.normal_(parameter, std=0.1)
     values = batch()
     original = model(values["input_ids"]).logits
-    state = patch(model, config(mode=mode, distance=distance, prerouter_enabled=enabled))
+    state = patch(model, config(mode=mode, distance=distance, execution_mode=execution_mode))
     handles = []
     for index, (_, block) in enumerate(state.blocks):
         def check_weights(module, args, index=index, block=block):
@@ -168,7 +168,7 @@ def test_reference_model_moe_forward_and_routes(model, mode, distance, enabled):
     task = TrainingTask(model, state, "router")
     task(values, record_metrics=True).backward()
     output = model(values["input_ids"]).logits
-    if not enabled:
+    if execution_mode == "native":
         torch.testing.assert_close(output, original, rtol=0, atol=0)
     for target, logits in state.router_logits.items():
         expected = model.layers[target].mlp.route_tokens_to_experts(logits)[0]

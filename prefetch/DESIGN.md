@@ -6,7 +6,7 @@
 
 固定基模版本、量化方式、attention adapter、数据 split、head 结构与温度，比较预测位置。一个 predictor 输出完整排序，一次训练评估所有候选数 k′。
 
-默认原 router 决定实际专家及权重；head 是旁路。prefill 始终使用原 router。`prerouter_enabled=true` 时在 decode 及 teacher-forcing 的 response 输入位置用预测结果选择专家，再从原 gate 的 sigmoid 分数中提取对应权重，按原规则归一化、缩放。真值使用当前 hidden states 上的 gate 输出及原生 route_tokens_to_experts。可选 attention LoRA 先用原路由 SFT，再冻结 adapter 训练 predictor。router 阶段只对 head 求梯度，teacher 标签 detach。
+默认原 router 决定实际专家及权重；head 是旁路。prefill 始终使用原 router。`execution_mode=predicted` 时在 decode 及 teacher-forcing 的 response 输入位置用预测结果选择专家，再从原 gate 的 sigmoid 分数中提取对应权重，按原规则归一化、缩放。真值使用当前 hidden states 上的 gate 输出及原生 route_tokens_to_experts。可选 attention LoRA 先用原路由 SFT，再冻结 adapter 训练 predictor。router 阶段只对 head 求梯度，teacher 标签 detach。
 
 此阶段实现预测训练与正确性评测。Flash→DRAM 调度、缓存容量和端侧时延模型可后续读取排序与覆盖率结果，独立控制传输变量。
 
@@ -86,9 +86,9 @@ DDP wrapper 只注册可训练 ParameterList，参数按配置中的 pair 顺序
 
 生成评测使用 capture_generation(model, state, meter) 包住一次 generate。评测侧临时挂 model forward hook，每步完成后 meter.update(state)，其中 prefill 自动返回，decode 累计指标；请求结束时卸载观察器并清理 state，报告计数单独保留。直接调用 model forward 只收集信息，由调用方决定后续处理。
 
-same_token / previous_token 的 head 在 source 原路由选择之后、专家计算之前调用，生成报告 producer_timing=after_source_routing_before_experts。previous_top 的生成报告为 decode_start_after_token_embedding，teacher forcing 仍在 source MoE 中批量对齐计算。moe_forward 根据 phase 和开关决定执行策略：prefill 使用原路由；decode 可用 select_experts 替换；teacher forcing 只将 response 行交给 select_experts 并写回这些行。无预测器的层及两种跨 token 模式的序列首位置使用原路由。监督和指标读取已收集的原 router 标签，原 router 始终参与权重计算。
+same_token / previous_token 的 head 在 source 原路由选择之后、专家计算之前调用，生成报告 producer_timing=after_source_routing_before_experts。previous_top 的生成报告为 decode_start_after_token_embedding，teacher forcing 仍在 source MoE 中批量对齐计算。moe_forward 根据 phase 和 execution_mode 决定执行策略：prefill 使用原路由；decode 可用 select_experts 替换；teacher forcing 只将 response 行交给 select_experts 并写回这些行。无预测器的层及两种跨 token 模式的序列首位置使用原路由。监督和指标读取已收集的原 router 标签，原 router 始终参与权重计算。
 
-开关可通过 YAML、patch(..., prerouter_enabled=...) 或 state.config.prerouter_enabled 设置；显式 patch 参数优先于传入配置和 checkpoint 值，旧 checkpoint 默认关闭。请求 reset 保留策略；切换策略后用新请求重新构建 KV cache。路由改变后，原 router 标签对应改变后的当前轨迹。evaluate_base 支持在固定验证集上比较开关前后的 assistant NLL/PPL；缓存 I/O trace 采集固定使用原路由。
+`execution_mode` 统一选择 `native`、`predicted`、`compensated`，默认 `native`。可通过 YAML、`--execution-mode`、`patch(..., execution_mode=...)` 设置；显式参数优先于传入配置和 checkpoint 保存值。`compensated` 在预测集合上调用补偿模块调整权重，使用初始化时传入的 `compensation` 配置。请求 reset 保留执行策略；独立请求间切换策略后重新 prefill，建立匹配的 KV cache。原 router 标签对应当前轨迹。evaluate_base 支持在固定验证集比较三种模式的 assistant NLL/PPL；缓存 I/O trace 采集使用 `native`。
 
 ## 5. Head、损失与指标
 
