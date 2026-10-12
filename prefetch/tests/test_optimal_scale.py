@@ -267,7 +267,9 @@ def test_single_pass_matches_separate_collection_and_releases_stats(
     assert set(values) == {"2.scale", "3.scale"}
     for target, (scale, metrics) in expected.items():
         torch.testing.assert_close(values[f"{target}.scale"], scale, rtol=0, atol=0)
-        assert report["fit_metrics"][target] == pytest.approx(metrics)
+        fitted = dict(report["fit_metrics"][target])
+        assert fitted.pop("solve_seconds") >= 0
+        assert fitted == pytest.approx(metrics)
         assert metrics["normalized_mse"] <= metrics["baseline_normalized_mse"] + 1e-8
     assert all(value.shape == (8, 6) and value.dtype == torch.float32 for value in values.values())
     assert state.route_observer is None and not state.compensators
@@ -303,3 +305,160 @@ def test_calibration_cli_uses_single_pass_collection(tmp_path, monkeypatch, caps
     assert report["collection"] == "single_pass"
     assert report["tokens"] == {"3": 3}
     assert set(load_artifact(output)[0]) == {"3.scale"}
+
+
+@pytest.mark.parametrize("kind,dtype", [
+    ("toy", torch.float32), ("bf16", torch.bfloat16), ("nf4_interface", torch.bfloat16),
+])
+def test_calibration_batches_and_deduplicates_expert_outputs(kind, dtype):
+    from prefetch.compensation.calibration import CalibrationObserver
+    torch.manual_seed(19)
+    experts = make_experts(kind, dtype)
+    x = torch.randn(4, 6).to(dtype)
+    native_ids = torch.tensor([[0, 1], [2, 0], [1, 3], [3, 2]])
+    predicted_ids = torch.tensor([[1, 2], [0, 2], [3, 0], [1, 0]])
+    ids = torch.cat([native_ids, predicted_ids], dim=1)
+    ones = torch.ones(4, 1)
+    expected = torch.stack([experts(x, ids[:, slot:slot + 1], ones).float()
+                            for slot in range(4)], dim=1)
+    calls, captured = [], []
+    handle = experts.register_forward_pre_hook(lambda module, args: calls.append(args))
+    collector = SimpleNamespace(sampling="prefetch", update=lambda *args: captured.append(args))
+    observer = CalibrationObserver(collector, chunk_size=4, max_tokens=4)
+    observer(0, SimpleNamespace(experts=experts), x,
+             (native_ids, torch.ones(4, 2)), (predicted_ids, torch.ones(4, 2)))
+    handle.remove()
+    actual = torch.cat(captured[0][-2:], dim=1)
+    torch.testing.assert_close(actual, expected)
+    assert len(calls) == 1
+    assert calls[0][1].shape == (12, 1)  # Four overlapping (token, expert) pairs reused.
+    assert observer.tokens[0] == 4
+
+
+def _sample_parallel_model(mode):
+    torch.manual_seed(51)
+    model = ToyModel().eval().requires_grad_(False)
+    state = patch(model, config(mode=mode, distance=1, targets=[2, 3], excluded_token_ids=[0]))
+    return model, state
+
+
+def _sample_parallel_collate(records):
+    record = records[0]
+    assert record["images"] == [f"image{record['id']}.png"]
+    ids = torch.tensor([record["ids"]])
+    return dict(input_ids=ids, attention_mask=ids != 0,
+                router_mask=torch.ones_like(ids, dtype=torch.bool))
+
+
+def _parallel_calibration_worker(rank, directory, settings):
+    import sys
+    from datetime import timedelta
+    import prefetch.compensation.optimal_scale.calibrate as calibration
+    import prefetch.training.runtime as runtime
+
+    torch.set_num_threads(1)
+    model, state = _sample_parallel_model(settings["mode"])
+    directory = Path(directory)
+    processed = []
+    original_forward = model.forward
+    def forward(input_ids, **kwargs):
+        processed.append(input_ids[0].tolist())
+        return original_forward(input_ids=input_ids, **kwargs)
+    model.forward = forward
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        for key, value in {"RANK": rank, "LOCAL_RANK": rank, "WORLD_SIZE": settings["world_size"]}.items():
+            monkeypatch.setenv(key, str(value))
+        monkeypatch.setattr(torch.cuda, "set_device", lambda *args: None)
+        monkeypatch.setattr(runtime, "make_collator", lambda *args: _sample_parallel_collate)
+        monkeypatch.setattr(calibration, "load_calibration", lambda args:
+                            (model, None, state, {"model": {}, "data": {}}, "cpu", {"layers": state.layers}))
+        init = torch.distributed.init_process_group
+        monkeypatch.setattr(calibration.dist, "init_process_group", lambda backend, timeout:
+                            init("gloo", init_method=(directory / "rendezvous").as_uri(),
+                                 rank=rank, world_size=settings["world_size"], timeout=timedelta(seconds=60)))
+        monkeypatch.setattr(sys, "argv", ["calibrate", "--checkpoint", "trained",
+                            "--sample-file", str(directory / "data.jsonl"),
+                            "--limit", str(settings["limit"]), "--max-tokens", str(settings["max_tokens"]),
+                            "--chunk-size", "2", "--channel-chunk-size", "2",
+                            "--shared-stats-dir", str(directory),
+                            "--output", str(directory / "parallel.safetensors")])
+        calibration.main()
+    (directory / f"forward{rank}.json").write_text(json.dumps(processed), encoding="utf-8")
+    assert state.route_observer is None and not state.active
+    assert not torch.distributed.is_initialized()
+
+
+@pytest.mark.skipif(not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+                    reason="CPU Gloo required")
+@pytest.mark.parametrize("mode,world_size,limit,max_tokens", [
+    ("previous_token", 2, 5, 99),  # Uneven sample counts across ranks.
+    ("previous_token", 2, 4, 4),   # Global cap cuts into a response.
+    ("previous_token", 2, 5, 1),   # A rank has zero assigned response tokens.
+    ("same_token", 3, 1, 99),     # More ranks than samples and target layers.
+    ("previous_top", 2, 4, 7),
+])
+def test_sample_parallel_matches_serial_and_forwards_each_sample_once(
+        tmp_path, monkeypatch, mode, world_size, limit, max_tokens):
+    import prefetch.compensation.optimal_scale.calibrate as calibration
+    import prefetch.training.runtime as runtime
+    records = [dict(id=i, ids=ids, images=[f"image{i}.png"]) for i, ids in enumerate(
+               [[1, 3, 5], [2, 4, 6, 8], [3, 7, 0], [4, 5, 6, 7, 8], [5, 9, 10]])]
+    source = tmp_path / "data.jsonl"
+    source.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    model, state = _sample_parallel_model(mode)
+    monkeypatch.setattr(runtime, "make_collator", lambda *args: _sample_parallel_collate)
+    args = SimpleNamespace(chunk_size=2, max_tokens=max_tokens, limit=limit, sample_file=source,
+                           channel_chunk_size=2, ridge=1e-4, ridge_center=1.0,
+                           output=tmp_path / "single.safetensors")
+    expected_forwards = []
+    original_forward = model.forward
+    def forward(input_ids, **kwargs):
+        expected_forwards.append(input_ids[0].tolist())
+        return original_forward(input_ids=input_ids, **kwargs)
+    model.forward = forward
+    report = calibration.calibrate_layers(model, None, state, {"model": {}, "data": {}}, "cpu",
+                                          args, {"layers": state.layers})
+    model.forward = original_forward
+    reference, _ = load_artifact(args.output)
+    settings = dict(mode=mode, world_size=world_size, limit=limit, max_tokens=max_tokens)
+    context = torch.multiprocessing.spawn(_parallel_calibration_worker, args=(str(tmp_path), settings),
+                                          nprocs=world_size, join=False)
+    try:
+        from time import monotonic
+        deadline = monotonic() + 90
+        while not context.join(timeout=1):
+            if monotonic() >= deadline:
+                pytest.fail("Parallel calibration did not finish within 90 seconds")
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join()
+    values, combined = load_artifact(tmp_path / "parallel.safetensors")
+    assert values.keys() == reference.keys()
+    for key in reference:
+        torch.testing.assert_close(values[key], reference[key])
+    assert combined["tokens"] == {str(k): v for k, v in report["tokens"].items()}
+    for target, expected in report["fit_metrics"].items():
+        expected = {key: value for key, value in expected.items() if key != "solve_seconds"}
+        actual = {key: value for key, value in combined["fit_metrics"][str(target)].items()
+                  if key != "solve_seconds"}
+        assert actual == pytest.approx(expected, abs=1e-8)
+    processed = []
+    for rank in range(world_size):
+        shard = json.loads((tmp_path / f"forward{rank}.json").read_text(encoding="utf-8"))
+        assigned = [record["ids"] for record in records[:limit][rank::world_size]]
+        assert all(ids in assigned for ids in shard)
+        processed.extend(shard)
+    assert sorted(processed) == sorted(expected_forwards)
+    assert len({tuple(ids) for ids in processed}) == len(processed)
+    assert combined["parallelism"] == "samples" and combined["world_size"] == world_size
+    assert combined["layers"] == state.layers
+    assert combined["statistics_storage"] == "shared_cpu"
+    assert not list(tmp_path.glob("optimal-scale-*"))
+    assert "rank" not in combined
+    unpatch(model)
+    state = patch(model, config(mode=mode, distance=1, targets=[2, 3]), execution_mode="compensated",
+                  compensation={"method": "optimal_scale", "path": str(tmp_path / "parallel.safetensors")})
+    for target, module in state.compensators.items():
+        torch.testing.assert_close(module.scale, reference[f"{target}.scale"])

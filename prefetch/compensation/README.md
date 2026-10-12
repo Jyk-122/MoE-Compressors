@@ -23,7 +23,8 @@ compensation/
 ├── optimal_scale/
 │   ├── __init__.py
 │   ├── compensate.py     # 专家输出通道缩放
-│   └── calibrate.py      # 单次遍历采集各层统计量、求解 scale
+│   ├── calibrate.py      # 单次遍历采集各层统计量、求解 scale
+│   └── shared.py         # 单机样本并行的共享 CPU 统计量与写锁
 └── README.md
 ```
 
@@ -135,7 +136,7 @@ G[h] = V_hᵀ V_h、q[h] = V_hᵀ Y_h 保留专家间的交叉项。默认求解
 
 三个入口共用 `calibration.py` 的数据循环，要求训练好的 predictor checkpoint、原运行配置和过滤后的 JSONL。沿原生轨迹采集 response 输入上的专家输出，冻结 backbone 和 predictor，shared experts 不参与拟合。
 
-采集通过现有 expert backend 的标准接口获得未加权输出，适用于 BF16/NF4 相同调用接口。`--limit` 限制样本数，`--max-tokens` 是全部样本合计每层的 response token 上限，`--chunk-size` 控制暂存激活大小。OWA/ExFold 默认 512 tokens/layer，适合检查流程；OptimalScale 默认最多 32 条样本、65536 tokens/layer。实际 token 数写入校准报告。
+采集通过现有 expert backend 的标准接口获得未加权输出，适用于 BF16/NF4 相同调用接口。每个 token 分块将 native/predicted 集合合并，对 `(token, expert)` 去重后一次调用后端，再恢复两组输出。`--limit` 限制样本数，`--max-tokens` 是全部样本合计每层的 response token 上限，`--chunk-size` 控制暂存激活大小。OWA/ExFold 默认 512 tokens/layer，适合检查流程；OptimalScale 默认最多 32 条样本、65536 tokens/layer。实际 token 数写入校准报告。
 
 ### 混合校准数据
 
@@ -244,7 +245,37 @@ CUDA_VISIBLE_DEVICES=0 python -m prefetch.compensation.optimal_scale.calibrate \
 
 统计时按每个 token 的 K 个预取专家累积 K² 个交叉项。收集期间同时保留全部目标层的 G、q，其 CPU 内存为 `Σ层 8 × H × (N² + N)` 字节，与样本数无关。N=384、H=2560 时，每层约 2.82 GiB，35 个目标层合计约 98.69 GiB，另外需要激活和求解临时内存；程序会在采集前打印统计量内存估算。`--channel-chunk-size` 控制统计和求解时的通道分块及临时内存，G、q 仍覆盖全部通道。最终每层 FP32 S 为 3.75 MiB，文件只含各层 `<target_moe>.scale` 和元数据。
 
-校准日志及 artifact 的 `fit_metrics` 包含每层实际 token 数、观测专家数、predicted 和拟合后的 normalized MSE。它们是校准集上的局部输出误差；使用独立验证集检查 NLL 和任务精度。
+校准日志记录采集耗时 `collection_seconds`，artifact 的 `fit_metrics` 包含每层实际 token 数、观测专家数、predicted 和拟合后的 normalized MSE，以及求解耗时 `solve_seconds`。normalized MSE 衡量校准集上的局部输出误差；使用独立验证集检查 NLL 和任务精度。
+
+#### 多 GPU 样本并行校准
+
+OptimalScale 支持单机 `torchrun` 样本并行：每张 GPU 加载完整模型，按 JSONL 行号分配不同样本。192 条样本分给 8 张卡时，每卡约 24 条，每条样本只在所属 GPU 上进行模型前向，完整图文 pair 一起交给 processor。
+
+所有进程映射同一份 CPU `G[H,N,N]`、`q[H,N]`，即原 OptimalScale 的 `A_stats/B_stats`。各进程先计算当前分块的贡献，再通过逐层进程锁累加到共享统计量；不同层可以同时写入。全部样本收集完成后，各进程分担不同层的 solve，每层均使用全体样本的统计量，并只加一次 ridge 正则。各层结果最终合并为一个 safetensors。
+
+8 张 H20 的启动示例：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 \
+  torchrun --standalone --nnodes=1 --nproc-per-node=8 \
+  -m prefetch.compensation.optimal_scale.calibrate \
+  --checkpoint prefetch/outputs/previous_token_20260925_133256/checkpoint-10000 \
+  --sample-file /data/calib/mixed.jsonl \
+  --limit 192 --max-tokens 393216 \
+  --chunk-size 256 --channel-chunk-size 256 \
+  --ridge 1e-4 --ridge-center 1 \
+  --output prefetch/outputs/optimal_scale.safetensors
+```
+
+`--limit` 是全部 GPU 合计的样本上限，`--max-tokens` 是全局每层 response token 上限。各进程只预处理自己分到的样本，交换 response token 数后，按 JSONL 顺序分配全局 token 配额。因此单卡和多卡使用相同的样本及 response token 前缀，浮点累加顺序可能带来舍入差异。
+
+CPU 统计量总内存为 `Σ层 8 × H × (N² + N)` 字节，与 GPU 数无关。N=384、H=2560、35 层时，全机 G、q 合计约 98.69 GiB；另外需要各进程的图文预处理、分块激活和求解临时内存。每张 GPU 需要容纳完整模型及前向临时张量。多个进程的 RSS 会包含相同的共享页面，统计物理内存时应查看 PSS 或系统总用量。
+
+Linux 默认在 `/dev/shm` 建立共享映射，启动前检查其可用容量。需要约 99 GiB 的可用共享空间，可用 `df -h /dev/shm` 查看；也可通过 `--shared-stats-dir /path/to/shared-memory` 指定容量充足的内存文件系统目录。统计文件在对应层求解完成后释放，临时目录在正常结束后自动清理。普通磁盘目录也能映射，但大规模写回可能增加耗时。
+
+每个进程保存自己求解出的 `optimal_scale.rank0.safetensors` 等结果分片。全部完成后，rank 0 自动合并为 `--output` 指定的完整文件，推理直接使用该文件。共享统计目录和输出目录须对同机所有进程可见。
+
+上述命令使用较大的 token/通道分块，以减少小调用开销；单卡同样可以使用这两个参数，临时内存随分块增大。`OMP_NUM_THREADS` 和 `MKL_NUM_THREADS` 是每个进程的 CPU 线程数，8 个进程各设 8 线程需要相应的 CPU 核资源，可按机器负载调整。实际加速取决于样本长度、模型前向、共享统计写入和求解的耗时；日志记录各卡采集耗时及各层 `solve_seconds`。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m prefetch.examples.infer_prefetch_demo \
