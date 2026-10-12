@@ -1,6 +1,6 @@
 # MoE Prefetch Router 训练工程
 
-在较早的 MoE 输入处预测目标层路由，训练一次即可评估多个候选数 k′。训练与 teacher-forcing 验证使用 response 文本输入位置；生成评测使用真实 decode 调用。prefill 始终由原 router 执行；`prefetch.execution_mode` 默认为 `native`；`predicted` 在 decode 和 teacher-forcing 的 response 位置执行预测专家，`compensated` 在预测集合上进一步补偿权重。真值始终来自原 router 在当前 hidden states 上的选择（包含所选量化和 attention LoRA）。
+在较早的 MoE 输入处预测目标层路由，训练一次即可评估多个候选数 k′。训练与 teacher-forcing 验证使用 response 文本输入位置；生成评测使用真实 decode 调用。prefill 始终由原 router 执行；`prefetch.execution_mode` 默认为 `native`；`predicted` 在 decode 和 teacher-forcing 的 response 位置执行预测专家，`compensated` 在预测集合上补偿权重或专家输出通道。真值始终来自原 router 在当前 hidden states 上的选择（包含所选量化和 attention LoRA）。
 
 支持同 token 提前 M≥1 个 MoE、上一 token 同层或提前 M≥1 个 MoE，以及结合当前已采样 token embedding 的 `previous_top` 模式。支持可选 attention LoRA SFT、routed-expert NF4、多卡训练、恢复、覆盖率曲线和单 prompt 推理。语义见 [DESIGN.md](DESIGN.md)。本阶段测量预测能力；Flash→DRAM 调度和端侧时延模拟可在后续实验中接入。
 
@@ -319,7 +319,7 @@ router 阶段的周期验证、独立评测和单 prompt demo 自动报告 Recal
 | --- | --- | --- |
 | native | 原 router 选择的专家 | 原生路由权重 |
 | predicted | prerouter 预测的专家 | 原 gate 在预测 ID 上的分数，按原规则归一化、缩放 |
-| compensated | prerouter 预测的专家 | 根据原生路由，经 OWA 或 ExFold 补偿后的权重 |
+| compensated | prerouter 预测的专家 | OWA/ExFold 补偿权重，或 predicted 权重配合 OptimalScale 通道缩放 |
 
 在完整 YAML 的 `prefetch` 下设置：
 
@@ -359,7 +359,7 @@ topk_indices, topk_weights = select_experts(
 )
 ~~~
 
-`original_route` 为本次原 router 产生的 `(indices, weights)`，调用方传入对齐到同一批目标位置的 logits 和原路由，输出为 `[T,K]`。`prerouter_logits=None` 表示使用原路由。`moe_forward` 按模式选择路由，并在 `compensated` 模式调用补偿模块调整权重。实际专家 ID 使用 detached 预测选择，router 阶段通过独立 KL loss 训练 head。
+`original_route` 为本次原 router 产生的 `(indices, weights)`，调用方传入对齐到同一批目标位置的 logits 和原路由，输出为 `[T,K]`。`prerouter_logits=None` 表示使用原路由。`moe_forward` 按模式选择路由，并在 `compensated` 模式调用补偿模块调整权重或缩放专家输出通道。实际专家 ID 使用 detached 预测选择，router 阶段通过独立 KL loss 训练 head。
 
 单 prompt 推理，通过 `--execution-mode` 指定模式：
 
@@ -381,7 +381,7 @@ python -m prefetch.examples.infer_prefetch_demo \
   --output prefetch/outputs/compensated_demo/metrics.json
 ~~~
 
-OWA 可传入 `--method owa --alpha1 1.0 --alpha2 0.9`，或通过 `--path` 加载校准结果。补偿实现和校准命令见 [compensation/README.md](compensation/README.md)。
+OptimalScale 可传入 `--method optimal_scale --path prefetch/outputs/optimal_scale.safetensors`，使用逐层校准的专家通道 scale。OWA 可传入 `--method owa --alpha1 1.0 --alpha2 0.9`，或通过 `--path` 加载校准结果。补偿实现和校准命令见 [compensation/README.md](compensation/README.md)。
 
 准备好 ExFold 校准表后，可在同一验证集上比较三种模式：
 
@@ -550,4 +550,7 @@ python -m prefetch.evaluation.cache.simulate \
 
 ## 专家补偿
 
-支持 native、predicted、compensated 三种专家执行模式。推理与评测可直接传入 `--execution-mode compensated --method exfold --path outputs/exfold.safetensors`；OWA 可传入 `--method owa --alpha1 1.0 --alpha2 0.9`。实现、独立校准入口及完整示例见 [compensation/README.md](compensation/README.md)。
+可通过 `python -m prefetch.datasets.prepare_calibration --checkpoint <checkpoint> --output /data/calib/mixed.jsonl` 导出 SlimPajama、CodeAlpaca、CogVLM、ChartQA 和中文 Alpaca 混合校准集，图文样本的图片保存于输出目录的 `images/`。数据源配置与完整命令见 [混合校准数据](compensation/README.md#混合校准数据)。
+
+
+支持 native、predicted、compensated 三种专家执行模式。推理与评测可直接传入 `--execution-mode compensated --method exfold --path outputs/exfold.safetensors`；OWA 可传入 `--method owa --alpha1 1.0 --alpha2 0.9`；OptimalScale 使用 `--method optimal_scale --path outputs/optimal_scale.safetensors`，校准入口为 `python -m prefetch.compensation.optimal_scale.calibrate`。实现、独立校准入口及完整示例见 [compensation/README.md](compensation/README.md)。

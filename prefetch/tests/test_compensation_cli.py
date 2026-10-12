@@ -8,7 +8,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from prefetch.compensation import OWA, ExFold
+from prefetch.compensation import OWA, ExFold, OptimalScale
 from prefetch.compensation.artifacts import save_artifact
 from prefetch.compensation.cli import add_compensation_arguments, compensation_from_args
 from prefetch.prerouter.checkpoint import save_predictor
@@ -48,7 +48,7 @@ def test_cli_inherits_checkpoint_compensation(tmp_path):
     "prefetch.evaluation.evaluate",
     "prefetch.evaluation.evaluate_base",
 ])
-@pytest.mark.parametrize("method", ["exfold", "owa"])
+@pytest.mark.parametrize("method", ["exfold", "owa", "optimal_scale"])
 def test_cli_loads_compensation_on_predictor_checkpoint(tmp_path, monkeypatch, module_name, method):
     model = ToyModel().eval().requires_grad_(False)
     state = patch(model, config())
@@ -57,11 +57,15 @@ def test_cli_loads_compensation_on_predictor_checkpoint(tmp_path, monkeypatch, m
     artifact = tmp_path / "exfold.safetensors"
     tensors = {f"{target}.{key}": value for target in state.targets
                for key, value in (("coefficients", torch.eye(8)), ("loss", torch.ones(8, 8)))}
-    save_artifact(artifact, tensors, {"method": "exfold", "layers": state.layers})
+    artifact_method = "exfold"
+    if method == "optimal_scale":
+        artifact_method = method
+        tensors = {f"{target}.scale": torch.ones(8, 6) for target in state.targets}
+    save_artifact(artifact, tensors, {"method": artifact_method, "layers": state.layers})
     unpatch(model)
 
     # Each invocation selects a new method over the run's previous compensation.
-    previous = ({"method": "owa", "alpha1": 2.0} if method == "exfold"
+    previous = ({"method": "owa", "alpha1": 2.0} if method != "owa"
                 else {"method": "exfold", "path": "previous-exfold.safetensors"})
     run_config = {"prefetch": {"compensation": previous}, "model": {}, "data": {}}
     module = importlib.import_module(module_name)
@@ -77,9 +81,10 @@ def test_cli_loads_compensation_on_predictor_checkpoint(tmp_path, monkeypatch, m
     def install(*args, **kwargs):
         state = patch(*args, **kwargs)
         assert state.config.execution == "compensated"
-        if method == "exfold":
-            assert state.config.compensation == {"method": "exfold", "path": str(artifact)}
-            assert all(isinstance(module, ExFold) for module in state.compensators.values())
+        if method != "owa":
+            assert state.config.compensation == {"method": method, "path": str(artifact)}
+            expected = OptimalScale if method == "optimal_scale" else ExFold
+            assert all(isinstance(module, expected) for module in state.compensators.values())
         else:
             assert state.config.compensation == {"method": "owa", "alpha1": 2.0, "alpha2": 0.8,
                                                  "hit_min": 1, "hit_max": 1}
@@ -92,7 +97,7 @@ def test_cli_loads_compensation_on_predictor_checkpoint(tmp_path, monkeypatch, m
             "--execution-mode", "compensated", "--method", method]
     if module_name.endswith("evaluate_base"):
         argv += ["--sample-file", "unused"]
-    argv += (["--path", str(artifact)] if method == "exfold"
+    argv += (["--path", str(artifact)] if method != "owa"
              else ["--alpha1", "2", "--alpha2", "0.8", "--hit-min", "1", "--hit-max", "1"])
     monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(Patched):

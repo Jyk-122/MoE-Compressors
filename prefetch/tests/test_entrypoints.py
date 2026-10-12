@@ -7,10 +7,12 @@ import pytest
 
 @pytest.mark.parametrize("name", [
     "prefetch.datasets.prepare",
+    "prefetch.datasets.prepare_calibration",
     "prefetch.backbone.export_nf4",
     "prefetch.training.train",
     "prefetch.compensation.owa.calibrate",
     "prefetch.compensation.exfold.calibrate",
+    "prefetch.compensation.optimal_scale.calibrate",
     "prefetch.evaluation.evaluate",
     "prefetch.evaluation.evaluate_base",
     "prefetch.evaluation.plot",

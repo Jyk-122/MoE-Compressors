@@ -6,7 +6,7 @@ from prefetch.prerouter.checkpoint import read_metadata
 
 def add_compensation_arguments(parser):
     group = parser.add_argument_group("compensation (used with --execution-mode compensated)")
-    group.add_argument("--method", choices=["owa", "exfold"], help="Compensation method")
+    group.add_argument("--method", choices=["owa", "exfold", "optimal_scale"], help="Compensation method")
     group.add_argument("--path", help="Calibrated compensation safetensors file")
     group.add_argument("--alpha1", type=float, help="OWA overlap weight multiplier")
     group.add_argument("--alpha2", type=float, help="OWA total weight multiplier")

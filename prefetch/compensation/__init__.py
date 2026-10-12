@@ -2,5 +2,6 @@
 
 from .exfold import ExFold
 from .owa import OWA
+from .optimal_scale import OptimalScale
 
-__all__ = ["OWA", "ExFold"]
+__all__ = ["OWA", "ExFold", "OptimalScale"]

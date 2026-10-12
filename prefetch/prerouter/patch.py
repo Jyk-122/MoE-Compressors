@@ -14,6 +14,7 @@ from prefetch.prerouter.configuration import PrefetchConfig
 from prefetch.backbone.structure import find_moe_blocks
 from prefetch.prerouter.routing import select_experts
 from prefetch.prerouter.state import PrerouterState
+from prefetch.compensation.optimal_scale import OptimalScale
 
 
 def produce_prediction(block, hidden_states):
@@ -60,6 +61,7 @@ def moe_forward(self, hidden_states):
             produce_prediction(self, hidden_states)
 
     topk_indices, topk_weights = original_route
+    output_compensator = None
     execution = state.config.execution
     if (state.active and index in state.predictions and
             (execution != "native" or state.route_observer is not None)):
@@ -79,11 +81,20 @@ def moe_forward(self, hidden_states):
         if execution != "native":
             indices, weights = predicted
             if execution == "compensated":
-                weights = state.compensators[index](*native, indices, weights)
+                compensator = state.compensators[index]
+                if isinstance(compensator, OptimalScale):
+                    if rows.numel():
+                        output_compensator = compensator
+                else:
+                    weights = compensator(*native, indices, weights)
             topk_indices, topk_weights = topk_indices.clone(), topk_weights.clone()
             topk_indices[rows], topk_weights[rows] = indices, weights
-    output = self.experts(hidden_states.view(-1, hidden_states.shape[-1]),
-                          topk_indices, topk_weights).view_as(hidden_states)
+    hidden = hidden_states.view(-1, hidden_states.shape[-1])
+    if output_compensator is None:
+        output = self.experts(hidden, topk_indices, topk_weights)
+    else:
+        output = output_compensator(self.experts, hidden, topk_indices, topk_weights, rows)
+    output = output.view_as(hidden_states)
     return output + self.shared_experts(hidden_states)
 
 

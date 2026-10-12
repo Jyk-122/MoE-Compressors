@@ -18,13 +18,16 @@ def expert_outputs(block, hidden, indices):
 
 
 class CalibrationObserver:
-    def __init__(self, collector, chunk_size=32, max_tokens=512):
+    def __init__(self, collector, chunk_size=32, max_tokens=512, targets=None):
         self.collector = collector
         self.chunk_size, self.max_tokens = chunk_size, max_tokens
+        self.targets = None if targets is None else set(targets)
         self.tokens = defaultdict(int)
 
     @torch.no_grad()
     def __call__(self, target, block, hidden, native, predicted):
+        if self.targets is not None and target not in self.targets:
+            return
         stop = min(hidden.shape[0], self.max_tokens - self.tokens[target])
         for start in range(0, stop, self.chunk_size):
             end = min(start + self.chunk_size, stop)
@@ -44,9 +47,9 @@ def add_arguments(parser):
     parser.add_argument("--checkpoint", required=True, help="Trained prerouter checkpoint")
     parser.add_argument("--sample-file", required=True, help="Filtered calibration JSONL")
     parser.add_argument("--limit", type=int, default=128, help="Maximum calibration examples")
-    parser.add_argument("--max-tokens", type=int, default=512, help="Response tokens per target layer")
+    parser.add_argument("--max-tokens", type=int, default=512, help="Total response-token cap per layer across all examples")
     parser.add_argument("--chunk-size", type=int, default=32)
-    parser.add_argument("--output", help="Optional OWA / required ExFold safetensors artifact")
+    parser.add_argument("--output", help="Optional OWA / required ExFold and OptimalScale safetensors artifact")
 
 
 def load_calibration(args):
@@ -73,11 +76,12 @@ def load_calibration(args):
 
 
 @torch.no_grad()
-def collect(model, processor, state, config, device, args, collector):
+def collect(model, processor, state, config, device, args, collector, *, targets=None):
     from tqdm import tqdm
     from prefetch.datasets.dataset import to_device
     from prefetch.training.runtime import make_collator
-    observer = CalibrationObserver(collector, args.chunk_size, args.max_tokens)
+    targets = state.targets if targets is None else set(targets)
+    observer = CalibrationObserver(collector, args.chunk_size, args.max_tokens, targets)
     collate = make_collator(processor, config["data"])
     previous = state.route_observer
     state.route_observer = observer
@@ -90,11 +94,11 @@ def collect(model, processor, state, config, device, args, collector):
                 forward_kwargs = dict(config["model"].get("router_forward_kwargs") or {})
                 forward_kwargs["use_cache"] = False
                 model(**batch, **forward_kwargs)
-                if all(observer.tokens[target] >= args.max_tokens for target in state.targets):
+                if all(observer.tokens[target] >= args.max_tokens for target in targets):
                     break
     finally:
         state.route_observer = previous
         state.reset()
-    if any(observer.tokens[target] == 0 for target in state.targets):
+    if any(observer.tokens[target] == 0 for target in targets):
         raise ValueError("Calibration needs valid response tokens for every target layer")
     return dict(observer.tokens)

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .exfold import ExFold
 from .owa import OWA
+from .optimal_scale import OptimalScale
 
 
 def save_artifact(path, tensors, metadata):
@@ -44,17 +45,22 @@ def build_compensators(state):
             calibrated = dict(calibrated, alpha1=float(tensors["alpha"][0]),
                               alpha2=float(tensors["alpha"][1]))
         return {target: OWA(**dict(calibrated, **options)) for target in state.targets}
-    if method == "exfold":
+    if method in {"exfold", "optimal_scale"}:
         if not artifact:
-            raise ValueError("ExFold requires compensation.path to a calibrated safetensors file")
+            raise ValueError(f"{method} requires compensation.path to a calibrated safetensors file")
         if options:
-            raise ValueError(f"Unknown ExFold options: {sorted(options)}")
+            raise ValueError(f"Unknown {method} options: {sorted(options)}")
         result = {}
         for target in state.targets:
             block = state.blocks[target][1]
-            module = ExFold(tensors[f"{target}.coefficients"], tensors[f"{target}.loss"])
-            if module.coefficients.shape[0] != block.gate.weight.shape[0]:
-                raise ValueError("ExFold table size differs from target expert count")
+            if method == "optimal_scale":
+                module = OptimalScale(tensors[f"{target}.scale"])
+                if module.scale.shape != block.gate.weight.shape:
+                    raise ValueError("OptimalScale shape differs from target [experts, hidden]")
+            else:
+                module = ExFold(tensors[f"{target}.coefficients"], tensors[f"{target}.loss"])
+                if module.coefficients.shape[0] != block.gate.weight.shape[0]:
+                    raise ValueError("ExFold table size differs from target expert count")
             result[target] = module.to(block.gate.weight.device)
         return result
-    raise ValueError("Compensated execution requires method 'owa' or 'exfold'")
+    raise ValueError("Compensated execution requires method 'owa', 'exfold', or 'optimal_scale'")

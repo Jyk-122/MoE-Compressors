@@ -1,6 +1,6 @@
 # Prefetch 专家补偿
 
-prerouter 决定执行专家集合，当前真实 router 提供原生专家 ID 和权重，compensator 返回预取集合上的新权重。在线路径只执行一次最终 expert mixture，shared experts 保持原生计算。
+prerouter 决定执行专家集合，当前真实 router 提供路由分数。OWA/ExFold 调整预取集合上的权重，OptimalScale 在专家输出聚合前应用逐通道 scale。shared experts 保持原生计算。
 
 ## 目录结构
 
@@ -20,6 +20,10 @@ compensation/
 │   ├── __init__.py
 │   ├── compensate.py     # ExFold 查表与权重累加
 │   └── calibrate.py      # 专家对回归及 CLI
+├── optimal_scale/
+│   ├── __init__.py
+│   ├── compensate.py     # 专家输出通道缩放
+│   └── calibrate.py      # 逐层联合回归、保存 scale
 └── README.md
 ```
 
@@ -56,7 +60,7 @@ compensation:
 | --- | --- | --- |
 | native | 当前真实 router top-k | 原生 route 权重 |
 | predicted | prerouter top-k | 当前真实 gate 在预测 ID 上的分数，按 block 配置归一化和缩放 |
-| compensated | prerouter top-k | OWA 或 ExFold 的补偿权重 |
+| compensated | prerouter top-k | OWA/ExFold 补偿权重，或 predicted 权重配合 OptimalScale 通道缩放 |
 
 推理和评测统一通过 `--execution-mode native|predicted|compensated` 选择执行模式。优先级为命令行/Python 显式参数 > 传入配置 > checkpoint 保存值，默认使用 `native`。
 
@@ -74,16 +78,17 @@ state = patch(model, checkpoint="outputs/predictor",
 
 - `owa/compensate.py::OWA.forward`：重分配命中专家的权重。
 - `exfold/compensate.py::ExFold.forward`：查表，将漏选贡献累加到预取槽位。
+- `optimal_scale/compensate.py::OptimalScale.forward`：执行选中专家，逐通道缩放后聚合。
 - `../prerouter/patch.py::moe_forward`：选择模式、对齐 token、调用补偿、执行专家。
 
-统一接口：
+OWA/ExFold 的权重接口：
 
 ```python
 weights = compensator(native_ids, native_weights, predicted_ids, baseline_weights)
 # 输入和输出均为 [tokens, top_k]，输出槽位顺序与 predicted_ids 相同。
 ```
 
-`native_weights` 已包含原生 top-k 归一化和 routed scaling，补偿后直接交给 expert backend。新增算法可建立同名子文件夹，在 `compensate.py` 实现此接口、`calibrate.py` 编写校准逻辑，再在 `artifacts.py::build_compensators` 添加分支。当前参数由离线校准获得，prerouter 训练沿用现有损失。
+`native_weights` 已包含原生 top-k 归一化和 routed scaling，补偿后直接交给 expert backend。新增算法可建立同名子文件夹，在 `compensate.py` 实现此接口、`calibrate.py` 编写校准逻辑，再在 `artifacts.py::build_compensators` 添加分支。OptimalScale 使用输出接口 `compensator(experts, hidden, indices, weights, rows)`，其中 `rows` 指定需要通道缩放的 token 行。当前参数由离线校准获得，prerouter 训练沿用现有损失。
 
 ### OWA
 
@@ -112,11 +117,84 @@ weights = 原生命中专家的权重；其他预取槽位从 0 开始
 
 scatter_add 把贡献累加到唯一的预取 ID 槽位。系数可为负，结果直接使用；误取专家仅在被选为替代目标时获得贡献。若某个漏选源专家到整个 P 都没有有效校准记录，其贡献为零。表的覆盖率影响效果，应结合校准报告和 held-out NLL 判断。
 
+### OptimalScale
+
+每层保存 `scale[N,H]`，对预取专家的加权输出进行联合回归。记原生 routed 输出为 Y，predicted 权重为 b：
+
+```text
+V[t,e,h] = b[t,e] * E_e(x_t)[h]，e 属于当前预取集合；其余为 0
+Y[t,h]   = sum(e 属于原生 Top-K) g[t,e] * E_e(x_t)[h]
+output[t,h] = sum(e 属于预取集合) V[t,e,h] * S[e,h]
+```
+
+G[h] = V_hᵀ V_h、q[h] = V_hᵀ Y_h 保留专家间的交叉项。默认求解 `(G + ridge*I) S = q + ridge*1`，对应向 predicted 基线 S=1 正则化；`--ridge-center 0` 使用原始零中心 ridge。未观测的专家通道取 S=1，系数允许为负。S=1 对应 predicted 输出。
+
+在线按当前路由中的 active expert 分组，每组通过现有 backend 计算一次未加权输出，乘 S 和路由权重后累加。支持当前 BF16/NF4 接口；此路径使用逐专家调度，延迟需在实际 GPU 后端测量。生成 prefill 使用原生计算，decode 应用 S；teacher forcing 只缩放有效 response 行。全命中行也应用 S，与校准目标一致。
+
 ## 独立校准
 
-两个入口共用 `calibration.py` 的数据循环，要求训练好的 predictor checkpoint、原运行配置和过滤后的 JSONL。沿原生轨迹采集 response 输入上的专家输出，冻结 backbone 和 predictor，shared experts 不参与拟合。
+三个入口共用 `calibration.py` 的数据循环，要求训练好的 predictor checkpoint、原运行配置和过滤后的 JSONL。沿原生轨迹采集 response 输入上的专家输出，冻结 backbone 和 predictor，shared experts 不参与拟合。
 
-采集通过现有 expert backend 的标准接口获得未加权输出，适用于 BF16/NF4 相同调用接口。`--limit` 限制样本数，`--max-tokens` 限制每层 token 数，`--chunk-size` 控制暂存激活大小。默认 512 tokens/layer 适合检查流程，专家较多时应增大校准集并检查覆盖率。
+采集通过现有 expert backend 的标准接口获得未加权输出，适用于 BF16/NF4 相同调用接口。`--limit` 限制样本数，`--max-tokens` 是全部样本合计每层的 response token 上限，`--chunk-size` 控制暂存激活大小。OWA/ExFold 默认 512 tokens/layer，适合检查流程；OptimalScale 默认最多 32 条样本、65536 tokens/layer。实际 token 数写入校准报告。
+
+### 混合校准数据
+
+使用原 OptimalScale 的五种来源导出一个可直接作为 `--sample-file` 的 JSONL：
+
+| 来源 | 默认数量 | 内容 |
+| --- | ---: | --- |
+| SlimPajama | 32 | 文本分块，转换为前缀—续写 |
+| CodeAlpaca | 32 | 完整问答按上下文长度打包 |
+| CogVLM | 64 | 英文标注与对应图片 |
+| ChartQA | 32 | 问题、答案与对应图片 |
+| 中文 Alpaca | 32 | 完整中文问答按上下文长度打包 |
+
+```bash
+python -m prefetch.datasets.prepare_calibration \
+  --checkpoint prefetch/outputs/previous_token_20260925_133256/checkpoint-10000 \
+  --datasets-root /data1/jiangyikun/datasets \
+  --output /data/calib/mixed.jsonl
+```
+
+脚本读取 checkpoint 的运行配置，加载相同 processor，使用其中的 `data.max_length` 和 `data.max_image_side`，导出时完成与校准一致的图像处理、长度过滤和 assistant token 对齐校验。也可用 `--config path/to/run.yaml` 指定配置。实际模型权重在校准阶段加载。
+
+默认数据根目录下的相对路径为：
+
+```text
+slimpajama-200k/
+CodeAlpaca-20k/
+CogVLM-SFT-311K/CogVLM-SFT-311K/llava_instruction_single_conversation_formate/
+ChartQA/
+alpaca-data-gpt4-chinese/
+```
+
+CogVLM 的目录可通过 `--cog-root` 单独指定；其中包含 `images/` 和 `labels_en/`。ChartQA 默认使用 `test` split，与原脚本一致，也可指定 `--chart-split train`。
+
+导出结果：
+
+```text
+/data/calib/
+├── mixed.jsonl
+├── mixed.meta.json
+└── images/
+    └── <sample-id-hash>-0.png
+```
+
+每条记录包含 `id/source/group_id/messages/images`，以及 `num_tokens/assistant_text_tokens`。文字消息保持字符串，图文样本的 `images` 保存导出图片的绝对路径，纯文本样本为 `[]`。ChartQA 的 PIL 图片和 CogVLM 的文件图片都转换成 RGB PNG；移动数据目录后需更新图片路径或在目标目录重新导出。
+
+SlimPajama 的原始文本按 token 分块，以最多 64 个 token 为前缀，后续原文作为 assistant 续写；可用 `--text-prefix-tokens` 调整。原始文本由此符合当前 response-input 校准接口。CodeAlpaca 和中文 Alpaca 保留 instruction/input/output 内容并打包完整问答；图文样本分别保留配对关系。
+
+默认导出 192 条有效样本；超长样本会跳过并从同来源继续补足，来源耗尽时报告实际数量。可用 `--counts 32 32 64 32 32` 调整五种来源数量，0 表示停用对应来源。每个来源内部使用固定 seed 打乱，再按比例交错排列，前 32 条同样覆盖五种来源。
+
+校准命令可以直接替换为 `--sample-file /data/calib/mixed.jsonl`。现有 `--limit` 和 `--max-tokens` 继续生效；若要使用全部 192 条、且配置 `max_length=2048`，设置：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m prefetch.compensation.optimal_scale.calibrate \
+  --checkpoint prefetch/outputs/previous_token_20260925_133256/checkpoint-10000 \
+  --sample-file /data/calib/mixed.jsonl \
+  --limit 192 --max-tokens 393216 \
+  --output prefetch/outputs/optimal_scale.safetensors
+```
 
 ### OWA：输出参数或保存 safetensors
 
@@ -151,6 +229,34 @@ loss = (U - 2*c*D + c²*V) / U
 
 artifact 按目标 MoE ordinal 保存，记录层名、专家数、top-k、模型量化配置、LoRA、predictor 路径、采样方法和覆盖统计。加载时校验目标层映射及表尺寸。使用相同 backbone、量化、adapter 和 predictor 进行实验；更换它们后重新校准。
 
+### OptimalScale：逐层校准并保存 S
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m prefetch.compensation.optimal_scale.calibrate \
+  --checkpoint prefetch/outputs/previous_token_20260925_133256/checkpoint-10000 \
+  --sample-file prefetch/data/tulu/train.filtered.jsonl \
+  --limit 32 --max-tokens 65536 --chunk-size 32 \
+  --ridge 1e-4 --ridge-center 1 --channel-chunk-size 64 \
+  --output prefetch/outputs/optimal_scale.safetensors
+```
+
+模型只加载一次，每层重新遍历同一批校准数据，并只采集该层 G、q。完成一层后，将已完成层的 FP32 S 和元数据写入同一个 safetensors，释放该层统计量，再开始下一层。继续采集时使用原生模型轨迹。推理要求所有目标层的 scale 均已完成。
+
+统计时按每个 token 的 K 个预取专家累积 K² 个交叉项。`--channel-chunk-size` 控制统计和求解时的通道分块大小。N=384、H=2560 时，一层 CPU FP64 G 约 2.81 GiB，另外需要激活和求解临时内存；最终一层 FP32 S 为 3.75 MiB。文件只含各层 `<target_moe>.scale` 和元数据。
+
+校准日志及 artifact 的 `fit_metrics` 包含每层实际 token 数、观测专家数、predicted 和拟合后的 normalized MSE。它们是校准集上的局部输出误差；使用独立验证集检查 NLL 和任务精度。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m prefetch.examples.infer_prefetch_demo \
+  --checkpoint prefetch/outputs/previous_token_20260925_133256/checkpoint-10000 \
+  --prompt '请描述一下这张图。' --image prefetch/datasets/demo.jpg \
+  --execution-mode compensated \
+  --method optimal_scale --path prefetch/outputs/optimal_scale.safetensors \
+  --output prefetch/outputs/demo/optimal_scale.json
+```
+
+评测入口同样接受 `--method optimal_scale --path ...`。已有 predictor checkpoint 可以直接使用，scale 需使用相同基模、量化、adapter 和 predictor 校准。
+
 ## 加载与评测
 
 将 YAML 的补偿配置改为：
@@ -158,7 +264,7 @@ artifact 按目标 MoE ordinal 保存，记录层名、专家数、top-k、模�
 ```yaml
 execution_mode: compensated
 compensation:
-  method: exfold             # 或 owa
+  method: exfold             # owa / exfold / optimal_scale
   path: outputs/exfold.safetensors
 ```
 
@@ -172,7 +278,7 @@ python -m prefetch.evaluation.evaluate_base --config path/to/run.yaml --checkpoi
 
 `prefetch.examples.infer_prefetch_demo` 和 `prefetch.evaluation.evaluate` 同样支持 `--execution-mode`。用独立 held-out 数据比较 NLL/PPL，再比较生成质量；原生轨迹上的局部校准误差不能替代累积误差评测。
 
-当前 cache I/O trace 比较使用 native 执行轨迹。模块负责补偿权重，实际异步预取、offloading 调度和延迟收益需要在对应后端测量。完整模型 CUDA、NF4 和优化 expert kernel 路径需在部署环境验证，尤其是 ExFold 的有符号权重。
+当前 cache I/O trace 比较使用 native 执行轨迹。模块负责权重或专家输出补偿，实际异步预取、offloading 调度和延迟收益需要在对应后端测量。完整模型 CUDA、NF4 和优化 expert kernel 路径需在部署环境验证，尤其是 ExFold 的有符号权重。
 
 ## 参考
 
