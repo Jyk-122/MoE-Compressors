@@ -39,9 +39,10 @@ class Processor(ToyProcessor):
         return super().__call__(text, **kwargs)
 
 
-def test_raw_text_becomes_bounded_continuation_chunks():
+@pytest.mark.parametrize("column", ["text", "content"])
+def test_raw_text_becomes_bounded_continuation_chunks(column):
     processor = Processor()
-    rows = [{"text": "alpha beta gamma delta " * 15}, {"text": "more text " * 10}]
+    rows = [{column: "alpha beta gamma delta " * 15}, {column: "more text " * 10}]
     result = list(text_chunks(rows, processor, max_length=128, prefix_tokens=12))
     assert len(result) > 2
     for item in result:
@@ -51,6 +52,15 @@ def test_raw_text_becomes_bounded_continuation_chunks():
         batch = SFTCollator(processor, max_length=128)([item])
         assert batch["input_ids"].shape[1] <= 128
         assert batch["router_mask"].any()
+
+
+def test_raw_text_column_selection_and_empty_rows(caplog):
+    rows = [{"id": "metadata", "text": value} for value in (None, "", "  ", "actual body")]
+    with caplog.at_level("INFO"):
+        result = list(text_chunks(rows, Processor(), max_length=128, prefix_tokens=3))
+    assert len(result) == 1
+    assert result[0]["messages"] == conversation("Continue the following text:\nact", "ual body\n\n")
+    assert "SlimPajama text column: text" in caplog.text
 
 
 @pytest.mark.parametrize("source,suffix", [("codealpaca", ""), ("alpaca_zh", "_zh")])

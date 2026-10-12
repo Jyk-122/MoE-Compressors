@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 from pathlib import Path
 import random
 
@@ -18,6 +19,7 @@ from prefetch.datasets.prepare import cog_records
 
 SOURCES = ("slimpajama", "codealpaca", "cogvlm", "chartqa", "alpaca_zh")
 CONTINUATION_PROMPT = "Continue the following text:\n"
+logger = logging.getLogger(__name__)
 
 
 def record(source, index, messages, images=()):
@@ -41,6 +43,7 @@ def text_chunks(rows, processor, max_length, prefix_tokens=64):
     if chunk_size < 2:
         raise ValueError("max_length leaves no room for a text continuation")
     pending, index = [], 0
+    text_column = None
 
     def make_chunk(tokens, index):
         split = min(prefix_tokens, max(1, len(tokens) // 4))
@@ -49,9 +52,14 @@ def text_chunks(rows, processor, max_length, prefix_tokens=64):
         return record("slimpajama", index, conversation(CONTINUATION_PROMPT + prefix, answer))
 
     for item in rows:
-        text = item["text"]
-        if not text or not text.strip():
+        if text_column is None:
+            # Match the original OptimalScale loader's column selection.
+            text_column = "text" if "text" in item else next(iter(item))
+            logger.info("SlimPajama text column: %s; available columns: %s", text_column, list(item))
+        value = item[text_column]
+        if not value or not str(value).strip():
             continue
+        text = str(value)
         pending.extend(tokenizer.encode(text + "\n\n", add_special_tokens=False))
         while len(pending) >= chunk_size:
             yield make_chunk(pending[:chunk_size], index)
