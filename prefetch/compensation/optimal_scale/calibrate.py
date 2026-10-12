@@ -1,4 +1,4 @@
-"""Fit per-expert channel scales on prerouter routes, one MoE layer at a time."""
+"""Collect all MoE layers in one data pass, then solve per-expert channel scales."""
 from __future__ import annotations
 
 import argparse
@@ -79,24 +79,45 @@ class ScaleStats:
         return scale.T.float().contiguous(), report
 
 
+class OptimalScaleCalibration:
+    """Accumulate each target layer's normal equations during the same forward."""
+    sampling = "prefetch"
+
+    def __init__(self, shapes, channel_chunk_size=64):
+        self.shapes = shapes
+        self.channel_chunk_size = channel_chunk_size
+        self.stats = {}
+
+    def update(self, target, native, predicted, native_outputs, predicted_outputs):
+        if target not in self.stats:
+            self.stats[target] = ScaleStats(*self.shapes[target], self.channel_chunk_size)
+        self.stats[target].update(target, native, predicted, native_outputs, predicted_outputs)
+
+
 def calibrate_layers(model, processor, state, config, device, args, metadata):
-    """Save completed scales after each layer; only one layer owns G and q."""
+    """Collect once, then solve, save and release each layer's G and q."""
+    shapes = {row["target_moe"]: state.blocks[row["target_moe"]][1].gate.weight.shape
+              for row in state.layers}
+    stats_bytes = sum(hidden * experts * (experts + 1) * 8 for experts, hidden in shapes.values())
+    logger.info("OptimalScale: collecting %s layers in one data pass, up to %s response tokens/layer; "
+                "CPU FP64 G and q require %.2f GiB in total (plus temporary buffers)",
+                len(shapes), args.max_tokens, stats_bytes / 1024**3)
+    collector = OptimalScaleCalibration(shapes, args.channel_chunk_size)
+    tokens = collect(model, processor, state, config, device, args, collector)
+
     tensors, completed, counts, metrics = {}, [], {}, {}
     report = dict(metadata, method="optimal_scale", ridge=args.ridge,
                   ridge_center=args.ridge_center, sampling="prefetch",
-                  limit=args.limit, max_tokens=args.max_tokens)
+                  collection="single_pass", limit=args.limit, max_tokens=args.max_tokens)
     for row in state.layers:
         target = row["target_moe"]
-        experts, hidden = state.blocks[target][1].gate.weight.shape
-        logger.info("OptimalScale layer %s: collecting up to %s response tokens",
-                    target, args.max_tokens)
-        collector = ScaleStats(experts, hidden, args.channel_chunk_size)
-        tokens = collect(model, processor, state, config, device, args, collector, targets=[target])
-        scale, fitted = collector.solve(args.ridge, args.ridge_center)
-        del collector  # Release this layer's G and q before starting the next one.
+        logger.info("OptimalScale layer %s: solving", target)
+        stats = collector.stats.pop(target)
+        scale, fitted = stats.solve(args.ridge, args.ridge_center)
+        del stats  # Release this layer's G and q immediately after solving.
         tensors[f"{target}.scale"] = scale
         completed.append(row)
-        counts.update(tokens)
+        counts[target] = tokens[target]
         metrics[target] = fitted
         report.update(layers=list(completed), tokens=dict(counts), fit_metrics=dict(metrics))
         save_artifact(args.output, tensors, report)
@@ -112,7 +133,7 @@ def main():
     parser.add_argument("--ridge-center", type=float, choices=[0.0, 1.0], default=1.0,
                         help="Regularize toward 1 (predicted baseline) or 0 (original ridge)")
     parser.add_argument("--channel-chunk-size", type=int, default=64,
-                        help="Channels per statistics/solve chunk; G still covers one full layer")
+                        help="Channels per statistics/solve chunk; CPU G and q cover all target layers")
     args = parser.parse_args()
     if not args.output:
         parser.error("OptimalScale requires --output")

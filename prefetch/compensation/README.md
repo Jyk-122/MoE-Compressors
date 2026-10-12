@@ -23,7 +23,7 @@ compensation/
 ├── optimal_scale/
 │   ├── __init__.py
 │   ├── compensate.py     # 专家输出通道缩放
-│   └── calibrate.py      # 逐层联合回归、保存 scale
+│   └── calibrate.py      # 单次遍历采集各层统计量、求解 scale
 └── README.md
 ```
 
@@ -229,20 +229,20 @@ loss = (U - 2*c*D + c²*V) / U
 
 artifact 按目标 MoE ordinal 保存，记录层名、专家数、top-k、模型量化配置、LoRA、predictor 路径、采样方法和覆盖统计。加载时校验目标层映射及表尺寸。使用相同 backbone、量化、adapter 和 predictor 进行实验；更换它们后重新校准。
 
-### OptimalScale：逐层校准并保存 S
+### OptimalScale：单次遍历采集，逐层求解 S
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m prefetch.compensation.optimal_scale.calibrate \
   --checkpoint prefetch/outputs/previous_token_20260925_133256/checkpoint-10000 \
-  --sample-file prefetch/data/tulu/train.filtered.jsonl \
+  --sample-file /data/calib/mixed.jsonl \
   --limit 32 --max-tokens 65536 --chunk-size 32 \
   --ridge 1e-4 --ridge-center 1 --channel-chunk-size 64 \
   --output prefetch/outputs/optimal_scale.safetensors
 ```
 
-模型只加载一次，每层重新遍历同一批校准数据，并只采集该层 G、q。完成一层后，将已完成层的 FP32 S 和元数据写入同一个 safetensors，释放该层统计量，再开始下一层。继续采集时使用原生模型轨迹。推理要求所有目标层的 scale 均已完成。
+模型加载一次，校准数据遍历一次。每个样本沿原生模型轨迹前向时，各目标层分别累积 CPU FP64 G、q，当前分块的专家输出用完即释放。全部采集完成后，逐层 solve 得到 FP32 S，立即释放该层 G、q，并将已完成层的 scale 和元数据写入同一个 safetensors。推理要求所有目标层的 scale 均已完成。
 
-统计时按每个 token 的 K 个预取专家累积 K² 个交叉项。`--channel-chunk-size` 控制统计和求解时的通道分块大小。N=384、H=2560 时，一层 CPU FP64 G 约 2.81 GiB，另外需要激活和求解临时内存；最终一层 FP32 S 为 3.75 MiB。文件只含各层 `<target_moe>.scale` 和元数据。
+统计时按每个 token 的 K 个预取专家累积 K² 个交叉项。收集期间同时保留全部目标层的 G、q，其 CPU 内存为 `Σ层 8 × H × (N² + N)` 字节，与样本数无关。N=384、H=2560 时，每层约 2.82 GiB，35 个目标层合计约 98.69 GiB，另外需要激活和求解临时内存；程序会在采集前打印统计量内存估算。`--channel-chunk-size` 控制统计和求解时的通道分块及临时内存，G、q 仍覆盖全部通道。最终每层 FP32 S 为 3.75 MiB，文件只含各层 `<target_moe>.scale` 和元数据。
 
 校准日志及 artifact 的 `fit_metrics` 包含每层实际 token 数、观测专家数、predicted 和拟合后的 normalized MSE。它们是校准集上的局部输出误差；使用独立验证集检查 NLL 和任务精度。
 

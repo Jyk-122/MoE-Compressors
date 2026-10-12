@@ -1,4 +1,4 @@
-"""Joint regression, output scaling, and sequential layer calibration."""
+"""Joint regression, output scaling, and single-pass calibration."""
 import ast
 import json
 from pathlib import Path
@@ -190,7 +190,10 @@ def test_identity_scale_generation_matches_predicted_and_resets(mode, distance):
         handle.remove()
 
 
-def test_layer_calibration_releases_stats_and_saves_only_scales(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode,distance", ROUTING_CASES)
+@pytest.mark.parametrize("max_tokens", [3, 9])
+def test_single_pass_matches_separate_collection_and_releases_stats(
+        tmp_path, monkeypatch, mode, distance, max_tokens):
     import prefetch.compensation.optimal_scale.calibrate as calibration
     import prefetch.training.runtime as runtime
 
@@ -198,21 +201,48 @@ def test_layer_calibration_releases_stats_and_saves_only_scales(tmp_path, monkey
     model = ToyModel().eval().requires_grad_(False)
     ids = torch.tensor([[1, 3, 5]])
     original = model(ids).logits
-    state = patch(model, config(mode="previous_token", distance=0, targets=[1, 3]))
+    state = patch(model, config(mode=mode, distance=distance, targets=[2, 3]))
     samples = tmp_path / "samples.jsonl"
-    samples.write_text('{"ids": [1, 3, 5]}\n' * 2, encoding="utf-8")
+    samples.write_text('{"ids": [1, 3, 5]}\n' * 3, encoding="utf-8")
 
     def collate(records):
         return dict(input_ids=ids, labels=ids, router_mask=torch.ones_like(ids, dtype=torch.bool))
     monkeypatch.setattr(runtime, "make_collator", lambda *args: collate)
-    live = []
+    args = SimpleNamespace(chunk_size=1, max_tokens=max_tokens, limit=2, sample_file=samples,
+                           channel_chunk_size=2, ridge=1e-4, ridge_center=1.0,
+                           output=tmp_path / "scale.safetensors")
+    expected = {}
+    for target in (2, 3):
+        stats = ScaleStats(8, 6, args.channel_chunk_size)
+        calibration.collect(model, None, state, {"model": {}, "data": {}}, "cpu", args,
+                            stats, targets=[target])
+        expected[target] = stats.solve(args.ridge, args.ridge_center)
+    del stats
+
+    tokens_per_example = 3 if mode == "same_token" else 2
+    forward_count = min(args.limit, (max_tokens + tokens_per_example - 1) // tokens_per_example)
+    token_count = min(max_tokens, args.limit * tokens_per_example)
+    live, passes = [], []
     class TrackedStats(ScaleStats):
         def __init__(self, *args):
-            assert all(reference() is None for reference in live)
             super().__init__(*args)
             live.append(weakref.ref(self))
+
+        def solve(self, *args):
+            # All layers finish collection before the first solve.
+            assert len(passes) == forward_count
+            assert len(live) == 2
+            assert all(ref().tokens == token_count for ref in live if ref() is not None)
+            return super().solve(*args)
+
     monkeypatch.setattr(calibration, "ScaleStats", TrackedStats)
-    passes = []
+    collect_calls = []
+    real_collect = calibration.collect
+    def collect(*args, **kwargs):
+        collect_calls.append(1)
+        return real_collect(*args, **kwargs)
+    monkeypatch.setattr(calibration, "collect", collect)
+
     def check_native(module, args, output):
         torch.testing.assert_close(output.logits, original)
         passes.append(1)
@@ -221,33 +251,35 @@ def test_layer_calibration_releases_stats_and_saves_only_scales(tmp_path, monkey
     def save(path, tensors, report):
         assert all(key.endswith(".scale") for key in tensors)
         saved_layers.append([row["target_moe"] for row in report["layers"]])
+        assert sum(ref() is not None for ref in live) == 2 - len(saved_layers)
         save_artifact(path, tensors, report)
     monkeypatch.setattr(calibration, "save_artifact", save)
-    args = SimpleNamespace(chunk_size=1, max_tokens=4, limit=2, sample_file=samples,
-                           channel_chunk_size=2, ridge=1e-4, ridge_center=1.0,
-                           output=tmp_path / "scale.safetensors")
     report = calibrate_layers(model, None, state, {"model": {}, "data": {}}, "cpu", args,
                               {"layers": state.layers})
     handle.remove()
-    assert len(passes) == 4  # Two examples per layer, always on the native trajectory.
+    assert len(collect_calls) == 1
+    assert len(passes) == forward_count
     assert all(reference() is None for reference in live)
-    assert saved_layers == [[1], [1, 3]]
-    assert report["tokens"] == {1: 4, 3: 4}
-    for metrics in report["fit_metrics"].values():
-        assert metrics["normalized_mse"] <= metrics["baseline_normalized_mse"] + 1e-8
+    assert saved_layers == [[2], [2, 3]]
+    assert report["tokens"] == {2: token_count, 3: token_count}
+    assert report["collection"] == "single_pass"
     values, metadata = load_artifact(args.output)
-    assert set(values) == {"1.scale", "3.scale"}
+    assert set(values) == {"2.scale", "3.scale"}
+    for target, (scale, metrics) in expected.items():
+        torch.testing.assert_close(values[f"{target}.scale"], scale, rtol=0, atol=0)
+        assert report["fit_metrics"][target] == pytest.approx(metrics)
+        assert metrics["normalized_mse"] <= metrics["baseline_normalized_mse"] + 1e-8
     assert all(value.shape == (8, 6) and value.dtype == torch.float32 for value in values.values())
     assert state.route_observer is None and not state.compensators
     unpatch(model)
-    state = patch(model, config(targets=[1, 3]), execution_mode="compensated",
+    state = patch(model, config(targets=[2, 3]), execution_mode="compensated",
                   compensation={"method": "optimal_scale", "path": str(args.output)})
     for target, module in state.compensators.items():
         torch.testing.assert_close(module.scale, values[f"{target}.scale"])
     assert metadata["ridge_center"] == 1.0
 
 
-def test_calibration_cli_uses_layerwise_collection(tmp_path, monkeypatch, capsys):
+def test_calibration_cli_uses_single_pass_collection(tmp_path, monkeypatch, capsys):
     import sys
     import prefetch.compensation.optimal_scale.calibrate as calibration
     import prefetch.training.runtime as runtime
@@ -268,5 +300,6 @@ def test_calibration_cli_uses_layerwise_collection(tmp_path, monkeypatch, capsys
     report = json.loads(capsys.readouterr().out)
     assert report["method"] == "optimal_scale" and report["ridge_center"] == 0
     assert report["max_tokens"] == 65536
+    assert report["collection"] == "single_pass"
     assert report["tokens"] == {"3": 3}
     assert set(load_artifact(output)[0]) == {"3.scale"}

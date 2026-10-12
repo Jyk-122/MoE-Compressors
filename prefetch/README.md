@@ -381,7 +381,7 @@ python -m prefetch.examples.infer_prefetch_demo \
   --output prefetch/outputs/compensated_demo/metrics.json
 ~~~
 
-OptimalScale 可传入 `--method optimal_scale --path prefetch/outputs/optimal_scale.safetensors`，使用逐层校准的专家通道 scale。OWA 可传入 `--method owa --alpha1 1.0 --alpha2 0.9`，或通过 `--path` 加载校准结果。补偿实现和校准命令见 [compensation/README.md](compensation/README.md)。
+OptimalScale 可传入 `--method optimal_scale --path prefetch/outputs/optimal_scale.safetensors`，使用校准得到的专家通道 scale。OWA 可传入 `--method owa --alpha1 1.0 --alpha2 0.9`，或通过 `--path` 加载校准结果。补偿实现和校准命令见 [compensation/README.md](compensation/README.md)。
 
 准备好 ExFold 校准表后，可在同一验证集上比较三种模式：
 
