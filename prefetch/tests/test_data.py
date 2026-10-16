@@ -14,7 +14,7 @@ from prefetch.datasets.prepare import filter_records
 class ToyProcessor:
     tokenizer = SimpleNamespace(all_special_ids=[1, 2, 3, 4])
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kwargs):
         text = ""
         for message in messages:
             text += "U" if message["role"] == "user" else "A"

@@ -73,6 +73,30 @@ class MetricTests(unittest.TestCase):
         cache.loss().backward()
         self.assertGreater(logits.grad.abs().sum().item(), 0)
 
+    def test_temperature_loss_and_analytic_gradient(self):
+        teacher = torch.tensor([[[0.4, -0.1, 0.2, 0.0],
+                                 [-0.2, 0.3, 0.1, 0.4]]], requires_grad=True)
+        mask = torch.ones(1, 2, dtype=torch.bool)
+        for temperature in (1.0, 0.1):
+            with self.subTest(temperature=temperature):
+                logits = torch.tensor([[[0.1, 0.3, -0.2, 0.0],
+                                        [0.3, -0.1, 0.0, 0.2]]], requires_grad=True)
+                cache = RouterCache(1)
+                scores, indices = logits.softmax(-1).topk(2, dim=-1)
+                cache.save_prefetch(0, 0, logits, scores, indices, mask)
+                scores, indices = teacher.softmax(-1).topk(2, dim=-1)
+                cache.save_gt(0, 0, teacher, scores, indices, mask)
+
+                loss = cache.loss(temperature=temperature)
+                p = (teacher.detach() / temperature).softmax(-1)
+                q = (logits.detach() / temperature).softmax(-1)
+                expected_loss = (p * (p.log() - q.log())).sum(-1).mean()
+                torch.testing.assert_close(loss, expected_loss)
+                loss.backward()
+                # KL 对预测 logits 的梯度为 (q - p) / T，再按两个位置平均。
+                torch.testing.assert_close(logits.grad, (q - p) / (temperature * 2))
+                self.assertIsNone(teacher.grad)
+
     def test_evaluation_weights_samples_and_uses_no_grad(self):
         class Model(nn.Module):
             def __init__(self):

@@ -145,22 +145,23 @@ class GenerationTests(unittest.TestCase):
     def test_generation_config_and_length_options(self):
         model = tiny_generation_model()
         cache = patch(model, (0, 1))
+        default_capacity = cache.max_tokens
         config = GenerationConfig(max_length=9, max_new_tokens=2, pad_token_id=0)
         original_config = config.to_dict()
         output = model.generate(self.ids, config, max_new_tokens=4)
         self.assertEqual(output.shape[1], 9)
-        self.assertEqual(cache.max_tokens, 1024)
+        self.assertEqual(cache.max_tokens, default_capacity)
         self.assertEqual(config.to_dict(), original_config)
 
         config.max_new_tokens = None
         output = model.generate(self.ids, generation_config=config, max_length=7)
         self.assertEqual(output.shape[1], 7)
-        self.assertEqual(cache.max_tokens, 1024)
+        self.assertEqual(cache.max_tokens, default_capacity)
 
         model.generation_config.max_new_tokens = 2
         output = model.generate(self.ids)
         self.assertEqual(output.shape[1], 7)
-        self.assertEqual(cache.max_tokens, 1024)
+        self.assertEqual(cache.max_tokens, default_capacity)
 
     def test_native_stopping_and_streamer(self):
         model = tiny_generation_model()
@@ -234,6 +235,7 @@ class GenerationTests(unittest.TestCase):
     def test_training_batches_prepare_routes_and_keep_gradients(self):
         model = tiny_generation_model()
         cache = patch(model, (0, 1))
+        default_capacity = cache.max_tokens
         optimizer = torch.optim.SGD(
             [p for p in model.parameters() if p.requires_grad], lr=0.01)
 
@@ -254,7 +256,7 @@ class GenerationTests(unittest.TestCase):
 
         # 训练后的生成请求使用生成容量。
         model.generate(self.ids, max_new_tokens=2)
-        self.assertEqual(cache.max_tokens, 1024)
+        self.assertEqual(cache.max_tokens, default_capacity)
         self.assertEqual(cache.cache_gt[0].token_end, 6)
 
     def test_generation_from_existing_kv_prefix(self):

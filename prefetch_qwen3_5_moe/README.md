@@ -179,7 +179,7 @@ prefetch_logits, prefetch_scores, prefetch_indices = self.gate_prefetch(hidden.d
 3. 真实 gate 计算整段路由，调用一次 `cache.save_gt()`。
 4. 使用真实路由执行专家。
 
-完整 forward 后，训练通过 `cache.loss(router_mask=batch["router_mask"])` 计算 assistant 文本位置的损失。
+完整 forward 后，训练通过 `cache.loss(router_mask=batch["router_mask"], temperature=config["prefetch"]["temperature"])` 计算 assistant 文本位置的损失。
 
 训练和推理调用模型时设置 `output_router_logits=False`，两类路由分别从 RouterCache 读取。模型原有的 OutputRecorder 按 Router 类型收集输出；启用它会同时采集真实 gate 和 gate_prefetch。
 
@@ -196,13 +196,15 @@ teacher_logits = cache.cache_gt[layer_id].router_logits[:, 1:8]
 
 `cache.loss()` 对该层的整个有效区间计算 KL(真实分布 || 预测分布)，最后对所有有效的 batch/token/layer 位置取平均。源和目标都有效时才计入损失。传入 router_mask 时，还会根据绝对目标位置筛选 assistant 文本 token；提前 token 预测的源位置可以来自 prompt。
 
+真实和预测分布均使用 `softmax(router_logits / temperature)`。训练和验证读取 `prefetch.temperature`，示例配置为 `0.1`；直接调用 `cache.loss()` 时默认温度为 `1.0`。所得 KL 直接用于反向传播和日志。
+
 训练顺序为：
 
 ```python
 optimizer.zero_grad(set_to_none=True)
 # inputs 包含完整文本和图像输入；labels、router_mask 由训练入口单独处理。
 model(**inputs, use_cache=False, logits_to_keep=1, output_router_logits=False)
-loss = cache.loss(router_mask=batch["router_mask"])
+loss = cache.loss(router_mask=batch["router_mask"], temperature=config["prefetch"]["temperature"])
 loss.backward()
 optimizer.step()
 cache.clear()
@@ -263,6 +265,7 @@ python -m prefetch_qwen3_5_moe.train --config prefetch_qwen3_5_moe/configs/train
 | model.path / dtype | Qwen 模型路径和加载精度；设备由 Accelerate 分配 |
 | output_dir | 本次训练结果目录 |
 | prefetch.mode_prefetch / ks | 提前层数与 token 数、评估的专家预算 |
+| prefetch.temperature | 训练和验证计算 KL 使用的温度，必须为有限正数；示例值为 0.1 |
 | data.max_length / max_image_side | 完整序列长度上限、图像最长边上限 |
 | data.train | JSONL 训练数据源及 weight，可设置每个源的 limit |
 | data.train_limit | 数据源混合后的总样本数上限 |

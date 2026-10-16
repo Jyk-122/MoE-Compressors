@@ -4,6 +4,7 @@ from datetime import timedelta
 import json
 import math
 from pathlib import Path
+from time import monotonic
 
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import (DistributedDataParallelKwargs, GradientAccumulationPlugin,
@@ -29,6 +30,9 @@ def read_config(path):
             raise ValueError(f"training.{key} must be positive")
     if training["warmup_steps"] < 0 or training["weight_decay"] < 0:
         raise ValueError("warmup_steps and weight_decay must be nonnegative")
+    temperature = config["prefetch"]["temperature"]
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("prefetch.temperature must be finite and positive")
     if config["data"]["max_length"] <= 0:
         raise ValueError("data.max_length must be positive")
     if not config["data"]["train"]:
@@ -81,27 +85,35 @@ def infinite_batches(loader):
         yield from loader
 
 
-def forward_batch(model, batch):
+def format_duration(seconds):
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def forward_batch(model, batch, temperature=1.0):
     """完整上下文参与 forward，assistant 文本位置参与路由损失。"""
     inputs = dict(batch)
     router_mask = inputs.pop("router_mask")
     inputs.pop("labels", None)
     model(**inputs, use_cache=False, logits_to_keep=1, output_router_logits=False)
-    return model.router_cache.loss(router_mask=router_mask)
+    return model.router_cache.loss(router_mask=router_mask, temperature=temperature)
 
 
 class PrefetchTrainingModel(torch.nn.Module):
     """将路由 loss 作为 forward 的返回值，让 DDP 跟踪预测头的梯度。"""
-    def __init__(self, model):
+    def __init__(self, model, temperature=1.0):
         super().__init__()
         self.model = model
+        self.temperature = temperature
 
     def forward(self, batch):
-        return forward_batch(self.model, batch)
+        return forward_batch(self.model, batch, temperature=self.temperature)
 
 
 @torch.no_grad()
-def evaluate(model, validation_loaders, prefetch_k=(8, 12, 16, 32)):
+def evaluate(model, validation_loaders, prefetch_k=(8, 12, 16, 32), max_length=2048,
+             temperature=1.0):
     """分别评估各验证集；损失和命中数量都按有效 token-layer 位置加权。"""
     model.eval()
     cache = model.router_cache
@@ -116,13 +128,13 @@ def evaluate(model, validation_loaders, prefetch_k=(8, 12, 16, 32)):
         total_loss = 0.0
         for batch in loader:
             batch = to_device(batch, device)
-            loss = forward_batch(model, batch)
+            loss = forward_batch(model, batch, temperature=temperature)
             stats = cache.prefetch_hit_stats(prefetch_k, router_mask=batch["router_mask"])
             num_positions += stats["num_positions"]
             total_loss += loss.item() * stats["num_positions"]
             for k in total_hits:
                 total_hits[k] += stats["total_hits"][k]
-            cache.clear()
+            cache.clear(max_tokens=max_length)
 
         if num_positions == 0:
             raise ValueError(f"No matched valid routes in validation set {name}")
@@ -161,7 +173,7 @@ def train(model, train_loader, validation_loaders, config, accelerator):
         return 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
-    task = PrefetchTrainingModel(model)
+    task = PrefetchTrainingModel(model, temperature=config["prefetch"]["temperature"])
     task, optimizer, train_loader = accelerator.prepare(task, optimizer, train_loader)
     train_iterator = infinite_batches(train_loader)
     model = accelerator.unwrap_model(task).model
@@ -170,6 +182,7 @@ def train(model, train_loader, validation_loaders, config, accelerator):
     optimizer.zero_grad(set_to_none=True)
     step = 0
     totals = torch.zeros(2, device=accelerator.device, dtype=torch.float64)
+    started = monotonic()
 
     while step < max_steps:
         batch = next(train_iterator)
@@ -178,7 +191,7 @@ def train(model, train_loader, validation_loaders, config, accelerator):
             accelerator.backward(loss)  # Accelerate 自动除以梯度累积步数。
             totals[0] += loss.detach()
             totals[1] += 1
-            cache.clear()
+            cache.clear(max_tokens=config["data"]["max_length"])
 
             if not accelerator.sync_gradients:
                 continue
@@ -193,9 +206,15 @@ def train(model, train_loader, validation_loaders, config, accelerator):
         if step % training["log_every"] == 0 or step == max_steps:
             combined = accelerator.reduce(totals, reduction="sum")
             if accelerator.is_main_process:
+                router_kl = (combined[0] / combined[1]).item()
+                elapsed_seconds = monotonic() - started
+                remaining_seconds = elapsed_seconds / step * (max_steps - step)
                 entry = {
-                    "step": step, "router_kl": (combined[0] / combined[1]).item(),
+                    "step": step, "router_kl": router_kl,
                     "learning_rate": scheduler.get_last_lr()[0],
+                    "elapsed_seconds": round(elapsed_seconds, 3),
+                    "elapsed_time": format_duration(elapsed_seconds),
+                    "eta_time": format_duration(remaining_seconds),
                 }
                 print(json.dumps(entry), flush=True)
                 with (output / "train.jsonl").open("a", encoding="utf-8") as file:
@@ -205,7 +224,9 @@ def train(model, train_loader, validation_loaders, config, accelerator):
         if validation_loaders and (step % training["eval_every"] == 0 or step == max_steps):
             # 主进程评估完整验证集，其他进程在屏障处等待。
             if accelerator.is_main_process:
-                reports = evaluate(model, validation_loaders, config["prefetch"]["ks"])
+                reports = evaluate(model, validation_loaders, config["prefetch"]["ks"],
+                                   max_length=config["data"]["max_length"],
+                                   temperature=config["prefetch"]["temperature"])
                 print(json.dumps({"step": step, "validation": reports}), flush=True)
                 metrics_dir = output / "metrics"
                 metrics_dir.mkdir(exist_ok=True)

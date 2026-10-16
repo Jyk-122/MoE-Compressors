@@ -41,7 +41,10 @@ def multimodal_messages(messages, image_paths):
 
 
 def processor_call(processor, messages, images, generation=False):
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=generation)
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=generation,
+        enable_thinking=False, preserve_thinking=True,
+    )
     if not generation:
         text = text.removesuffix("<|message_start|>助手：</think>")
     kwargs = dict(text=[text], padding=False, return_tensors="pt")

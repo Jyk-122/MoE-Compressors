@@ -19,7 +19,7 @@ class RouterCache:
         self.num_hidden_layers = num_hidden_layers
         self.clear()
 
-    def clear(self, max_tokens=1024):
+    def clear(self, max_tokens=2048):
         """新 batch / 新请求开始时，指定可容纳的绝对 token 位置数。"""
         self.max_tokens = max_tokens
         self.cache_gt = [None] * self.num_hidden_layers
@@ -213,7 +213,7 @@ class RouterCache:
             "avg_hits": avg_hits,
         }
 
-    def loss(self, router_mask=None):
+    def loss(self, router_mask=None, temperature=1.0):
         """每层整段计算 KL，再对有效的 batch/token/layer 位置取平均。"""
         total_loss = None
         total_valid_tokens = 0
@@ -230,8 +230,8 @@ class RouterCache:
                 continue
 
             layer_loss = F.kl_div(
-                prediction_logits.log_softmax(dim=-1),
-                teacher_logits.log_softmax(dim=-1),
+                (prediction_logits / temperature).log_softmax(dim=-1),
+                (teacher_logits / temperature).log_softmax(dim=-1),
                 reduction="sum",
                 log_target=True,
             )

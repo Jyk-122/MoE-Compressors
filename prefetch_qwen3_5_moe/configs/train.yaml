@@ -8,6 +8,7 @@ model:
 
 prefetch:
   mode_prefetch: [1, 0]  # [提前层数, 提前 token 数]
+  temperature: 0.1     # 计算 KL 时，真实和预测 logits 都除以此值
   ks: [8, 12, 16, 32]
 
 data:

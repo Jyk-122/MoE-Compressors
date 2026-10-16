@@ -22,7 +22,7 @@ from .test_generation import tiny_generation_model
 class Processor:
     tokenizer = SimpleNamespace(all_special_ids=[1, 2, 3, 4])
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kwargs):
         text = ""
         for message in messages:
             if message["role"] == "user":
@@ -143,7 +143,11 @@ class TrainingTests(unittest.TestCase):
             original = {name: value.detach().clone() for name, value in model.named_parameters()}
             loader, validation = make_loaders(Processor(), config["data"])
             accelerator = make_accelerator(config["training"], cpu=True)
-            step = train(model, loader, validation, config, accelerator)
+            with mock_patch.object(model.router_cache, "loss", wraps=model.router_cache.loss) as loss:
+                step = train(model, loader, validation, config, accelerator)
+            self.assertEqual(loss.call_count, len(model.forward_calls))
+            for call in loss.call_args_list:
+                self.assertEqual(call.kwargs["temperature"], config["prefetch"]["temperature"])
             self.assertEqual(step, 3)
             # 每次更新累积两个样本，跨过数据末尾后继续累积。
             calls = model.forward_calls
@@ -217,6 +221,12 @@ class TrainingTests(unittest.TestCase):
                 invalid["training"]["max_steps"] = value
                 path.write_text(yaml.safe_dump(invalid), encoding="utf-8")
                 with self.subTest(max_steps=value), self.assertRaises(ValueError):
+                    read_config(path)
+            for value in (0, -1, float("nan"), float("inf")):
+                invalid = copy.deepcopy(config)
+                invalid["prefetch"]["temperature"] = value
+                path.write_text(yaml.safe_dump(invalid), encoding="utf-8")
+                with self.subTest(temperature=value), self.assertRaisesRegex(ValueError, "prefetch.temperature"):
                     read_config(path)
 
 
