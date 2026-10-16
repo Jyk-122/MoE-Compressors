@@ -1,0 +1,36 @@
+seed: 42
+output_dir: prefetch_qwen3_5_moe/outputs
+
+model:
+  path: /path/to/Qwen3.6/checkpoint
+  dtype: auto
+  attn_implementation: null
+
+prefetch:
+  mode_prefetch: [1, 0]  # [提前层数, 提前 token 数]
+  ks: [8, 12, 16, 32]
+
+data:
+  seed: 42
+  max_length: 2048
+  max_image_side: null
+  router_tokens: assistant
+  num_workers: 0
+  train_limit: null      # 数据源混合后的总样本数上限
+  train:
+    - {path: prefetch/data/cog/train.filtered.jsonl, weight: 0.5}
+    - {path: prefetch/data/tulu/train.filtered.jsonl, weight: 0.5}
+  validation:
+    vl: {path: prefetch/data/cog/validation.filtered.jsonl, limit: 128}
+    text: {path: prefetch/data/tulu/validation.filtered.jsonl, limit: 128}
+
+training:
+  max_steps: 10000       # optimizer 更新次数
+  gradient_accumulation: 4  # 每卡累积样本数；全局 batch = 卡数 × 此值
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  warmup_steps: 50
+  max_grad_norm: 1.0
+  log_every: 10
+  eval_every: 1000
+  save_every: 1000
