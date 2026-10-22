@@ -97,8 +97,8 @@ def wrap_generation(model):
     cache = model.router_cache
 
     @wraps(original_generate)
-    def generate(*args, **kwargs):
-        cache.clear()
+    def generate(*args, router_cache_max_tokens=2048, **kwargs):
+        cache.clear(max_tokens=router_cache_max_tokens)
         return original_generate(*args, **kwargs)
 
     @wraps(original_forward)

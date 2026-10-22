@@ -2,7 +2,7 @@ seed: 42
 output_dir: prefetch_qwen3_5_moe/outputs
 
 model:
-  path: /path/to/Qwen3.6/checkpoint
+  path: /data1/jiangyikun/models/Qwen3.6-35B-A3B
   dtype: auto
   attn_implementation: null
 

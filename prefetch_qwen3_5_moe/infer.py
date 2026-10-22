@@ -21,7 +21,7 @@ def main():
         args.model, dtype="auto", device_map=args.device)
     cache = load_prefetch(model, args.checkpoint)
     prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": args.prompt}], tokenize=False, add_generation_prompt=True)
+        [{"role": "user", "content": args.prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=False)
     inputs = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").to(
         model.get_input_embeddings().weight.device)
     eos_token_id = model.generation_config.eos_token_id

@@ -302,6 +302,47 @@ output_dir 内保存：
 - `checkpoint-N.safetensors`：按 save_every 保存的 gate_prefetch 权重。
 - `gate_prefetch.safetensors`：训练结束时的 gate_prefetch 权重。
 
+[test.py](test.py) 加载训练后的预测头，用 Transformers 原生 `generate(use_cache=True)` 生成回答，评估 decode 阶段的预取命中数量。从仓库根目录启动单卡测试：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash prefetch_qwen3_5_moe/test.sh
+```
+
+[test.sh](test.sh) 默认读取 `configs/train.yaml` 和 `outputs/gate_prefetch.safetensors`。可以指定训练时保存的配置、任意训练 checkpoint 和结果路径：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash prefetch_qwen3_5_moe/test.sh \
+    --config prefetch_qwen3_5_moe/outputs/run_config.yaml \
+    --checkpoint prefetch_qwen3_5_moe/outputs/checkpoint-1000.safetensors \
+    --max-new-tokens 128 \
+    --output prefetch_qwen3_5_moe/outputs/metrics/test-1000.json
+```
+
+测试优先读取 YAML 中的 `data.test`，未配置时读取 `data.validation`。两者均按名称设置 `path` 和可选的 `limit`；省略 `limit` 会评估整个数据集。独立测试集可这样配置：
+
+```yaml
+data:
+  # 保留 max_length、max_image_side 等数据处理参数。
+  test:
+    vl: {path: /path/to/vl-test.jsonl}
+    text: {path: /path/to/text-test.jsonl}
+```
+
+基础模型路径、精度和数据处理参数沿用 YAML，`mode_prefetch` 从 checkpoint 恢复。每条记录取第一条 assistant 消息之前的上下文作为 prompt，由模型生成第一轮回答；也支持仅含 prompt 的记录。图文数据保留图像输入，聊天模板使用 `enable_thinking=False` 和 `preserve_thinking=True`。生成采用 greedy decoding，每次处理一条记录，`--max-new-tokens` 默认 128。此入口中的 `data.max_length` 限制 processor 处理后的 prompt 长度，生成长度由 `--max-new-tokens` 单独控制。
+
+指标统计实际进入 decode forward 的所有生成 token，包含其中的特殊 token。目标位置从 prompt 末尾开始，按 RouterCache 中真实路由与预测路由的重合区间计数；提前 token 预测的源位置可以来自 prompt。最后采样出的 token 尚未执行 forward，例如生成 128 个 token 时，通常有 127 个 token 的 decode 路由可供评估。
+
+报告记录生成模式、checkpoint、预取模式、生成长度上限和 KL 温度，`datasets` 按名称保存各数据集结果：
+
+- `num_examples`：评估样本数。
+- `generated_tokens`：生成 token 总数。
+- `decode_tokens`：实际执行 decode forward 的 token 总数。
+- `num_positions`：预测与真值配对成功的 decode token-layer 位置数。
+- `avg_hits[k′]`：预取 k′ 个专家时平均命中的真实 top-k 专家数量，使用配置中的 `prefetch.ks`。
+- `loss`：相同 decode 位置的 KL，使用配置中的 `prefetch.temperature`。
+
+命中数量和 KL 均按有效 token-layer 位置数加权。若所有样本均在首次采样时结束，decode 位置数为 0，`avg_hits` 和 `loss` 的值为 `null`。结果同时打印到终端并保存到 `output_dir/metrics/test.json`，可通过 `--output` 指定路径。训练期间的验证使用数据集回答做 teacher forcing，用于跟踪训练目标；独立测试衡量模型自身生成序列上的预取效果，两者的输入分布不同。
+
 [infer.py](infer.py) 调用原生 model.generate，并通过同一个 RouterCache 方法统计 prefill 和 decode 的平均命中数量：
 
 ```bash
@@ -309,6 +350,8 @@ python -m prefetch_qwen3_5_moe.infer --model /path/to/model --checkpoint prefetc
 ```
 
 训练和推理使用相同的基础模型。新请求重置 RouterCache，KV cache 由原生 generate 管理。同一请求的 decode 持续追加路由。生成结束时，最后一个采样 token 尚未进入下一轮 forward，因此尚无对应的真实路由；查询时以记录的 token_end 为准。
+
+`model.generate(..., router_cache_max_tokens=N)` 为本次请求指定路由缓存容量，默认 2048。该参数由 wrapper 接收，用于 `cache.clear(max_tokens=N)`；生成参数传给 Transformers 原生方法。独立测试按 `prompt 长度 + max_new_tokens + 提前 token 数` 设置容量。
 
 当前程序验证预测路由及其读取。异步专家搬运可在源层 `save_prefetch()` 后发起，在目标层执行专家前检查完成状态。
 
@@ -327,6 +370,8 @@ python -m unittest discover -s prefetch_qwen3_5_moe/tests -t . -v
 [test_metrics.py](tests/test_metrics.py) 用可手算的排名验证各个 k′ 的命中数量、有效位置对齐和测试集加权，并检查统计后仍能正常反向传播。
 
 [test_training.py](tests/test_training.py) 验证 YAML 入口、实际 JSONL 混合、图文 collation、assistant 监督位置、梯度累积、分验证集报告及权重保存。测试使用小型模型和测试 processor；完整 Qwen 图文训练需在目标模型环境验证。
+
+[test_evaluation.py](tests/test_evaluation.py) 将更新后的预测头保存并重新加载，通过原生生成核对 decode 统计与生成序列的路由，覆盖文本、图像、测试集选择、样本上限、checkpoint 预测模式恢复、EOS 停止和长输入容量。
 
 [test_distributed_training.py](tests/test_distributed_training.py) 使用两个真实 CPU/Gloo 进程，检查数据分片、梯度同步、跨数据末尾累积和主进程评估保存，并与相同有效 batch 的单进程训练比较权重、学习率和指标。完整 Qwen 模型的多 GPU/NCCL 训练需在目标硬件上验证。
 
