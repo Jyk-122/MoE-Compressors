@@ -1,5 +1,6 @@
 """每层保存 [batch, max_tokens, ...] 张量，按 token 区间读写。"""
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn.functional as F
@@ -165,8 +166,16 @@ class RouterCache:
                 yield layer_id, prediction_range, teacher_range
 
     @torch.no_grad()
-    def prefetch_hit_stats(self, prefetch_k=(8, 12, 16, 32), router_mask=None):
-        """预测前 k' 个专家，统计命中真实 top-k 的总数和每个有效位置的平均数量。"""
+    def prefetch_hit_stats(self, prefetch_k=(8, 12, 16, 32), router_mask=None,
+                           mode="logits", lambda_=None, temperature=1.0):
+        """统计平均命中数量；指定 lambda_ 时，融合预测与同层上一 token 的真实路由。"""
+        if mode not in ("logits", "prob"):
+            raise ValueError("mode must be logits or prob")
+        if lambda_ is not None:
+            if not math.isfinite(lambda_) or not 0 <= lambda_ <= 1:
+                raise ValueError("lambda_ must be between 0 and 1")
+        if mode == "prob" and (not math.isfinite(temperature) or temperature <= 0):
+            raise ValueError("Fusion temperature must be finite and positive")
         total_hits = {}
         for k in prefetch_k:
             if type(k) is not int or k <= 0:
@@ -183,19 +192,51 @@ class RouterCache:
             if max_k > num_experts:
                 raise ValueError(f"prefetch_k={max_k} exceeds layer {layer_id}'s {num_experts} experts")
 
+            if lambda_ is not None:
+                # 目标 t 对齐同层真实路由 t-1；所有 lambda 使用同一组有效位置。
+                full_teacher = self.cache_gt[layer_id]
+                start = max(teacher.token_start, full_teacher.token_start + 1)
+                end = teacher.token_end
+                if start >= end:
+                    continue
+                prediction = self._slice_layer(self.cache_pre[layer_id], start, end)
+                teacher = self._slice_layer(full_teacher, start, end)
+                previous_token = self._slice_layer(full_teacher, start - 1, end - 1)
+
             # 源位置和目标位置都有效时，才计入统计。
             valid = prediction.valid_mask & teacher.valid_mask.to(device)
+            if lambda_ is not None:
+                valid = valid & previous_token.valid_mask.to(device)
             if router_mask is not None:
                 target_mask = router_mask[:, teacher.token_start:teacher.token_end]
                 valid = valid & target_mask.to(device=device, dtype=torch.bool)
             logits = prediction.router_logits[valid]
             if logits.shape[0] == 0:
                 continue
+            scores = logits
+            if lambda_ is not None:
+                layer_logits = logits.float()
+                token_logits = previous_token.router_logits.to(device)[valid].float()
+                # 两个端点直接按原始 logits 排名，保留完整的专家排序。
+                if lambda_ == 1:
+                    scores = layer_logits
+                elif lambda_ == 0:
+                    scores = token_logits
+                elif mode == "logits":
+                    scores = lambda_ * layer_logits + (1 - lambda_) * token_logits
+                else:
+                    # log(λ*p_layer + (1-λ)*p_token)：排名相同，同时避免小概率下溢。
+                    layer_log_probs = (layer_logits / temperature).log_softmax(dim=-1)
+                    token_log_probs = (token_logits / temperature).log_softmax(dim=-1)
+                    scores = torch.logaddexp(
+                        math.log(lambda_) + layer_log_probs,
+                        math.log1p(-lambda_) + token_log_probs,
+                    )
             expected = teacher.router_indices.to(device)[valid]
             num_positions += logits.shape[0]
 
             # 一次取最大的 k'，较小的 k' 直接使用排名前缀。
-            predicted = logits.topk(max_k, dim=-1, sorted=True).indices
+            predicted = scores.topk(max_k, dim=-1, sorted=True).indices
             matched = (predicted.unsqueeze(-1) == expected.unsqueeze(-2)).any(dim=-1)
             hits_at_each_rank = matched.sum(dim=0)
             hits_within_top_k = hits_at_each_rank.cumsum(dim=0).tolist()

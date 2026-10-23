@@ -235,6 +235,21 @@ print(stats["num_positions"])  # 参与统计的有效 batch/token/layer 位置�
 
 每层对最大的 k′ 执行一次 top-k，再累计各个排名前缀的命中数量。k′ 必须为正整数，且不超过该层专家总数。这个参数控制评估时选取多少个预测专家；模型仍按真实 Router 执行专家计算。
 
+`prefetch_hit_stats()` 支持将目标位置 `(layer_id, t)` 的 prerouter 预测与同层上一 token 的真实 router logits 融合：
+
+```python
+stats = cache.prefetch_hit_stats(
+    [8, 12, 16, 32], router_mask=decode_mask,
+    mode="prob", lambda_=0.5, temperature=1.0,
+)
+```
+
+- `mode="logits"`：`lambda_ * prediction_logits + (1 - lambda_) * previous_token_logits`。
+- `mode="prob"`：先分别计算 `softmax(logits / temperature)`，再按相同权重相加。实现使用对数概率计算混合分布的排名，保留很小概率的排序。
+- `lambda_` 是 prerouter 的权重；1 表示只用 prerouter，0 表示只用上一 token 的真实路由。省略此参数时统计原始 prerouter 预测。
+
+融合的各个 lambda 均要求预测、目标真值和上一 token 真值有效，并使用相同的位置作为分母。目标位置由 `router_mask` 筛选，历史来源可以是 prompt 的最后一个 token；缺少历史的位置会跳过。`temperature` 仅影响 `prob` 融合，默认 1.0；它与 KL 损失的温度分别设置。融合用于评估候选专家排名，缓存保留原始路由。
+
 ## 运行入口
 
 [train.sh](train.sh) 使用 YAML 配置启动训练。从仓库根目录运行：
@@ -343,6 +358,23 @@ data:
 
 命中数量和 KL 均按有效 token-layer 位置数加权。若所有样本均在首次采样时结束，decode 位置数为 0，`avg_hits` 和 `loss` 的值为 `null`。结果同时打印到终端并保存到 `output_dir/metrics/test.json`，可通过 `--output` 指定路径。训练期间的验证使用数据集回答做 teacher forcing，用于跟踪训练目标；独立测试衡量模型自身生成序列上的预取效果，两者的输入分布不同。
 
+使用 `--fusion-lambdas` 扫描融合权重。每条样本生成一次，在清空 RouterCache 前评估所有权重。原始 prerouter 的 `avg_hits` 和 `loss` 保留在数据集报告中，融合结果写入 `datasets.<name>.fusion.<lambda>`，包含 `num_positions` 和 `avg_hits`。
+
+```bash
+# 原始 logits 融合
+CUDA_VISIBLE_DEVICES=0 bash prefetch_qwen3_5_moe/test.sh \
+    --fusion-mode logits --fusion-lambdas 0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1 \
+    --output prefetch_qwen3_5_moe/outputs/metrics/fusion-logits.json
+
+# 概率融合，温度为 1
+CUDA_VISIBLE_DEVICES=0 bash prefetch_qwen3_5_moe/test.sh \
+    --fusion-mode prob --fusion-temperature 1 \
+    --fusion-lambdas 0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1 \
+    --output prefetch_qwen3_5_moe/outputs/metrics/fusion-prob.json
+```
+
+`--fusion-mode` 可选 `logits`（默认）或 `prob`；指定 `--fusion-lambdas` 时启用融合评估。报告顶层记录融合模式、lambda 列表和概率融合温度。融合实验可先在验证集选择参数，再通过 `data.test` 评估独立测试集。
+
 [infer.py](infer.py) 调用原生 model.generate，并通过同一个 RouterCache 方法统计 prefill 和 decode 的平均命中数量：
 
 ```bash
@@ -368,6 +400,8 @@ python -m unittest discover -s prefetch_qwen3_5_moe/tests -t . -v
 测试文件位于 `tests/`，以上命令从仓库根目录运行。CPU 测试使用参考文件中的实际 MoE 类。[test_prefetch.py](tests/test_prefetch.py) 覆盖整段写入、梯度、decode 衔接、容量和 checkpoint 恢复。[test_generation.py](tests/test_generation.py) 在随机初始化的小型 Llama 中使用这些 MoE block，通过 Transformers 原生 generate 验证生成结果、路由位置、padding、请求重置、停止回调和异常处理；测试本身需要安装 Transformers。完整 Qwen checkpoint 的 CUDA 运行需在对应环境中验证。
 
 [test_metrics.py](tests/test_metrics.py) 用可手算的排名验证各个 k′ 的命中数量、有效位置对齐和测试集加权，并检查统计后仍能正常反向传播。
+
+[test_fusion.py](tests/test_fusion.py) 核对 logits/prob 融合公式、温度、权重端点、小概率排名，以及上一 token 真值与目标位置的对齐。
 
 [test_training.py](tests/test_training.py) 验证 YAML 入口、实际 JSONL 混合、图文 collation、assistant 监督位置、梯度累积、分验证集报告及权重保存。测试使用小型模型和测试 processor；完整 Qwen 图文训练需在目标模型环境验证。
 

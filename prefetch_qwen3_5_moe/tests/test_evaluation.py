@@ -78,6 +78,11 @@ class EvaluationTests(unittest.TestCase):
                 }
                 argv = ["test", "--config", str(config_path), "--checkpoint", str(checkpoint),
                         "--device", "cpu", "--max-new-tokens", "4"]
+                fusion_mode = "logits"
+                if split == "validation":
+                    fusion_mode = "prob"
+                argv.extend(["--fusion-mode", fusion_mode, "--fusion-lambdas", "0", "0.5", "1",
+                             "--fusion-temperature", "0.7"])
                 output = Path(config["output_dir"]) / "metrics" / "test.json"
                 if split == "test":
                     output = directory / "reports" / "checkpoint-test.json"
@@ -90,6 +95,10 @@ class EvaluationTests(unittest.TestCase):
                 self.assertEqual(actual["scope"], "decode")
                 self.assertEqual(actual["mode_prefetch"], list(mode))
                 self.assertEqual(actual["max_new_tokens"], 4)
+                self.assertEqual(actual["fusion"]["mode"], fusion_mode)
+                self.assertEqual(actual["fusion"]["lambdas"], [0., 0.5, 1.])
+                if fusion_mode == "prob":
+                    self.assertEqual(actual["fusion"]["temperature"], 0.7)
                 self.assertEqual(restored.mode_prefetch, mode)
                 self.assertEqual(len(generated), 2)  # 每个数据集 limit=1。
                 for name, (inputs, ids) in zip(sorted(config["data"][split]), generated):
@@ -116,6 +125,15 @@ class EvaluationTests(unittest.TestCase):
                     self.assertEqual(report["num_positions"], 3 * (4 - mode[0]))
                     self.assertEqual(report["avg_hits"], json.loads(json.dumps(expected["avg_hits"])))
                     self.assertAlmostEqual(report["loss"], expected_loss.item(), places=5)
+                    for lambda_ in (0., 0.5, 1.):
+                        fusion = model.router_cache.prefetch_hit_stats(
+                            [1, 2, 4], router_mask=mask, mode=fusion_mode,
+                            lambda_=lambda_, temperature=0.7,
+                        )
+                        actual_fusion = report["fusion"][str(lambda_)]
+                        self.assertEqual(actual_fusion["num_positions"], 3 * (4 - mode[0]))
+                        self.assertEqual(actual_fusion["avg_hits"], json.loads(json.dumps(fusion["avg_hits"])))
+                    self.assertEqual(report["fusion"]["1.0"]["avg_hits"], report["avg_hits"])
                 self.assertEqual(len(restored.forward_calls), 8)
                 self.assertTrue(any(call["has_image"] for call in restored.forward_calls))
                 self.assertTrue(all(not call["grad_enabled"] for call in restored.forward_calls))
@@ -147,6 +165,7 @@ class EvaluationTests(unittest.TestCase):
         ]
         generate = model.generate
         sample_stats = []
+        fusion_sample_stats = []
 
         def generate_until_eos(**kwargs):
             prompt_length = kwargs["input_ids"].shape[1]
@@ -165,28 +184,39 @@ class EvaluationTests(unittest.TestCase):
 
         def record_stats(*args, **kwargs):
             stats = hit_stats(*args, **kwargs)
-            sample_stats.append(stats)
+            if kwargs.get("lambda_") is None:
+                sample_stats.append(stats)
+            else:
+                fusion_sample_stats.append(stats)
             return stats
 
         with mock_patch.object(model, "generate", side_effect=generate_until_eos), \
                 mock_patch.object(cache, "prefetch_hit_stats", side_effect=record_stats):
-            report = evaluate_generation(model, Processor(), records, [1, 2, 4], max_new_tokens=8)
+            report = evaluate_generation(model, Processor(), records, [1, 2, 4], max_new_tokens=8,
+                                         fusion_mode="prob", fusion_lambdas=[0.5])
         self.assertEqual(report["generated_tokens"], 6)
         self.assertEqual(report["decode_tokens"], 4)
         self.assertEqual([stats["num_positions"] for stats in sample_stats], [4, 12])
         self.assertEqual(report["num_positions"], 16)
         for k in (1, 2, 4):
             self.assertEqual(report["avg_hits"][k], sum(s["total_hits"][k] for s in sample_stats) / 16)
+            self.assertEqual(report["fusion"][0.5]["avg_hits"][k],
+                             sum(s["total_hits"][k] for s in fusion_sample_stats) / 16)
+        self.assertEqual(report["fusion"][0.5]["num_positions"], 16)
 
         # 首次采样即 EOS 时，只有 prefill 路由，decode 指标为 null。
         with mock_patch.object(model, "generate", side_effect=lambda **kwargs: generate(
                 **kwargs, eos_token_id=3, prefix_allowed_tokens_fn=lambda batch_id, ids: [3])):
-            report = evaluate_generation(model, Processor(), records[:1], [1, 2, 4], max_new_tokens=8)
+            report = evaluate_generation(model, Processor(), records[:1], [1, 2, 4], max_new_tokens=8,
+                                         fusion_mode="prob", fusion_lambdas=[0., 0.5, 1.])
         self.assertEqual(report["generated_tokens"], 1)
         self.assertEqual(report["decode_tokens"], 0)
         self.assertEqual(report["num_positions"], 0)
         self.assertIsNone(report["loss"])
         self.assertEqual(report["avg_hits"], {1: None, 2: None, 4: None})
+        for fusion in report["fusion"].values():
+            self.assertEqual(fusion["num_positions"], 0)
+            self.assertEqual(fusion["avg_hits"], {1: None, 2: None, 4: None})
 
     def test_long_prompt_capacity_and_length_limit(self):
         model = generation_model()

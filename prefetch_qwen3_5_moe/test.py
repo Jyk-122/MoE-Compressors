@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+from tqdm import tqdm
 
 from accelerate.utils import set_seed
 import torch
@@ -34,7 +35,8 @@ def generation_inputs(processor, example, max_image_side=None):
 @torch.no_grad()
 def evaluate_generation(model, processor, records, prefetch_k=(8, 12, 16, 32),
                         max_length=2048, max_new_tokens=128, max_image_side=None,
-                        temperature=1.0):
+                        temperature=1.0, fusion_mode="logits", fusion_lambdas=(),
+                        fusion_temperature=1.0):
     """逐条生成，只累计实际进入 decode forward 的目标 token 路由。"""
     model.eval()
     device = model.get_input_embeddings().weight.device
@@ -45,8 +47,13 @@ def evaluate_generation(model, processor, records, prefetch_k=(8, 12, 16, 32),
     num_examples = 0
     generated_tokens = 0
     decode_tokens = 0
+    fusion_hits = {}
+    fusion_positions = {}
+    for lambda_ in fusion_lambdas:
+        fusion_hits[lambda_] = {k: 0 for k in prefetch_k}
+        fusion_positions[lambda_] = 0
 
-    for example in records:
+    for example in tqdm(records):
         inputs = generation_inputs(processor, example, max_image_side)
         prompt_length = inputs["input_ids"].shape[1]
         if prompt_length > max_length:
@@ -72,6 +79,16 @@ def evaluate_generation(model, processor, records, prefetch_k=(8, 12, 16, 32),
         num_positions += positions
         for k in total_hits:
             total_hits[k] += stats["total_hits"][k]
+
+        # 同一次生成的缓存可用于比较全部 lambda。
+        for lambda_ in fusion_hits:
+            fusion_stats = cache.prefetch_hit_stats(
+                prefetch_k, router_mask=router_mask, mode=fusion_mode,
+                lambda_=lambda_, temperature=fusion_temperature,
+            )
+            fusion_positions[lambda_] += fusion_stats["num_positions"]
+            for k in fusion_hits[lambda_]:
+                fusion_hits[lambda_][k] += fusion_stats["total_hits"][k]
         num_examples += 1
         generated_tokens += output_ids.shape[1] - prompt_length
         # 最后采样出的 token 尚未执行 forward，以 cache 的真实终点为准。
@@ -86,7 +103,7 @@ def evaluate_generation(model, processor, records, prefetch_k=(8, 12, 16, 32),
         loss = total_loss / num_positions
         for k in total_hits:
             avg_hits[k] = total_hits[k] / num_positions
-    return {
+    report = {
         "num_examples": num_examples,
         "generated_tokens": generated_tokens,
         "decode_tokens": decode_tokens,
@@ -94,6 +111,16 @@ def evaluate_generation(model, processor, records, prefetch_k=(8, 12, 16, 32),
         "num_positions": num_positions,
         "avg_hits": avg_hits,
     }
+    if fusion_hits:
+        report["fusion"] = {}
+        for lambda_ in fusion_hits:
+            positions = fusion_positions[lambda_]
+            avg_hits = {k: None for k in prefetch_k}
+            if positions > 0:
+                for k in prefetch_k:
+                    avg_hits[k] = fusion_hits[lambda_][k] / positions
+            report["fusion"][lambda_] = {"num_positions": positions, "avg_hits": avg_hits}
+    return report
 
 
 def main():
@@ -102,6 +129,11 @@ def main():
     parser.add_argument("--checkpoint", required=True, help="Trained gate_prefetch .safetensors file")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--fusion-mode", choices=["logits", "prob"], default="logits")
+    parser.add_argument("--fusion-lambdas", type=float, nargs="+", default=[],
+                        help="Evaluate these layer-prediction weights against previous-token true routes")
+    parser.add_argument("--fusion-temperature", type=float, default=1.0,
+                        help="Softmax temperature for prob fusion; separate from the KL temperature")
     parser.add_argument("--output", help="JSON report path; defaults to output_dir/metrics/test.json")
     args = parser.parse_args()
 
@@ -115,6 +147,12 @@ def main():
         raise ValueError("data.max_length must be positive")
     if args.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be positive")
+    for lambda_ in args.fusion_lambdas:
+        if not math.isfinite(lambda_) or not 0 <= lambda_ <= 1:
+            raise ValueError("--fusion-lambdas must be between 0 and 1")
+    if args.fusion_mode == "prob":
+        if not math.isfinite(args.fusion_temperature) or args.fusion_temperature <= 0:
+            raise ValueError("--fusion-temperature must be finite and positive")
     split = "test"
     if split not in data:
         split = "validation"
@@ -146,6 +184,8 @@ def main():
             model, processor, records, config["prefetch"]["ks"],
             max_length=data["max_length"], max_new_tokens=args.max_new_tokens,
             max_image_side=data.get("max_image_side"), temperature=temperature,
+            fusion_mode=args.fusion_mode, fusion_lambdas=args.fusion_lambdas,
+            fusion_temperature=args.fusion_temperature,
         )
         print(json.dumps({name: reports[name]}, ensure_ascii=False), flush=True)
     report = {
@@ -157,6 +197,13 @@ def main():
         "temperature": temperature,
         "datasets": reports,
     }
+    if args.fusion_lambdas:
+        report["fusion"] = {
+            "mode": args.fusion_mode,
+            "lambdas": args.fusion_lambdas,
+        }
+        if args.fusion_mode == "prob":
+            report["fusion"]["temperature"] = args.fusion_temperature
     output = Path(config["output_dir"]) / "metrics" / "test.json"
     if args.output:
         output = Path(args.output)
