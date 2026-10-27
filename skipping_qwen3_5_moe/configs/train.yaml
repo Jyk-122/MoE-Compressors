@@ -1,0 +1,42 @@
+seed: 42
+output_dir: skipping_qwen3_5_moe/outputs
+
+model:
+  path: /data1/jiangyikun/models/Qwen3.6-35B-A3B
+  dtype: auto
+  attn_implementation: null
+
+skipping:
+  threshold: 0.5
+
+calibration:
+  artifact: skipping_qwen3_5_moe/outputs/calibration.safetensors
+  epsilon: 0.00001
+
+data:
+  seed: 42
+  max_length: 2048
+  max_image_side: null
+  num_workers: 0
+  train_limit: null
+  calibration_limit: 64
+  train:
+    - {path: prefetch/data/cog/train.filtered.jsonl, weight: 0.5}
+    - {path: prefetch/data/tulu/train.filtered.jsonl, weight: 0.5}
+  validation:
+    vl: {path: prefetch/data/cog/validation.filtered.jsonl, limit: 128}
+    text: {path: prefetch/data/tulu/validation.filtered.jsonl, limit: 128}
+
+training:
+  max_steps: 10000
+  gradient_accumulation: 4
+  learning_rate: 0.001
+  weight_decay: 0.0
+  warmup_steps: 50
+  max_grad_norm: 1.0
+  feature_weight: 1.0
+  kl_weight: 1.0
+  temperature: 1.0
+  log_every: 10
+  eval_every: 1000
+  save_every: 1000
