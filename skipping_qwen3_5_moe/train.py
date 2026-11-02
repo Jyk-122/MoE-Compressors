@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import time
 
 import torch
 
@@ -15,6 +16,37 @@ from .config import read_config, load_model_and_processor
 from .losses import CompensationTrainingModel
 from .model import configure_activation_checkpointing, load_compensation, save_compensation
 from .routing import validate_threshold
+
+
+def log_json(value, indent=None, _level=0):
+    """Format log floats to six decimal places, preserving JSON numeric types."""
+    if isinstance(value, float) and math.isfinite(value):
+        return f"{value:.6f}"
+    if isinstance(value, dict):
+        opening, closing = "{", "}"
+        items = [f"{json.dumps(key)}: {log_json(item, indent, _level + 1)}"
+                 for key, item in value.items()]
+    elif isinstance(value, (list, tuple)):
+        opening, closing = "[", "]"
+        items = [log_json(item, indent, _level + 1) for item in value]
+    else:
+        return json.dumps(value)
+    if indent is None or not items:
+        return opening + ", ".join(items) + closing
+    padding = " " * (indent * (_level + 1))
+    return opening + "\n" + padding + (",\n" + padding).join(items) + "\n" + " " * (indent * _level) + closing
+
+
+def format_duration(seconds):
+    hours, remainder = divmod(max(0, int(seconds)), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def progress_times(start_time, step, total_steps):
+    elapsed = time.monotonic() - start_time
+    remaining = elapsed / step * max(0, total_steps - step)
+    return {"elapsed": format_duration(elapsed), "eta": format_duration(remaining)}
 
 
 def make_accelerator(training, cpu=False, expected_world_size=None):
@@ -103,8 +135,8 @@ def report_runtime(accelerator, model, task, output):
         report["cudnn_sdpa"] = torch.backends.cuda.cudnn_sdp_enabled()
     output.mkdir(parents=True, exist_ok=True)
     (output / f"runtime-rank-{accelerator.process_index}.json").write_text(
-        json.dumps(report, indent=2), encoding="utf-8")
-    print(json.dumps(report), flush=True)
+        log_json(report, indent=2), encoding="utf-8")
+    print(log_json(report), flush=True)
 
 
 @torch.no_grad()
@@ -154,6 +186,7 @@ def train(model, loader, validation, config, accelerator):
     report_runtime(accelerator, raw_task.model, task, output)
     if accelerator.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(accelerator.device)
+    start_time = time.monotonic()
     iterator = iter(loader)
     optimizer.zero_grad(set_to_none=True)
     total = torch.zeros(8, device=accelerator.device, dtype=torch.float64)
@@ -177,8 +210,8 @@ def train(model, loader, validation, config, accelerator):
                           "device": str(accelerator.device), "input_shape": list(batch["input_ids"].shape),
                           "error": str(error), "cuda_memory_gib": cuda_memory(accelerator.device)}
                 (output / f"error-rank-{accelerator.process_index}.json").write_text(
-                    json.dumps(report, indent=2), encoding="utf-8")
-                print(json.dumps(report), flush=True)
+                    log_json(report, indent=2), encoding="utf-8")
+                print(log_json(report), flush=True)
                 raise
             finally:
                 raw_task.model.skipping_controller.feature_terms.clear()
@@ -199,14 +232,16 @@ def train(model, loader, validation, config, accelerator):
                 values = accelerator.gather(values).reshape(-1, len(memory)).max(0).values.tolist()
                 memory = dict(zip(memory, values))
             if accelerator.is_main_process:
-                report = {"step": step, "threshold": config["skipping"]["threshold"],
+                report = {"step": step, **progress_times(start_time, step, steps),
+                          "threshold": config["skipping"]["threshold"],
                           "learning_rate": scheduler.get_last_lr()[0], "world_size": accelerator.num_processes,
                           **metric_report(combined, options)}
                 if memory:
                     report["cuda_memory_gib_max"] = memory
-                print(json.dumps(report), flush=True)
+                text = log_json(report)
+                print(text, flush=True)
                 with (output / "train.jsonl").open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps(report) + "\n")
+                    stream.write(text + "\n")
             total.zero_()
             if memory:
                 torch.cuda.reset_peak_memory_stats(accelerator.device)
@@ -214,8 +249,9 @@ def train(model, loader, validation, config, accelerator):
             if accelerator.is_main_process:
                 report = evaluate(raw_task, validation)
                 (output / "metrics").mkdir(exist_ok=True)
-                (output / "metrics" / f"step-{step}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-                print(json.dumps({"step": step, "validation": report}), flush=True)
+                (output / "metrics" / f"step-{step}.json").write_text(log_json(report, indent=2), encoding="utf-8")
+                print(log_json({"step": step, **progress_times(start_time, step, steps),
+                                "validation": report}), flush=True)
             accelerator.wait_for_everyone()
         if step % options["save_every"] == 0:
             if accelerator.is_main_process:
@@ -237,7 +273,7 @@ def main():
     args = parser.parse_args()
     config = read_config(args.config)
     accelerator = make_accelerator(config["training"], expected_world_size=args.expected_world_size)
-    print(json.dumps({"event": "process_ready", "rank": accelerator.process_index,
+    print(log_json({"event": "process_ready", "rank": accelerator.process_index,
                       "local_rank": accelerator.local_process_index, "world_size": accelerator.num_processes,
                       "device": str(accelerator.device)}), flush=True)
     set_seed(config["seed"])

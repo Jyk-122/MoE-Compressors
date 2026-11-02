@@ -119,6 +119,8 @@ DDP 每卡保存完整模型与当前样本激活，并同步系数矩阵、均�
 
 脚本默认使用 `expandable_segments:True` 的 CUDA allocator 配置，适配不同序列长度的分配需求。`train.jsonl` 中的 `cuda_memory_gib_max` 记录各 rank 中最大的实际分配、缓存预留和区间分配峰值，单位为 GiB。
 
+训练进度日志中的 `elapsed` 记录训练循环开始后的累计用时，`eta` 按已完成优化步的平均耗时估算剩余训练时间，均使用 `HH:MM:SS` 格式，小时数可以超过 24。累计用时包含期间的验证和保存耗时。训练终端日志及 JSON 日志文件中的浮点数统一保留 6 位小数，保持 JSON 数值类型。
+
 输出目录包含：
 
 - `calibration.safetensors`：各专家的均值、标准差及样本数。
