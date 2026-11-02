@@ -1,10 +1,11 @@
+import copy
 import unittest
 
 import torch
 from torch.nn import functional as F
 
 from ..losses import CompensationTrainingModel, hidden_kl, prediction_mask
-from ..model import patch
+from ..model import configure_activation_checkpointing, patch
 from .helpers import TinyModel, calibration_for, batch
 
 
@@ -108,6 +109,69 @@ class TrainingTests(unittest.TestCase):
             if threshold == 1:
                 self.assertLess(result["feature_loss"].item(), 1e-10)
                 self.assertLess(result["kl_loss"].abs().item(), 1e-6)
+
+    def test_activation_checkpointing_preserves_losses_gradients_and_counts(self):
+        template = TinyModel()
+        calibration = calibration_for(template)
+        results = []
+        for enabled in (False, True):
+            model = copy.deepcopy(template)
+            runtime = patch(model, calibration)
+            configure_activation_checkpointing(model, enabled)
+            parameter_storage = {p.storage().data_ptr() for p in model.parameters()}
+            saved = {}
+
+            def pack(tensor):
+                storage = tensor.storage()
+                if storage.data_ptr() not in parameter_storage:
+                    saved[storage.data_ptr()] = storage.size() * tensor.element_size()
+                return tensor
+
+            with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+                result = CompensationTrainingModel(model, threshold=0.65)(batch())
+            counts = {index: value.clone() for index, value in runtime.statistics.items()}
+            self.assertEqual(runtime.feature_terms, {})
+            runtime.threshold = 0.9
+            result["loss"].backward()
+            self.assertEqual(runtime.feature_terms, {})
+            for index, value in counts.items():
+                torch.testing.assert_close(runtime.statistics[index], value)
+            gradients = {name: p.grad.clone() for name, p in model.named_parameters() if p.requires_grad}
+            results.append((result, gradients, sum(saved.values())))
+        for name in ("loss", "feature_loss", "kl_loss", "counts"):
+            torch.testing.assert_close(results[0][0][name], results[1][0][name])
+        for name in results[0][1]:
+            torch.testing.assert_close(results[0][1][name], results[1][1][name])
+        self.assertLess(results[1][2], results[0][2])
+
+    def test_attention_checkpointing_preserves_kwargs_and_tuple_outputs(self):
+        class Attention(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def forward(self, *, hidden_states, position_embeddings):
+                self.calls += 1
+                cosine, sine = position_embeddings
+                return (hidden_states * cosine + sine).sin().square(), None
+
+        model = TinyModel()
+        runtime = patch(model, calibration_for(model))
+        attention = Attention()
+        model.model.layers[0].self_attn = attention
+        hidden = torch.randn(2, 5, 6, requires_grad=True)
+        positions = (torch.randn_like(hidden), torch.randn_like(hidden))
+        expected = attention(hidden_states=hidden, position_embeddings=positions)[0]
+        expected_grad = torch.autograd.grad(expected.sum(), hidden)[0]
+        attention.calls = 0
+        configure_activation_checkpointing(model)
+        with runtime.context(mode="reconstruction"):
+            actual, weights = attention(hidden_states=hidden, position_embeddings=positions)
+        actual_grad = torch.autograd.grad(actual.sum(), hidden)[0]
+        self.assertIsNone(weights)
+        self.assertEqual(attention.calls, 2)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, expected_grad)
 
 
 if __name__ == "__main__":

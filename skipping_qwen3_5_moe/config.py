@@ -14,6 +14,8 @@ def read_config(path):
         config = yaml.safe_load(stream)
     validate_threshold(config["skipping"]["threshold"])
     training = config["training"]
+    if type(training.get("activation_checkpointing", True)) is not bool:
+        raise ValueError("training.activation_checkpointing must be a boolean")
     for key in ("max_steps", "gradient_accumulation", "log_every", "eval_every", "save_every"):
         if type(training[key]) is not int or training[key] <= 0:
             raise ValueError(f"training.{key} must be a positive integer")
@@ -35,8 +37,15 @@ def read_config(path):
     return config
 
 
+def configure_attention():
+    """Use PyTorch SDPA's flash, efficient, or math kernels for attention."""
+    if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        torch.backends.cuda.enable_cudnn_sdp(False)
+
+
 def load_model_and_processor(config, device):
     from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
+    configure_attention()
     options = config["model"]
     dtype = options.get("dtype", "auto")
     if dtype != "auto":

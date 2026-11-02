@@ -71,7 +71,9 @@ kl_loss = T² * mean(valid_prediction, KL(softmax(z_teacher/T) || softmax(z_stud
 loss = feature_weight * feature_loss + kl_weight * kl_loss
 ```
 
-teacher 通过 `no_grad` 执行；student 的跨层激活保留计算图。LM head 对所有有效预测位置分别执行一次 teacher 和 student 投影，以 FP32 计算 log-softmax 和 KL，并对预测位置求平均。原生 backbone gradient checkpointing 应保持关闭，因为本实现按一次前向收集局部重建项。
+teacher 通过 `no_grad` 执行；student 保留跨层梯度。默认 `training.activation_checkpointing: true`，对注意力和 MoE 模块使用非重入激活检查点，在反向传播时重算内部激活。局部重建损失随 MoE 输出一同返回，统计在模块外收集一次。原生 backbone gradient checkpointing 保持关闭，由本目录管理训练重计算。
+
+LM head 对所有有效预测位置分别执行一次 teacher 和 student 投影，以 FP32 计算 log-softmax 和 KL，并对预测位置求平均。各模块仍按整批 token 计算。
 
 训练日志记录特征损失、KL、实际剪枝比例、平均保留数量及 `coefficient_positions`。后者统计同时存在缺失专家和至少两个保留专家的位置，这些位置可以训练系数矩阵。只保留一个专家时，替代系数恒为 1，补偿算子的均值和尺度仍参与训练；全部保留时，该层补偿参数的直接梯度为零。
 
@@ -80,6 +82,8 @@ teacher 通过 `no_grad` 执行；student 的跨层激活保留计算图。LM he
 ## 数据和运行
 
 在仓库根目录执行。环境需要支持 `Qwen3_5MoeForConditionalGeneration` 的 Transformers、PyTorch、Accelerate（`>=1.2,<2`）、safetensors、PyYAML、datasets 和 Pillow。完整模型使用原生浮点 packed expert 权重。
+
+默认以 BF16 加载模型，注意力使用 PyTorch SDPA 的 flash、efficient 或 math 后端。加载入口关闭 cuDNN SDPA 后端；其状态会记录在训练启动信息中。
 
 先修改 [configs/train.yaml](configs/train.yaml) 中的模型路径与数据路径。[data.py](data.py) 包含 JSONL 加载、多源混合、图文处理、assistant 标签对齐和设备搬运：
 
@@ -111,10 +115,16 @@ CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 bash skipping_qwen3_5_moe/train.sh
 
 DDP 每卡保存完整模型与当前样本激活，并同步系数矩阵、均值和对数标准差的梯度。有效 batch 为 `进程数 × gradient_accumulation`。显存预算需要包含主模型权重和 student 的反向激活。
 
+脚本通过当前 Python 的 `torch.distributed.run` 启动进程，可用 `PYTHON_BIN` 指定解释器。每个进程按 `LOCAL_RANK` 绑定 GPU，并校验请求的进程数。两卡启动时，`process_ready` 应分别显示 `rank=0, device=cuda:0` 和 `rank=1, device=cuda:1`，两者的 `world_size` 都为 2；模型准备完成后，`training_start` 中的 `ddp` 为 `true`。
+
+脚本默认使用 `expandable_segments:True` 的 CUDA allocator 配置，适配不同序列长度的分配需求。`train.jsonl` 中的 `cuda_memory_gib_max` 记录各 rank 中最大的实际分配、缓存预留和区间分配峰值，单位为 GiB。
+
 输出目录包含：
 
 - `calibration.safetensors`：各专家的均值、标准差及样本数。
 - `run_config.yaml`、`train.jsonl`：运行配置与训练指标。
+- `runtime-rank-N.json`：各进程的设备、DDP 状态、精度和依赖版本。
+- `error-rank-N.json`：出现运行时错误时的 step、输入形状和显存统计。
 - `metrics/step-N.json`：验证结果。
 - `checkpoint-N.safetensors`、`compensation.safetensors`：各层训练后的系数矩阵、均值与对数标准差；加载时使用同一个基础模型。
 
@@ -156,6 +166,6 @@ print(controller.summary())
 python -m unittest discover -s skipping_qwen3_5_moe/tests -t . -v
 ```
 
-CPU 测试覆盖校准统计量与参数初始化、并行补偿的输出和全部参数梯度、实际专家调用数、同输入局部目标、两项损失各自的跨层梯度、单专家保留时的补偿训练、完整补偿参数保存恢复、梯度累积、双进程 Gloo 与单进程更新一致性，以及原生 Transformers `generate` 的 prefill/decode 一致性。
+CPU 测试覆盖校准统计量与参数初始化、并行补偿的输出和全部参数梯度、实际专家调用数、同输入局部目标、两项损失各自的跨层梯度、激活重计算的数值等价性与保存张量量、单专家保留时的补偿训练、完整补偿参数保存恢复、梯度累积、不同长度样本的双进程 Gloo 与单进程更新一致性，以及原生 Transformers `generate` 的 prefill/decode 一致性。GPU rank 绑定和 SDPA 后端选择另有模拟测试。
 
 核心 MoE 测试使用 [tests/reference_moe.py](tests/reference_moe.py) 中的 Qwen MoE 参考类；生成测试将这些 MoE 类接入小型 Llama 因果模型。数据测试覆盖文本和图像样本、assistant 标签及多源加载。完整 Qwen3.6-35B-A3B 的 CUDA 训练、混合注意力缓存与实际延迟需要在目标模型和硬件环境验证。当前专家执行采用 PyTorch 分组调用；推理速度取决于专家 kernel、batch 大小与路由分布。

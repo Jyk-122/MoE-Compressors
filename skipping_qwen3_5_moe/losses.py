@@ -83,6 +83,7 @@ class CompensationTrainingModel(nn.Module):
                 if parameter.requires_grad:
                     loss = loss + parameter.sum().to(device) * 0
             counts = torch.stack([value.to(device) for value in runtime.statistics.values()]).sum(0)
+            runtime.feature_terms.clear()
             return {"loss": loss, "feature_loss": feature.detach(), "kl_loss": kl.detach(),
                     "counts": counts.detach(), "feature_positions": denominator.detach(),
                     "prediction_positions": prediction_mask(batch).sum().detach()}

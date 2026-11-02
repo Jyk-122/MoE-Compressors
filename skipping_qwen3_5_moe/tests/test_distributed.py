@@ -1,5 +1,6 @@
 """Two CPU/Gloo ranks compared with the same effective single-process batch."""
 import copy
+import json
 from datetime import timedelta
 import os
 from pathlib import Path
@@ -25,6 +26,8 @@ def examples():
     for index in range(4):
         sample = batch()
         sample["input_ids"] = (sample["input_ids"] + index) % 19
+        length = 4 + index % 2
+        sample = {name: tensor[:, :length] for name, tensor in sample.items()}
         samples.append(sample)
     return samples
 
@@ -78,6 +81,12 @@ class DistributedTests(unittest.TestCase):
                         process.terminate()
                     process.join(timeout=5)
             ranks = [torch.load(Path(directory) / f"rank-{rank}.pt", map_location="cpu") for rank in range(2)]
+            for rank in range(2):
+                report = json.loads((Path(config["output_dir"]) / f"runtime-rank-{rank}.json").read_text())
+                self.assertEqual(report["rank"], rank)
+                self.assertEqual(report["world_size"], 2)
+                self.assertTrue(report["ddp"])
+                self.assertTrue(report["activation_checkpointing"])
             for name in ranks[0]:
                 torch.testing.assert_close(ranks[0][name], ranks[1][name], rtol=0, atol=0)
             single = copy.deepcopy(config)

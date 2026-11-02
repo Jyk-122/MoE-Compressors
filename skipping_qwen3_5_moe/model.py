@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from functools import wraps
+from functools import partial, wraps
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .artifacts import read_artifact, save_artifact
 from .experts import selected_outputs
@@ -43,6 +44,7 @@ class SkippingController:
         self.statistics = {}
         self.generation_depth = 0
         self.blocks = []
+        self.activation_checkpointing = False
 
     @contextmanager
     def context(self, *, mode=None, threshold=None, attention_mask=None, loss_mask=None, reset=False):
@@ -97,23 +99,37 @@ class CompensatedMoE(nn.Module):
         runtime = self.controller
         if runtime.mode == "teacher":
             return self.original(hidden_states)
+        arguments = (hidden_states, runtime.mode, runtime.threshold, runtime.attention_mask, runtime.loss_mask)
+        if runtime.activation_checkpointing and torch.is_grad_enabled() and runtime.mode == "reconstruction":
+            output, feature_sum, feature_count, counts = checkpoint(self._compute, *arguments, use_reentrant=False)
+        else:
+            output, feature_sum, feature_count, counts = self._compute(*arguments)
+        if runtime.mode == "reconstruction":
+            runtime.feature_terms[self.layer_index] = (feature_sum, feature_count)
+        previous = runtime.statistics.get(self.layer_index)
+        runtime.statistics[self.layer_index] = counts.detach() if previous is None else previous + counts.detach()
+        return output
+
+    def _compute(self, hidden_states, mode, threshold, attention_mask, loss_mask):
+        """Return reconstruction terms explicitly so recomputation has no controller side effects."""
         batch, length, hidden_dim = hidden_states.shape
         hidden = hidden_states.reshape(-1, hidden_dim)
-        valid = self._mask(runtime.attention_mask, batch, length, hidden.device)
-        supervised = valid & self._mask(runtime.loss_mask, batch, length, hidden.device)
+        valid = self._mask(attention_mask, batch, length, hidden.device)
+        supervised = valid & self._mask(loss_mask, batch, length, hidden.device)
         _, weights, ids = self.original.gate(hidden)
-        keep = top_p_mask(weights, runtime.threshold)
+        keep = top_p_mask(weights, threshold)
         source_outputs = selected_outputs(self.original.experts, hidden, ids, keep)
         coefficients = self.coefficients(ids, keep)
         routed = self.operator.aggregate(source_outputs, ids, keep, weights, coefficients)
 
-        if runtime.mode == "reconstruction":
+        feature_sum = routed.new_zeros(())
+        if mode == "reconstruction":
             with torch.no_grad():
                 missing = selected_outputs(self.original.experts, hidden.detach(), ids, ~keep)
                 target = ((source_outputs.detach().float() + missing.float())
                           * weights.detach().float().unsqueeze(-1)).sum(1)
             error = (routed - target).square().mean(-1)
-            runtime.feature_terms[self.layer_index] = ((error * supervised).sum(), supervised.sum())
+            feature_sum = (error * supervised).sum()
 
         shared = self.original.shared_expert(hidden)
         shared = self.original.shared_expert_gate(hidden).sigmoid() * shared
@@ -121,9 +137,8 @@ class CompensatedMoE(nn.Module):
         counts = torch.stack(((number * valid).sum(), valid.sum() * ids.shape[1],
                               valid.sum(), ((number > 1) & (number < ids.shape[1]) & valid).sum()))
 
-        previous = runtime.statistics.get(self.layer_index)
-        runtime.statistics[self.layer_index] = counts.detach() if previous is None else previous + counts.detach()
-        return (routed.to(hidden.dtype) + shared).reshape(batch, length, hidden_dim)
+        output = (routed.to(hidden.dtype) + shared).reshape(batch, length, hidden_dim)
+        return output, feature_sum, supervised.sum(), counts
 
     @staticmethod
     def _mask(mask, batch, length, device):
@@ -197,6 +212,29 @@ def patch(model, calibration, threshold=0.5):
                     controller.generation_depth -= 1
         model.generate = generate
     return controller
+
+
+def configure_activation_checkpointing(model, enabled=True):
+    """Recompute attention and compensated MoE modules during student backward."""
+    controller = model.skipping_controller
+    controller.activation_checkpointing = enabled
+    for _, layer in find_moe_layers(model):
+        for name in ("self_attn", "linear_attn"):
+            attention = getattr(layer, name, None)
+            if attention is None or hasattr(attention, "_compensation_forward"):
+                continue
+            attention._compensation_forward = attention.forward
+
+            def wrap(original):
+                @wraps(original)
+                def forward(*args, **kwargs):
+                    if (controller.activation_checkpointing and torch.is_grad_enabled()
+                            and controller.mode == "reconstruction"):
+                        return checkpoint(partial(original, **kwargs), *args, use_reentrant=False)
+                    return original(*args, **kwargs)
+                return forward
+
+            attention.forward = wrap(attention._compensation_forward)
 
 
 def save_compensation(model, path):

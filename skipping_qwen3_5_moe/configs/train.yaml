@@ -3,8 +3,8 @@ output_dir: skipping_qwen3_5_moe/outputs
 
 model:
   path: /data1/jiangyikun/models/Qwen3.6-35B-A3B
-  dtype: auto
-  attn_implementation: null
+  dtype: bfloat16
+  attn_implementation: sdpa
 
 skipping:
   threshold: 0.5
@@ -28,6 +28,7 @@ data:
     text: {path: prefetch/data/tulu/validation.filtered.jsonl, limit: 128}
 
 training:
+  activation_checkpointing: true
   max_steps: 10000
   gradient_accumulation: 4
   learning_rate: 0.001
