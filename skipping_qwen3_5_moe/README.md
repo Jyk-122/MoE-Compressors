@@ -162,6 +162,75 @@ print(controller.summary())
 
 每次调用的 threshold 在调用结束后恢复。生成过程中的 prefill 与 decode 使用本次调用的同一个阈值。控制器按串行请求保存统计；并发请求应使用各自的模型实例或请求级隔离。
 
+## vLLM 服务与 EvalScope
+
+[serve_vllm.py](serve_vllm.py) 面向 **vLLM 0.24.0（包括 `0.24.0+cu129`）**，将原始 Qwen3.6-35B-A3B 权重和训练得到的补偿文件一起用于推理。原模型需要能在该环境中正常启动。
+
+服务使用 `--worker-cls skipping_qwen3_5_moe.vllm_worker.CompensationWorker`。每个 GPU worker 加载原模型后、进行显存分析之前，[vllm_patch.py](vllm_patch.py) 为原生 `Qwen3NextSparseMoeBlock` 安装补偿前向：执行 router 和 top-p 选择，计算保留专家输出，使用训练得到的系数、均值和标准差重建缺失贡献，最后加上 gated shared expert 输出。双卡 TP 会先合并各卡的专家输出，再执行补偿。新增 FP32 参数也计入 vLLM 的显存预算。
+
+双卡启动，在仓库根目录执行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 TP_SIZE=2 \
+MODEL_PATH=/data1/jiangyikun/models/Qwen3.6-35B-A3B \
+COMPENSATION_PATH=skipping_qwen3_5_moe/outputs/compensation.safetensors \
+THRESHOLD=0.5 \
+bash skipping_qwen3_5_moe/serve_vllm.sh
+```
+
+也可以直接使用 Python 入口：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m skipping_qwen3_5_moe.serve_vllm \
+  --model /data1/jiangyikun/models/Qwen3.6-35B-A3B \
+  --checkpoint skipping_qwen3_5_moe/outputs/compensation.safetensors \
+  --threshold 0.5 --tensor-parallel-size 2 \
+  --served-model-name qwen3.6-pruned --host 127.0.0.1 --port 8000
+```
+
+单卡使用 `CUDA_VISIBLE_DEVICES=0 TP_SIZE=1`。默认 BF16、最大上下文 4096、每次调度最多 4096 token、最多 16 个序列，GPU 显存利用率为 0.9。`--max-model-len` 包括输入和生成长度；需要完整 4K 输入再生成时，可以增大此参数。服务启动时固定 threshold，prefill 和 decode 共用该值；切换阈值通过重启服务完成。其他原生 vLLM 服务参数可以追加到命令末尾，`--dry-run` 可以预览启动命令。供其他机器访问时可以指定 `--host 0.0.0.0`。
+
+每个 rank 应打印 `Compensation installed: rank=... layers=... threshold=0.500000 ...`，之后等待 vLLM 完成服务初始化。可以验证模型名和聊天接口：
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.6-pruned","messages":[{"role":"user","content":"请解释混合专家模型。"}],"max_tokens":128,"temperature":0}'
+```
+
+EvalScope 的质量评测示例：
+
+```bash
+evalscope eval \
+  --model qwen3.6-pruned \
+  --api-url http://127.0.0.1:8000/v1 \
+  --api-key EMPTY --eval-type openai_api \
+  --datasets gsm8k --limit 10 \
+  --dataset-args '{"gsm8k":{"few_shot_num":0}}' \
+  --generation-config '{"temperature":0,"max_tokens":2048}'
+```
+
+吞吐、TTFT、TPOT 压测示例（需要安装 `evalscope[perf]`）：
+
+```bash
+evalscope perf \
+  --model qwen3.6-pruned \
+  --url http://127.0.0.1:8000/v1/chat/completions \
+  --api openai --parallel 1 4 8 --number 10 40 80 \
+  --dataset random --prefix-length 0 \
+  --min-prompt-length 1024 --max-prompt-length 1024 \
+  --min-tokens 256 --max-tokens 256 \
+  --tokenizer-path /data1/jiangyikun/models/Qwen3.6-35B-A3B \
+  --extra-args '{"ignore_eos":true}'
+```
+
+这版适配器支持单副本的单卡或 TP 推理，完整专家权重驻留在各自的 TP 分片上。专家按实际保留的路由执行，补偿在整批输出上并行计算。MoE 使用 PyTorch 分组矩阵乘法，服务以 eager 模式运行；`--moe-backend triton` 用于固定加载后的专家权重布局。测得的延迟包含 Python 专家调度、补偿及 TP 归约开销，因此不能据此直接推断采用融合 kernel 后的剪枝加速收益。可在同一适配器下分别使用 `threshold=1` 和 `0.5` 做对照，并单独记录原生 vLLM 的结果。
+
+Worker 在启动时核验版本、权重布局和补偿文件的层号及维度。当前适配范围为浮点权重、普通解码、TP 并行；量化、EP、PP、DP、LoRA、推测解码和 sleep mode 需要分别适配。
+
+接口参考：[vLLM 0.24.0 Qwen MoE](https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/model_executor/models/qwen3_next.py)、[GPU worker](https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/v1/worker/gpu_worker.py)、[EvalScope API 评测](https://github.com/modelscope/evalscope/blob/main/docs/zh/get_started/basic_usage.md)、[EvalScope 压测](https://github.com/modelscope/evalscope/blob/main/docs/zh/user_guides/stress_test/quick_start.md)。
+
 ## 验证范围
 
 ```bash
@@ -169,5 +238,7 @@ python -m unittest discover -s skipping_qwen3_5_moe/tests -t . -v
 ```
 
 CPU 测试覆盖校准统计量与参数初始化、并行补偿的输出和全部参数梯度、实际专家调用数、同输入局部目标、两项损失各自的跨层梯度、激活重计算的数值等价性与保存张量量、单专家保留时的补偿训练、完整补偿参数保存恢复、梯度累积、不同长度样本的双进程 Gloo 与单进程更新一致性，以及原生 Transformers `generate` 的 prefill/decode 一致性。GPU rank 绑定和 SDPA 后端选择另有模拟测试。
+
+vLLM 适配测试覆盖原生权重布局的参考模块与 Transformers 补偿的输出一致性、实际跳过专家计算、启动参数和不兼容布局校验，以及双进程 Gloo 的 TP 输出合并。vLLM 0.24.0/H20 的完整服务启动与端到端性能需要在目标服务器验证。
 
 核心 MoE 测试使用 [tests/reference_moe.py](tests/reference_moe.py) 中的 Qwen MoE 参考类；生成测试将这些 MoE 类接入小型 Llama 因果模型。数据测试覆盖文本和图像样本、assistant 标签及多源加载。完整 Qwen3.6-35B-A3B 的 CUDA 训练、混合注意力缓存与实际延迟需要在目标模型和硬件环境验证。当前专家执行采用 PyTorch 分组调用；推理速度取决于专家 kernel、batch 大小与路由分布。
