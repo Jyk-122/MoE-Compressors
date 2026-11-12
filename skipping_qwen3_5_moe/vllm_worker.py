@@ -22,7 +22,11 @@ class CompensationWorker(Worker):
         layers = install_compensation(
             self.model_runner.get_model(), options["checkpoint"], options["threshold"],
             text_config, self.parallel_config.tensor_parallel_size, tensor_model_parallel_all_reduce)
-        # Account for the added FP32 parameters when vLLM sizes the KV cache.
+        # Account for the resident compensation tensors when vLLM sizes the KV cache.
         self.model_runner.model_memory_usage += torch.cuda.memory_allocated(self.device) - before
-        logger.info("Compensation installed: rank=%d layers=%d threshold=%.6f checkpoint=%s",
-                    self.rank, len(layers), options["threshold"], options["checkpoint"])
+        if layers:
+            logger.info("Compensation installed: rank=%d layers=%d threshold=%.6f backend=triton checkpoint=%s",
+                        self.rank, len(layers), options["threshold"], options["checkpoint"])
+        else:
+            logger.info("Using native MoE: rank=%d threshold=%.6f retains all routes",
+                        self.rank, options["threshold"])

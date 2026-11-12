@@ -11,6 +11,15 @@ import torch
 from torch import nn
 
 
+def aggregate_moments(outputs, retained, routing_weights, coefficients, mean, std):
+    """Combine unweighted slot outputs using the moments of the selected experts."""
+    standardized = (outputs.float() - mean) / std
+    standardized = standardized * retained.unsqueeze(-1)
+    recovered = mean + std * torch.bmm(coefficients.transpose(1, 2), standardized)
+    mixture = torch.where(retained.unsqueeze(-1), outputs.float(), recovered)
+    return (routing_weights.float().unsqueeze(-1) * mixture).sum(dim=1)
+
+
 class CompensateCoefficients(nn.Module):
     """Learn [source, target] logits and normalize over retained sources."""
 
@@ -56,9 +65,5 @@ class MomentCompensation(nn.Module):
         slots are zero. coefficients has shape [T, source_slot, target_slot].
         Only missing targets contribute to the reconstructed mixture.
         """
-        mean, std = self.mean[expert_ids], self.std[expert_ids]
-        standardized = (outputs.float() - mean) / std
-        standardized = standardized * retained.unsqueeze(-1)
-        recovered = mean + std * torch.bmm(coefficients.transpose(1, 2), standardized)
-        mixture = torch.where(retained.unsqueeze(-1), outputs.float(), recovered)
-        return (routing_weights.float().unsqueeze(-1) * mixture).sum(dim=1)
+        return aggregate_moments(outputs, retained, routing_weights, coefficients,
+                                 self.mean[expert_ids], self.std[expert_ids])

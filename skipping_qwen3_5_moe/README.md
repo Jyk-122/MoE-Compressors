@@ -166,7 +166,9 @@ print(controller.summary())
 
 [serve_vllm.py](serve_vllm.py) 面向 **vLLM 0.24.0（包括 `0.24.0+cu129`）**，将原始 Qwen3.6-35B-A3B 权重和训练得到的补偿文件一起用于推理。原模型需要能在该环境中正常启动。
 
-服务使用 `--worker-cls skipping_qwen3_5_moe.vllm_worker.CompensationWorker`。每个 GPU worker 加载原模型后、进行显存分析之前，[vllm_patch.py](vllm_patch.py) 为原生 `Qwen3NextSparseMoeBlock` 安装补偿前向：执行 router 和 top-p 选择，计算保留专家输出，使用训练得到的系数、均值和标准差重建缺失贡献，最后加上 gated shared expert 输出。双卡 TP 会先合并各卡的专家输出，再执行补偿。新增 FP32 参数也计入 vLLM 的显存预算。
+服务使用 `--worker-cls skipping_qwen3_5_moe.vllm_worker.CompensationWorker`。每个 GPU worker 加载原模型后、进行显存分析之前，[vllm_patch.py](vllm_patch.py) 为原生 `Qwen3NextSparseMoeBlock` 安装补偿前向。worker 加载检查点时把标准差转换为推理使用的 FP32 尺度，补偿占用的显存计入 vLLM 的预算。现有校准文件和训练好的 `compensation.safetensors` 都可以直接使用。
+
+[vllm_kernels.py](vllm_kernels.py) 在 GPU 上生成每个 token 的保留专家编号和补偿系数，调用 vLLM 的 Triton 分组矩阵乘法执行 gate/up 和 down 投影，跳过被剪掉专家的矩阵乘法。TP 模式将各卡的路由输出与 gated shared expert 输出放入同一次 all-reduce。补偿 kernel 在完整专家输出上按通道计算缺失贡献，加上共享专家，直接写出 `[tokens, hidden]`。标准化输出和重建结果只在 kernel 内临时计算。
 
 双卡启动，在仓库根目录执行：
 
@@ -190,7 +192,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m skipping_qwen3_5_moe.serve_vllm \
 
 单卡使用 `CUDA_VISIBLE_DEVICES=0 TP_SIZE=1`。默认 BF16、最大上下文 4096、每次调度最多 4096 token、最多 16 个序列，GPU 显存利用率为 0.9。`--max-model-len` 包括输入和生成长度；需要完整 4K 输入再生成时，可以增大此参数。服务启动时固定 threshold，prefill 和 decode 共用该值；切换阈值通过重启服务完成。其他原生 vLLM 服务参数可以追加到命令末尾，`--dry-run` 可以预览启动命令。供其他机器访问时可以指定 `--host 0.0.0.0`。
 
-每个 rank 应打印 `Compensation installed: rank=... layers=... threshold=0.500000 ...`，之后等待 vLLM 完成服务初始化。可以验证模型名和聊天接口：
+每个 rank 应打印 `Compensation installed: rank=... layers=... threshold=0.500000 backend=triton ...`。在 `threshold=1` 时 worker 使用原生 MoE 前向，日志为 `Using native MoE`。服务初始化完成后可以验证模型名和聊天接口：
 
 ```bash
 curl http://127.0.0.1:8000/v1/models
@@ -225,11 +227,11 @@ evalscope perf \
   --extra-args '{"ignore_eos":true}'
 ```
 
-这版适配器支持单副本的单卡或 TP 推理，完整专家权重驻留在各自的 TP 分片上。专家按实际保留的路由执行，补偿在整批输出上并行计算。MoE 使用 PyTorch 分组矩阵乘法，服务以 eager 模式运行；`--moe-backend triton` 用于固定加载后的专家权重布局。测得的延迟包含 Python 专家调度、补偿及 TP 归约开销，因此不能据此直接推断采用融合 kernel 后的剪枝加速收益。可在同一适配器下分别使用 `threshold=1` 和 `0.5` 做对照，并单独记录原生 vLLM 的结果。
+服务以 eager 模式运行，`--moe-backend triton` 固定专家权重布局。测量时可以先发一个请求完成 kernel 预热，再用相同的 TP、上下文长度和并发度对照 `threshold=1` 与 `0.5`。上面的压测固定了生成长度，可以在并发 8 时分别比较 TTFT、TPOT 和输出 token 吞吐。若服务使用 8011 端口，在启动脚本后追加 `--port 8011`，并将评测请求发到同一端口。
 
 Worker 在启动时核验版本、权重布局和补偿文件的层号及维度。当前适配范围为浮点权重、普通解码、TP 并行；量化、EP、PP、DP、LoRA、推测解码和 sleep mode 需要分别适配。
 
-接口参考：[vLLM 0.24.0 Qwen MoE](https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/model_executor/models/qwen3_next.py)、[GPU worker](https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/v1/worker/gpu_worker.py)、[EvalScope API 评测](https://github.com/modelscope/evalscope/blob/main/docs/zh/get_started/basic_usage.md)、[EvalScope 压测](https://github.com/modelscope/evalscope/blob/main/docs/zh/user_guides/stress_test/quick_start.md)。
+接口参考：[vLLM 0.24.0 Qwen MoE](https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/model_executor/models/qwen3_next.py)、[Triton 专家内核](https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/model_executor/layers/fused_moe/fused_moe.py)、[GPU worker](https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/v1/worker/gpu_worker.py)、[EvalScope API 评测](https://github.com/modelscope/evalscope/blob/main/docs/zh/get_started/basic_usage.md)、[EvalScope 压测](https://github.com/modelscope/evalscope/blob/main/docs/zh/user_guides/stress_test/quick_start.md)。
 
 ## 验证范围
 
@@ -239,6 +241,6 @@ python -m unittest discover -s skipping_qwen3_5_moe/tests -t . -v
 
 CPU 测试覆盖校准统计量与参数初始化、并行补偿的输出和全部参数梯度、实际专家调用数、同输入局部目标、两项损失各自的跨层梯度、激活重计算的数值等价性与保存张量量、单专家保留时的补偿训练、完整补偿参数保存恢复、梯度累积、不同长度样本的双进程 Gloo 与单进程更新一致性，以及原生 Transformers `generate` 的 prefill/decode 一致性。GPU rank 绑定和 SDPA 后端选择另有模拟测试。
 
-vLLM 适配测试覆盖原生权重布局的参考模块与 Transformers 补偿的输出一致性、实际跳过专家计算、启动参数和不兼容布局校验，以及双进程 Gloo 的 TP 输出合并。vLLM 0.24.0/H20 的完整服务启动与端到端性能需要在目标服务器验证。
+vLLM 适配测试覆盖原生权重布局的参考模块与 Transformers 补偿的输出一致性、校准和训练检查点、全保留时使用原生前向、启动参数和不兼容布局校验，以及双进程 Gloo 的 TP 输出合并。装有 vLLM 0.24.0 的 CUDA 机器还会执行混合保留数量、单 token 解码和批量 prefill 的 kernel 对照测试，可单独运行 `python -m unittest -v skipping_qwen3_5_moe.tests.test_vllm.VllmCudaTests`。H20 服务的端到端吞吐与评测结果需要用目标模型实测。
 
-核心 MoE 测试使用 [tests/reference_moe.py](tests/reference_moe.py) 中的 Qwen MoE 参考类；生成测试将这些 MoE 类接入小型 Llama 因果模型。数据测试覆盖文本和图像样本、assistant 标签及多源加载。完整 Qwen3.6-35B-A3B 的 CUDA 训练、混合注意力缓存与实际延迟需要在目标模型和硬件环境验证。当前专家执行采用 PyTorch 分组调用；推理速度取决于专家 kernel、batch 大小与路由分布。
+核心 MoE 测试使用 [tests/reference_moe.py](tests/reference_moe.py) 中的 Qwen MoE 参考类；生成测试将这些 MoE 类接入小型 Llama 因果模型。数据测试覆盖文本和图像样本、assistant 标签及多源加载。Transformers 训练和推理使用 PyTorch 分组调用。完整 Qwen3.6-35B-A3B 的 CUDA 训练、混合注意力缓存与实际延迟需要在目标模型和硬件环境验证。

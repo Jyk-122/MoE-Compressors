@@ -11,7 +11,7 @@ from torch.nn import functional as F
 
 from .artifacts import read_artifact
 from .experts import selected_outputs
-from .modules import CompensateCoefficients, MomentCompensation
+from .modules import CompensateCoefficients, aggregate_moments
 from .routing import top_p_mask, validate_threshold
 
 
@@ -49,12 +49,18 @@ class VllmCompensation(nn.Module):
         self.top_k = int(state["top_k"])
         self.tp_size = tp_size
         self.all_reduce = all_reduce
-        std = state["std"] if "std" in state else state["log_std"].exp()
-        self.operator = MomentCompensation(state["mean"], std, state["epsilon"])
-        self.coefficients = CompensateCoefficients(state["mean"].shape[0])
+        # Serving weights are immutable. Keep only the final FP32 scales on device.
+        count = state["mean"].shape[0]
+        log_std = (state["log_std"].float() if "log_std" in state else
+                   state["std"].float().clamp_min(state["epsilon"]).log())
+        self.register_buffer("mean", state["mean"].detach().float().contiguous())
+        self.register_buffer("std", log_std.detach().exp().clamp_min_(state["epsilon"]).contiguous())
+        expert_map = torch.arange(count + 1, dtype=torch.int32)
+        expert_map[-1] = -1
+        self.register_buffer("expert_map", expert_map)
+        self.coefficients = CompensateCoefficients(count)
         if "logits" in state:
             with torch.no_grad():
-                self.operator.log_std.copy_(state["log_std"])
                 self.coefficients.logits.copy_(state["logits"])
         self.requires_grad_(False)
         self.eval()
@@ -65,25 +71,44 @@ class VllmCompensation(nn.Module):
         if hidden.shape[0] == 0:
             return hidden_states
         router_logits, _ = block.gate(hidden)
-        weights, ids = router_logits.float().softmax(-1).topk(self.top_k, dim=-1)
-        weights = (weights / weights.sum(-1, keepdim=True)).to(router_logits.dtype)
-        retained = top_p_mask(weights, self.threshold)
         experts = block.experts.routed_experts
-        packed = SimpleNamespace(gate_up_proj=experts.w13_weight,
-                                 down_proj=experts.w2_weight, act_fn=F.silu)
-        outputs = selected_outputs(packed, hidden, ids, retained)
-        if self.tp_size > 1:
-            # The down projection is sharded along its input dimension. Moments
-            # describe the full output, so combine shards before applying T.
-            outputs = self.all_reduce(outputs)
-        coefficients = self.coefficients(ids, retained)
-        routed = self.operator.aggregate(outputs, ids, retained, weights, coefficients)
+        tokens, width = hidden.shape
+        rows = tokens * self.top_k
+        partials = hidden.new_empty((rows + (tokens if self.tp_size > 1 else 0), width))
+        outputs = partials[:rows].view(tokens, self.top_k, width)
+        if hidden.is_cuda:
+            from . import vllm_kernels
+
+            weights, ids, dispatch, coefficients = vllm_kernels.routes(
+                router_logits, self.coefficients.logits, self.top_k, self.threshold)
+            vllm_kernels.expert_outputs(hidden, experts.w13_weight, experts.w2_weight,
+                                        dispatch, self.expert_map, outputs)
+        else:
+            weights, ids = router_logits.float().softmax(-1).topk(self.top_k, dim=-1)
+            weights = (weights / weights.sum(-1, keepdim=True)).to(router_logits.dtype)
+            retained = top_p_mask(weights, self.threshold)
+            packed = SimpleNamespace(gate_up_proj=experts.w13_weight,
+                                     down_proj=experts.w2_weight, act_fn=F.silu)
+            outputs.copy_(selected_outputs(packed, hidden, ids, retained))
+            coefficients = self.coefficients(ids, retained)
 
         # vLLM's shared MLP applies its sigmoid gate inside forward().
         shared = block.shared_expert(hidden)
         if self.tp_size > 1:
-            shared = self.all_reduce(shared)
-        return (routed.to(hidden.dtype) + shared).reshape_as(hidden_states)
+            # Moments describe complete expert outputs. Reduce the expert slots
+            # and the shared shard in one collective, before applying transport.
+            partials[rows:].copy_(shared)
+            combined = self.all_reduce(partials)
+            outputs = combined[:rows].view_as(outputs)
+            shared = combined[rows:]
+        if hidden.is_cuda:
+            result = vllm_kernels.transport(outputs, ids, dispatch, weights, coefficients,
+                                            self.mean, self.std, shared)
+        else:
+            routed = aggregate_moments(outputs, retained, weights, coefficients,
+                                       self.mean[ids], self.std[ids])
+            result = routed.to(hidden.dtype) + shared
+        return result.reshape_as(hidden_states)
 
 
 def _compensated_forward(block, hidden_states):
@@ -124,7 +149,7 @@ def install_compensation(model, path, threshold, text_config, tp_size=1, all_red
             raise ValueError(f"Layer {index}: expected unquantized Triton weight layout")
         if (experts.w13_weight.shape != (count, 2 * intermediate, hidden)
                 or experts.w2_weight.shape != (count, hidden, intermediate)
-                or not experts.w13_weight.is_floating_point()
+                or experts.w13_weight.dtype not in (torch.float16, torch.bfloat16, torch.float32)
                 or experts.w13_weight.dtype != experts.w2_weight.dtype):
             raise ValueError(f"Layer {index}: expert weight geometry or dtype is incompatible")
         if (block.shared_expert is None or block.shared_expert.down_proj.reduce_results
@@ -141,6 +166,11 @@ def install_compensation(model, path, threshold, text_config, tp_size=1, all_red
         if (not torch.isfinite(state["mean"]).all() or not torch.isfinite(std).all()
                 or (std < 0).any() or not math.isfinite(state["epsilon"]) or state["epsilon"] <= 0):
             raise ValueError(f"Layer {index}: invalid expert moments")
+
+    if threshold == 1 or text_config.num_experts_per_tok == 1:
+        # All routes are retained. The native block already includes the gated
+        # shared expert and TP reduction; no adapter or device buffers are needed.
+        return []
 
     for index, block in layers.items():
         adapter = VllmCompensation(states[index], threshold, tp_size, all_reduce)

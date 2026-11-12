@@ -1,6 +1,7 @@
-"""CPU checks for vLLM weight layout, compensation, and TP output reduction."""
+"""Reference, TP and CUDA checks for the vLLM compensation adapter."""
 import copy
 from datetime import timedelta
+from importlib.util import find_spec
 import json
 from pathlib import Path
 import socket
@@ -8,7 +9,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch as mock_patch
+from unittest.mock import Mock, patch as mock_patch
 
 import torch
 from torch import nn
@@ -19,6 +20,8 @@ from torch.nn import functional as F
 from ..artifacts import save_artifact
 from ..experts import expert_output
 from ..model import patch
+from ..modules import CompensateCoefficients, MomentCompensation
+from ..routing import top_p_mask
 from ..serve_vllm import make_command
 from ..vllm_patch import install_compensation, validate_vllm_config
 from .reference_moe import Qwen3_5MoeSparseMoeBlock
@@ -67,11 +70,11 @@ class NativeMoE(nn.Module):
         raise AssertionError("Expected the worker to install compensation")
 
 
-def fixtures(rank=0, size=1):
+def fixtures(rank=0, size=1, *, count=5, width=6, intermediate=8, top_k=4):
     torch.manual_seed(81)
     config = SimpleNamespace(model_type="qwen3_5_moe_text", hidden_act="silu", norm_topk_prob=True,
-                             num_experts=5, hidden_size=6, moe_intermediate_size=8,
-                             num_experts_per_tok=4, shared_expert_intermediate_size=8)
+                             num_experts=count, hidden_size=width, moe_intermediate_size=intermediate,
+                             num_experts_per_tok=top_k, shared_expert_intermediate_size=intermediate)
     reference = Qwen3_5MoeSparseMoeBlock(config)
     for parameter in reference.parameters():
         nn.init.normal_(parameter, std=0.4)
@@ -81,9 +84,9 @@ def fixtures(rank=0, size=1):
     layer = nn.Module()
     layer.mlp = native
     model.model.layers = nn.ModuleList([layer])
-    state = {0: {"mean": torch.randn(5, 6) * 0.2, "log_std": torch.randn(5, 6) * 0.3,
-                 "logits": torch.randn(5, 5), "epsilon": 1e-5, "samples": 32, "top_k": 4}}
-    hidden = torch.randn(9, 6)
+    state = {0: {"mean": torch.randn(count, width) * 0.2, "log_std": torch.randn(count, width) * 0.3,
+                 "logits": torch.randn(count, count), "epsilon": 1e-5, "samples": 32, "top_k": top_k}}
+    hidden = torch.randn(9, width)
     return model, reference, config, state, hidden
 
 
@@ -109,8 +112,11 @@ def tp_worker(rank, directory, port):
                             world_size=2, timeout=timedelta(seconds=60))
     try:
         model, _, config, _, hidden = fixtures(rank, 2)
-        install_compensation(model, Path(directory) / "compensation.safetensors", 0.5, config, 2, reduce_sum)
+        reduce = Mock(wraps=reduce_sum)
+        install_compensation(model, Path(directory) / "compensation.safetensors", 0.5, config, 2, reduce)
         output = model.model.layers[0].mlp(hidden)
+        reduce.assert_called_once()
+        assert reduce.call_args.args[0].shape == (len(hidden) * (config.num_experts_per_tok + 1), hidden.shape[1])
         torch.save(output, Path(directory) / f"rank-{rank}.pt")
     finally:
         dist.destroy_process_group()
@@ -121,7 +127,7 @@ class VllmTests(unittest.TestCase):
         torch.set_num_threads(1)
 
     def test_outputs_match_transformers_compensation_and_experts_are_skipped(self):
-        for threshold in (0.1, 0.5, 1.0):
+        for threshold in (0.1, 0.5, 0.999):
             with self.subTest(threshold=threshold), tempfile.TemporaryDirectory() as directory:
                 model, reference, config, state, hidden = fixtures()
                 path = Path(directory) / "compensation.safetensors"
@@ -140,6 +146,34 @@ class VllmTests(unittest.TestCase):
                 torch.testing.assert_close(decode, expected[:1], rtol=1e-6, atol=1e-6)
                 self.assertEqual(block(hidden[:0]).shape, (0, 6))
                 self.assertTrue(all(not p.requires_grad for p in block.compensation.parameters()))
+
+    def test_all_retained_uses_original_forward_without_loading_device_state(self):
+        for threshold, top_k in ((1.0, 4), (0.5, 1)):
+            with self.subTest(threshold=threshold), tempfile.TemporaryDirectory() as directory:
+                model, _, config, state, hidden = fixtures()
+                state[0]["top_k"] = config.num_experts_per_tok = top_k
+                block = model.model.layers[0].mlp
+                path = Path(directory) / "compensation.safetensors"
+                save_artifact(state, path, threshold=threshold)
+                with mock_patch.object(block, "forward", return_value=hidden) as native:
+                    self.assertEqual(install_compensation(model, path, None, config), [])
+                    self.assertFalse(hasattr(block, "compensation"))
+                    self.assertIs(block(hidden), hidden)
+                    native.assert_called_once()
+
+    def test_calibration_checkpoint_keeps_clamped_scales_and_uniform_coefficients(self):
+        model, reference, config, state, hidden = fixtures()
+        calibration = state[0]
+        calibration["std"] = calibration.pop("log_std").exp()
+        calibration["std"][0, 0] = 0.
+        del calibration["logits"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.safetensors"
+            save_artifact(state, path, threshold=0.65)
+            install_compensation(model, path, None, config)
+        block = model.model.layers[0].mlp
+        torch.testing.assert_close(block.compensation.std, calibration["std"].clamp_min(calibration["epsilon"]))
+        torch.testing.assert_close(block(hidden), reference_output(reference, state, hidden, 0.65))
 
     def test_layout_and_checkpoint_are_validated_before_patching(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -209,6 +243,64 @@ class VllmTests(unittest.TestCase):
             for rank in range(2):
                 actual = torch.load(Path(directory) / f"rank-{rank}.pt", map_location="cpu")
                 torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@unittest.skipUnless(torch.cuda.is_available() and find_spec("vllm"), "Requires CUDA and vLLM 0.24.0")
+class VllmCudaTests(unittest.TestCase):
+    def test_route_and_transport_for_mixed_prefixes(self):
+        from ..vllm_kernels import routes, transport
+
+        torch.manual_seed(52)
+        experts, k, width = 7, 3, 70
+        logits = torch.full((3, experts), -100., device="cuda", dtype=torch.float16)
+        logits[:, [4, 0, 6]] = logits.new_tensor([[3., 0., -1.], [1., 0.8, 0.], [1., 1., 1.]])
+        table = CompensateCoefficients(experts).cuda()
+        with torch.no_grad():
+            table.logits.normal_()
+        probs, ids = logits.float().softmax(-1).topk(k)
+        weights = (probs / probs.sum(-1, keepdim=True)).to(logits.dtype)
+        keep = top_p_mask(weights, 0.7)
+        self.assertEqual(keep.sum(-1).tolist(), [1, 2, 3])
+        operator = MomentCompensation(torch.randn(experts, width), torch.rand(experts, width) + 0.1).cuda()
+        outputs = torch.randn((3, k, width), device="cuda", dtype=logits.dtype)
+        shared = torch.randn_like(outputs[:, 0])
+        with torch.no_grad():
+            actual_weights, actual_ids, dispatch, alpha = routes(logits, table.logits, k, 0.7)
+            torch.testing.assert_close(actual_ids, ids)
+            torch.testing.assert_close(actual_weights, weights, rtol=0, atol=0)
+            torch.testing.assert_close(dispatch, ids.masked_fill(~keep, experts).int())
+            coefficients = table(ids, keep)
+            torch.testing.assert_close(alpha, coefficients)
+            expected = operator.aggregate(outputs, ids, keep, weights, coefficients).to(shared.dtype) + shared
+            actual = transport(outputs.masked_fill(~keep[:, :, None], torch.nan), ids, dispatch, weights,
+                               alpha, operator.mean, operator.std, shared)
+            torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+
+    def test_cuda_adapter_decode_and_prefill_match_reference(self):
+        from .. import vllm_kernels
+
+        # One token exercises vLLM's direct assignment, nine tokens its sorted blocks.
+        model, reference, config, state, hidden = fixtures(count=32, width=80, intermediate=32, top_k=3)
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        model.to(device="cuda", dtype=dtype)
+        reference.to(device="cuda", dtype=dtype)
+        hidden = hidden.to(device="cuda", dtype=dtype) * 0.1
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "compensation.safetensors"
+            save_artifact(state, path)
+            install_compensation(model, path, 0.65, config)
+        block = model.model.layers[0].mlp
+        with mock_patch("skipping_qwen3_5_moe.vllm_patch.selected_outputs", side_effect=AssertionError):
+            for x in (hidden[:1], hidden):
+                expected = reference_output(reference, state, x, 0.65)
+                with mock_patch.object(vllm_kernels, "expert_outputs", wraps=vllm_kernels.expert_outputs) as grouped:
+                    actual = block(x)
+                    grouped.assert_called_once()
+                    dispatch, _, outputs = grouped.call_args.args[-3:]
+                    skipped = outputs[dispatch == config.num_experts]
+                    self.assertGreater(skipped.numel(), 0)
+                    torch.testing.assert_close(skipped, torch.zeros_like(skipped), atol=0, rtol=0)
+                torch.testing.assert_close(actual, expected, rtol=1e-2, atol=0.006)
 
 
 if __name__ == "__main__":
