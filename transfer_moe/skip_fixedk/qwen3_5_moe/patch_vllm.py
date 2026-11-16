@@ -43,7 +43,8 @@ def patch(model, *, native_topk):
         raise ValueError("No Qwen3.5 MoE layers found")
     attach_activation_stats(model, [(index, block.experts.routed_experts, native_topk,
                                      block.experts.routed_experts.w13_weight.device)
-                                    for index, block in layers], vllm=True)
+                                    for index, block in layers],
+                            max_num_tokens=config.scheduler_config.max_num_batched_tokens)
     for _, block in layers:
         experts = block.experts.routed_experts
         if not hasattr(experts, "fixedk_original_forward"):

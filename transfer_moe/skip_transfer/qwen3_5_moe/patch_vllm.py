@@ -210,7 +210,8 @@ def patch(model, calibration_path, *, topk=None, topp_threshold=None):
         raise ValueError("No Qwen3.5 MoE layers found")
     attach_activation_stats(model, [(index, block.experts.routed_experts, k,
                                      block.experts.routed_experts.w13_weight.device)
-                                    for index, block in layers], vllm=True)
+                                    for index, block in layers],
+                            max_num_tokens=config.scheduler_config.max_num_batched_tokens)
     for index, block in layers:
         experts = block.experts.routed_experts
         state = states[index]

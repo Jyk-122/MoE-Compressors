@@ -58,7 +58,8 @@ def patch(model, *, topp_threshold):
     attach_activation_stats(model, [(index, block.experts.routed_experts,
                                      config.model_config.hf_text_config.num_experts_per_tok,
                                      block.experts.routed_experts.w13_weight.device)
-                                    for index, block in blocks], vllm=True)
+                                    for index, block in blocks],
+                            max_num_tokens=config.scheduler_config.max_num_batched_tokens)
     for _, block in blocks:
         experts = block.experts.routed_experts
         if not hasattr(experts, "dynroute_original_forward"):

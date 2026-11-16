@@ -7,7 +7,7 @@ import json
 import torch
 
 from .data import multimodal_messages, open_images, processor_call, to_device
-from .utils import load_model_and_processor
+from .utils import activation_stats_enabled, load_model_and_processor
 
 
 def main():
@@ -36,6 +36,8 @@ def main():
         output = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False)
     generated = output[0, inputs["input_ids"].shape[1]:]
     print(processor.tokenizer.decode(generated, skip_special_tokens=True))
+    if activation_stats_enabled():
+        print(json.dumps(model.activation_stats.report(), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
