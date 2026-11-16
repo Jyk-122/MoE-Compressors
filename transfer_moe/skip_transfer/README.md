@@ -93,12 +93,15 @@ python -m transfer_moe.skip_transfer.calibrate \
   --samples 32 \
   --max-length 2048 \
   --max-image-side 672 \
+  --stats-chunk-size 256 \
   --epsilon 1e-5
 ```
 
-`--samples 32` 按文件顺序取前 32 条记录；不足 32 条时使用全部记录，因此上述示例会使用两条。每条记录的全部非 padding token 都参与校准。`--data` 可以依次传入多个 JSONL 文件，记录数量上限对这些文件合计生效。
+`--samples 32` 按文件顺序取前 32 条记录；不足 32 条时使用全部记录，因此上述示例会使用两条。每条记录截断后保留的全部非 padding token 都参与校准。`--data` 可以依次传入多个 JSONL 文件，记录数量上限对这些文件合计生效。
 
-`--max-length` 是处理后的 token 数上限，超出时会报错；`--max-image-side` 限制图片长边尺寸。生成的校准文件对应当前模型，可以复用于不同的 `topk` 和 `topp_threshold` 设置。
+`--max-length` 是处理后的 token 数上限，超出时保留序列前缀并截断尾部；若截断点落在图片块内，则截到该图片之前，并同步移除未保留的图片输入。`--max-image-side` 限制图片长边尺寸。生成的校准文件对应当前模型，可以复用于不同的 `topk` 和 `topp_threshold` 设置。
+
+每个专家一次处理该层全部校准 token，计算全局 FP32 均值和标准差，并将输出按模型原始 dtype 缓存到 CPU。随后按 `--stats-chunk-size`（默认 256）分批搬回 GPU，用固定的全局统计量累计 D，分块结果以 FP64 累加；该参数只控制误差统计的临时显存，不改变校准 token 数或专家前向批次。每层完成后释放输出缓存。本层 CPU 输出缓存约占 `专家数 × 总 token 数 × hidden_size × dtype 字节数`，BF16/FP16 每元素 2 字节。
 
 固定保留专家数量进行文本推理。下面每个 token 从原生 router 选中的专家里保留 4 个，其余通过补偿重构：
 

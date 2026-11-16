@@ -50,7 +50,7 @@ def load_records(paths, limit=None):
 
 
 class CalibrationCollator:
-    """Process one complete conversation; retain every valid token for sampling."""
+    """Truncate a conversation to max_length, keeping image blocks complete."""
 
     def __init__(self, processor, max_length=2048, max_image_side=672):
         self.processor = processor
@@ -63,8 +63,23 @@ class CalibrationCollator:
         messages = multimodal_messages(example["messages"], paths)
         images = open_images(paths, self.max_image_side)
         batch = processor_call(self.processor, messages, images)
-        if batch["input_ids"].shape[1] > self.max_length:
-            raise ValueError(f"Calibration conversation exceeds max_length={self.max_length}")
+        length = self.max_length
+        if "image_grid_thw" in batch:
+            ids = batch["input_ids"][0]
+            starts = (ids == self.processor.vision_start_token_id).nonzero().flatten()
+            ends = (ids == self.processor.vision_end_token_id).nonzero().flatten()
+            count = int((ends < length).sum())
+            if count < starts.numel():
+                length = min(length, int(starts[count]))
+            if count:
+                grid = batch["image_grid_thw"][:count]
+                batch["pixel_values"] = batch["pixel_values"][:int(grid.prod(-1).sum())]
+                batch["image_grid_thw"] = grid
+            else:
+                del batch["pixel_values"], batch["image_grid_thw"]
+        for key in ("input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids"):
+            if key in batch:
+                batch[key] = batch[key][:, :length]
         return batch
 
 

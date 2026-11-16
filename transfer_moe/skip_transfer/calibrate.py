@@ -49,36 +49,51 @@ def read_calibration(path):
 
 
 @torch.no_grad()
-def calibrate_layer(block, hidden, epsilon=1e-5):
+def calibrate_layer(block, hidden, epsilon=1e-5, *, stats_chunk_size=1024):
     """Use the same [samples, hidden] inputs for every expert.
 
-    Compute each expert once and reuse its outputs for population moments and
-    D[source, target]. The squared residual is expanded exactly into
-    matrix products, preserving the target's per-channel variance weighting.
-    This avoids an [experts, experts, samples, hidden] intermediate.
+    Compute each expert once on all inputs. Cache outputs on CPU in their
+    original dtype and compute global FP32 moments one expert at a time.
+    Accumulate D[source, target] over token chunks using those fixed moments;
+    only the current chunk's expert outputs and intermediates occupy the GPU.
     """
     experts = block.experts
     hidden = hidden.to(experts.gate_up_proj)
     count = experts.gate_up_proj.shape[0]
-    outputs = torch.stack([expert_output(experts, hidden, i).float() for i in range(count)])
-    variance, mean = torch.var_mean(outputs, dim=1, correction=0)
-    std = variance.sqrt().clamp_min(epsilon)
+    tokens, width = hidden.shape
+    device = hidden.device
+    outputs = torch.empty((count, tokens, width), dtype=hidden.dtype, device="cpu")
+    mean = torch.empty((count, width), dtype=torch.float32, device=device)
+    std = torch.empty_like(mean)
+    for i in range(count):
+        output = expert_output(experts, hidden, i)
+        outputs[i].copy_(output)
+        variance, expert_mean = torch.var_mean(output.float(), dim=0, correction=0)
+        mean[i] = expert_mean
+        std[i] = variance.sqrt().clamp_min_(epsilon)
+        del output
+    del hidden
 
-    centered = outputs - mean.unsqueeze(1)
-    standardized = centered / std.unsqueeze(1)
-    # ||u_j - sigma_j*z_i||² = ||u_j||² + ||sigma_j*z_i||² - 2<z_i, sigma_j*u_j>.
-    source_square = standardized.square().sum(1) @ std.square().T
-    target_square = centered.square().sum((1, 2)).unsqueeze(0)
-    cross = standardized.flatten(1) @ (centered * std.unsqueeze(1)).flatten(1).T
-    error = source_square.double() + target_square.double() - 2 * cross.double()
-    error = (error / hidden.shape[0]).float().clamp_min_(0)
+    std_square = std.square()
+    error = torch.zeros((count, count), dtype=torch.float64, device=device)
+    for chunk in outputs.split(stats_chunk_size, dim=1):
+        centered = chunk.to(device=device, dtype=torch.float32, copy=True)
+        centered.sub_(mean.unsqueeze(1))
+        standardized = centered / std.unsqueeze(1)
+        # ||u_j - sigma_j*z_i||² = ||u_j||² + ||sigma_j*z_i||² - 2<z_i, sigma_j*u_j>.
+        source_square = standardized.square().sum(1) @ std_square.T
+        target_square = centered.square().sum((1, 2)).unsqueeze(0)
+        cross = standardized.flatten(1) @ (centered * std.unsqueeze(1)).flatten(1).T
+        error += source_square.double() + target_square.double() - 2 * cross.double()
+        del centered, standardized
+    error = (error / tokens).float().clamp_min_(0)
     error.fill_diagonal_(0)
     return {"mean": mean.cpu(), "std": std.cpu(), "error": error.cpu(),
-            "samples": hidden.shape[0], "top_k": block.gate.top_k, "epsilon": epsilon}
+            "samples": tokens, "top_k": block.gate.top_k, "epsilon": epsilon}
 
 
 @torch.no_grad()
-def calibrate_model(model, loader, epsilon=1e-5):
+def calibrate_model(model, loader, epsilon=1e-5, *, stats_chunk_size=256):
     """Collect native MoE inputs, then calibrate one layer at a time.
 
     loader yields single-example processor batches with attention_mask.
@@ -110,7 +125,7 @@ def calibrate_model(model, loader, epsilon=1e-5):
     result = {}
     for index, block in tqdm(blocks.items(), desc="Calibrating expert pairs"):
         hidden = torch.cat(samples.pop(index))
-        result[index] = calibrate_layer(block, hidden, epsilon)
+        result[index] = calibrate_layer(block, hidden, epsilon, stats_chunk_size=stats_chunk_size)
     return result
 
 
@@ -124,11 +139,13 @@ def main():
     parser.add_argument("--samples", type=int, default=32)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--max-image-side", type=int, default=672)
+    parser.add_argument("--stats-chunk-size", type=int, default=256,
+                        help="Tokens per D-statistics chunk; expert forwards still use all calibration tokens")
     parser.add_argument("--epsilon", type=float, default=1e-5)
     args = parser.parse_args()
     model, processor = load_model_and_processor(args.model, args.device, args.dtype)
     loader = make_loader(processor, args.data, args.samples, args.max_length, args.max_image_side)
-    states = calibrate_model(model, loader, args.epsilon)
+    states = calibrate_model(model, loader, args.epsilon, stats_chunk_size=args.stats_chunk_size)
     save_calibration(states, args.output, base_model=args.model)
     print(f"Saved {len(states)} layers to {args.output}")
 
