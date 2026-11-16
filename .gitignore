@@ -46,3 +46,6 @@ Thumbs.db
 # 日志与缓存
 *.log
 .cache/
+
+# 测试文件
+tests/
