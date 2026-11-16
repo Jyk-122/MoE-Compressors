@@ -45,15 +45,16 @@ def greedy_select_topk(top_ids, weights, error, topk):
 
 
 def greedy_select_topp(top_ids, weights, error, topp_threshold):
-    """Choose each token's smallest budget with J(S) <= topp_threshold.
+    """Choose the largest budget with 1 - J_k / J_1 <= topp_threshold.
 
-    topp_threshold >= 0 is an absolute proxy squared-error budget, not a
-    cumulative router probability or an energy-coverage fraction. Returns
-    retained [tokens, K], assignment [tokens, K], cost [tokens].
+    topp_threshold is in [0, 1]; larger values retain more experts. A zero
+    J_1 already has zero proxy error, so keep one expert. Returns
+    retained [tokens, K], assignment [tokens, K], absolute cost [tokens].
     """
     order, assignments, costs = _greedy_curve(top_ids, weights, error, top_ids.shape[1])
-    # The curve is nonincreasing and ends at zero, so this is the first passing stage.
-    stage = (costs > topp_threshold).sum(-1)
+    initial = costs[:, :1]
+    # Count admissible additions after the first expert, without dividing by J_1.
+    stage = ((costs[:, 1:] >= (1 - topp_threshold) * initial) & (initial > 0)).sum(-1)
     prefix = torch.arange(top_ids.shape[1], device=top_ids.device).unsqueeze(0) <= stage.unsqueeze(1)
     retained = torch.zeros_like(top_ids, dtype=torch.bool).scatter_(1, order, prefix)
     rows = torch.arange(top_ids.shape[0], device=top_ids.device)

@@ -50,22 +50,26 @@ def _select_kernel(Ids, Weights, Error, Dispatch, Assignment,
     assignment = tl.full((B,), 0, tl.int32)
     chosen_id = tl.sum(tl.where(selected, ids, 0), 0)
     packed = tl.where(slot == 0, chosen_id, E)
-    total = tl.sum(weights * best, 0)
+    initial = tl.sum(weights * best, 0)
+    cutoff = (1 - THRESHOLD) * initial
 
     for step in range(1, R):
-        if not FIXED and total <= THRESHOLD:
+        if not FIXED and initial == 0:
             break
         gains = tl.sum(tl.maximum(best[None, :] - costs, 0.) * weights[None, :], 1)
         gains = tl.where((slot < K) & ~selected, gains, -float("inf"))
         chosen = tl.min(tl.where(gains == tl.max(gains, 0), slot, B), 0)
         candidate = tl.sum(tl.where(slot[:, None] == chosen, costs, 0.), 0)
+        updated = tl.minimum(best, candidate)
+        # Reject the next expert before changing the retained prefix or mapping.
+        if not FIXED and tl.sum(weights * updated, 0) < cutoff:
+            break
         assignment = tl.where(candidate < best, step, assignment)
-        best = tl.minimum(best, candidate)
+        best = updated
         selected = selected | (slot == chosen)
         positions = tl.where(slot == chosen, step, positions)
         chosen_id = tl.sum(tl.where(slot == chosen, ids, 0), 0)
         packed = tl.where(slot == step, chosen_id, packed)
-        total = tl.sum(weights * best, 0)
 
     # The combine kernel consumes every original target, including retained
     # targets. Those must read their own output, even when D has zero-cost ties.
@@ -75,7 +79,7 @@ def _select_kernel(Ids, Weights, Error, Dispatch, Assignment,
 
 
 def select_routes(ids, weights, error, *, topk=None, topp_threshold=None):
-    """Return packed expert IDs [T, R] and target-to-packed-slot indices [T, K]."""
+    """Use the same floor rule as greedy_select_topp; return packed IDs and owners."""
     tokens, k = ids.shape
     slots = topk if topk is not None else k
     dispatch = torch.empty((tokens, slots), device=ids.device, dtype=torch.int32)
@@ -200,8 +204,9 @@ def patch(model, calibration_path, *, topk=None, topp_threshold=None):
     if (topk is None) == (topp_threshold is None):
         raise ValueError("Specify exactly one of topk and topp_threshold")
     k = config.model_config.hf_text_config.num_experts_per_tok
-    if (topk is not None and not 1 <= topk <= k) or (topp_threshold is not None and topp_threshold < 0):
-        raise ValueError(f"Require 1 <= topk <= {k}, or topp_threshold >= 0")
+    if ((topk is not None and not 1 <= topk <= k)
+            or (topp_threshold is not None and not 0 <= topp_threshold <= 1)):
+        raise ValueError(f"Require 1 <= topk <= {k}, or 0 <= topp_threshold <= 1")
 
     states, _ = read_calibration(calibration_path)
     layers = [(extract_layer_index(name), block) for name, block in model.named_modules()

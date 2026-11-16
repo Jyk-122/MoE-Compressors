@@ -71,7 +71,7 @@ def patch(model, calibration_path, *, topk=None, topp_threshold=None):
     """Load the calibration file and install one TransferMoE selection policy.
 
     Load the model at its inference dtype/device before patching. Statistics
-    remain FP32. Specify exactly one of topk (1..K) or topp_threshold (>= 0).
+    remain FP32. Specify exactly one of topk (1..K) or topp_threshold (0..1).
     """
     from ..calibrate import read_calibration
 
@@ -80,6 +80,8 @@ def patch(model, calibration_path, *, topk=None, topp_threshold=None):
     if topk is not None:
         select = partial(greedy_select_topk, topk=topk)
     else:
+        if not 0 <= topp_threshold <= 1:
+            raise ValueError("topp_threshold must be in [0, 1]")
         select = partial(greedy_select_topp, topp_threshold=topp_threshold)
     states, _ = read_calibration(calibration_path)
     blocks = moe_blocks(model)
