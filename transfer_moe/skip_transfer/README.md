@@ -173,7 +173,6 @@ python3.12 -m venv .venv-vllm
 source .venv-vllm/bin/activate
 python -m pip install -r transfer_moe/requirements-vllm.txt
 
-export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=0,1
 MODEL="/data1/jiangyikun/models/Qwen3.6-35B-A3B"
 CALIBRATION="$PWD/transfer_moe/outputs/skip_transfer/calibration.safetensors"
@@ -181,7 +180,10 @@ CALIBRATION="$PWD/transfer_moe/outputs/skip_transfer/calibration.safetensors"
 
 启动双卡 TP 服务，固定保留 4 个专家。worker 在加载权重后、profiling 和 CUDA Graph capture 前安装 patch；校准统计量占用的显存也计入 KV cache 预算。
 
+在仓库根目录执行下面的启动代码块。`PYTHONPATH` 必须包含仓库根目录，让 EngineCore 子进程能导入 `--worker-cls` 指定的 `transfer_moe` 模块；否则会在导入 worker 时报 `ModuleNotFoundError: No module named 'transfer_moe'`。这项设置需要在运行 `vllm serve` 的同一个终端执行。
+
 ```bash
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 POLICY="{\"skip_transfer\":{\"calibration_path\":\"$CALIBRATION\",\"topk\":4}}"
 
 vllm serve "$MODEL" \

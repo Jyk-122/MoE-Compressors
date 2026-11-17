@@ -1,6 +1,6 @@
 # Transfer MoE：方法与剪枝比例统计
 
-当前 `qwen3_5_moe` 适配 Qwen3.5 / Qwen3.6 MoE，已实现 [Fixed-K](skip_fixedk/README.md)、[DynRoute](skip_dynroute/README.md)、[TransferMoE](skip_transfer/README.md) 的 HF / vLLM 接入。DIEP、BAN 暂时只有原理说明。
+当前 `qwen3_5_moe` 适配 Qwen3.5 / Qwen3.6 MoE，已实现 [Fixed-K](skip_fixedk/README.md)、[DynRoute](skip_dynroute/README.md)、[TransferMoE](skip_transfer/README.md)、[ExFold 逐 token 变体](skip_exfold/README.md) 的 HF / vLLM 接入。DIEP、BAN 暂时只有原理说明。
 
 所有 patch 通过环境变量统一控制是否使用 [utils.py](utils.py) 中的 `ActivationStats`。开启后，每个模型拥有一个 `model.activation_stats`，各层共享这个对象，每层分别计数。patch 应在加载权重、确定设备之后，推理和图捕获之前安装。
 
@@ -101,7 +101,7 @@ Fixed-K 使用 `METHOD=skip_fixedk`、`PATCH_KWARGS='{"topk":4}'`。Transfer 使
 
 ## vLLM 服务：EvalScope 前清零、完成后读取
 
-三个自定义 worker 都继承公共 `ActivationStatsWorkerMixin`，提供 `reset_activation_stats()` 和 `get_activation_stats()`。后者返回与 HF 完全相同的 JSON，包含整体、prefill、decode。当前统计适配 **vLLM 0.24.0 的 V1 runner、单卡 / TP**；使用各方法文档中的未量化 Triton 路径，不启用 DBO、PP、EP、DP、SP 或 PCP。
+各方法的自定义 worker 都继承公共 `ActivationStatsWorkerMixin`，提供 `reset_activation_stats()` 和 `get_activation_stats()`。后者返回与 HF 完全相同的 JSON，包含整体、prefill、decode。当前统计适配 **vLLM 0.24.0 的 V1 runner、单卡 / TP**；使用各方法文档中的未量化 Triton 路径，不启用 DBO、PP、EP、DP、SP 或 PCP。
 
 worker 在原生 `_prepare_inputs` 完成后，使用最终的请求索引、GPU 序列位置和 prompt 长度更新阶段标记。标记存放在地址固定的设备缓冲区中，CUDA Graph 每次重放读取当前值；图补齐的行标记为 `-1`，不参与统计。统计 hook 不改动原生 MoE 的 dispatch / GEMM，也不关闭 CUDA Graph。[原生输入准备与补齐实现](https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/v1/worker/gpu_model_runner.py)
 
